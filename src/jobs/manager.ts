@@ -3,7 +3,14 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { Connector, JobEvent, JobLogger, JobMeta, JobSpec, Owner } from './connector.js';
 import { readConfig, type JobsConfig } from './config.js';
-import { JobStore, atomicWrite, sameOwner, terminal, type JobFile } from './store.js';
+import {
+  JobStore,
+  atomicWrite,
+  sameOwner,
+  terminal,
+  type JobFile,
+  type QuotaPause,
+} from './store.js';
 import { withLock } from './lock.js';
 import {
   currentOwner,
@@ -242,15 +249,12 @@ export class JobManager {
             await this.recoverOrphan(job, now);
           }
         }
-        // Pauses are records in the common store, including after a restart.
+        // Pauses live in their own per-connector (and per-model) state, so handing a paused job
+        // to another connector cannot lift them. Expired ones are dropped here.
         const requeued = new Set(jobs.map(job => job.requeuedFrom).filter(Boolean));
-        const pauses = jobs.filter(
-          job =>
-            job.state === 'paused' &&
-            !job.pauseCleared &&
-            !requeued.has(job.id) &&
-            (!job.resetAt || job.resetAt > now)
-        );
+        const saved = this.store.pauses();
+        const pauses = saved.filter(pause => !pause.resetAt || pause.resetAt > now);
+        if (pauses.length !== saved.length) this.store.writePauses(pauses);
         let slots = jobs.filter(job => job.state === 'running' || job.reserved).length;
         for (const job of jobs.reverse()) {
           if (job.connector !== this.connector.id || terminal(job)) continue;
@@ -287,15 +291,14 @@ export class JobManager {
             !job.manualRequeue &&
             pauses.find(
               p =>
-                p.connector === job.connector &&
-                (!p.pauseModel || !job.model || p.pauseModel === job.model)
+                p.connector === job.connector && (!p.model || !job.model || p.model === job.model)
             );
           if (pause) {
             Object.assign(job, {
               state: 'paused',
               reason: 'usage_limit',
               resetAt: pause.resetAt,
-              pauseModel: pause.pauseModel,
+              pauseModel: pause.model,
             });
             this.store.save(job, this.owner);
             continue;
@@ -451,14 +454,43 @@ export class JobManager {
       job.reason = 'usage_limit';
       job.resetAt = event.usageLimit.resetAt;
       job.pauseModel = event.usageLimit.model;
+      await this.recordQuota(job, event.usageLimit);
     } else if (outcome.kind === 'error' || outcome.code !== 0 || event.error) {
       job.state = 'failed';
       job.reason = outcome.kind === 'error' ? 'spawn_error' : 'cli_error';
     } else {
       job.state = 'completed';
       job.reason = undefined;
+      await this.recordQuota(job);
     }
     this.store.save(job, this.owner);
+  }
+
+  // A usage limit adds or extends the connector's pause (no reset time means until lifted). A
+  // job that started after the pause and completed proves the quota is back, which lifts it.
+  private recordQuota(job: JobMeta, limit?: { resetAt?: number; model?: string }): Promise<void> {
+    return withLock(this.config.home, () => {
+      const matches = (pause: QuotaPause, model?: string) =>
+        pause.connector === job.connector && pause.model === model;
+      let pauses = this.store.pauses();
+      if (limit) {
+        const existing = pauses.find(pause => matches(pause, limit.model));
+        const resetAt =
+          existing && (!existing.resetAt || !limit.resetAt)
+            ? undefined
+            : Math.max(existing?.resetAt ?? 0, limit.resetAt ?? 0) || undefined;
+        pauses = pauses.filter(pause => pause !== existing);
+        pauses.push({ connector: job.connector, model: limit.model, resetAt, since: Date.now() });
+      } else {
+        pauses = pauses.filter(
+          pause =>
+            pause.connector !== job.connector ||
+            (pause.model !== undefined && pause.model !== job.model) ||
+            pause.since > (job.startedAt ?? 0)
+        );
+      }
+      this.store.writePauses(pauses);
+    });
   }
 
   async list(limit = 50) {

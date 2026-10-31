@@ -325,3 +325,40 @@ test('requeue revalidates the original under the lock and cannot clobber a job p
     f.cleanup();
   }
 });
+
+test('handing the only paused job to another connector does not lift the quota pause', async () => {
+  const f = fixture();
+  const manager = new JobManager(fakeConnector(f.script, 'codex', Date.now() + 60000), f.config);
+  try {
+    const one = await manager.start({ prompt: JSON.stringify({ limit: true }), cwd: f.home });
+    await until(() => manager.store.get(one.jobId).state === 'paused', 'usage pause');
+    const handed = await manager.requeue(one.jobId, undefined, 'agy');
+    assert.equal(manager.store.get(handed.jobId).connector, 'agy');
+    const two = await manager.start({ prompt: 'second', cwd: f.home });
+    await until(() => manager.store.get(two.jobId).state === 'paused', 'new job pauses', 8000);
+    assert.equal(manager.store.get(two.jobId).reason, 'usage_limit');
+  } finally {
+    await manager.dispose();
+    f.cleanup();
+  }
+});
+
+test('a manual requeue on the same connector bypasses the pause, and its success lifts it', async () => {
+  const f = fixture();
+  const manager = new JobManager(fakeConnector(f.script, 'codex', Date.now() + 60000), f.config);
+  try {
+    const one = await manager.start({
+      prompt: JSON.stringify({ limit: true, once: join(f.home, 'limited') }),
+      cwd: f.home,
+    });
+    await until(() => manager.store.get(one.jobId).state === 'paused', 'usage pause');
+    const again = await manager.requeue(one.jobId);
+    assert.equal((await manager.result(again.jobId, 10)).state, 'completed');
+    await until(() => manager.store.pauses().length === 0, 'pause lifted by the success');
+    const next = await manager.start({ prompt: 'after', cwd: f.home });
+    assert.equal((await manager.result(next.jobId, 10)).state, 'completed');
+  } finally {
+    await manager.dispose();
+    f.cleanup();
+  }
+});

@@ -29,6 +29,14 @@ export const terminal = (job: JobMeta) =>
 export const sameOwner = (a: Owner | undefined, b: Owner) =>
   a?.pid === b.pid && a.startTime === b.startTime;
 
+/** A connector (and optionally one model) that hit a usage limit, independent of any job record. */
+export interface QuotaPause {
+  connector: string;
+  model?: string;
+  resetAt?: number;
+  since: number;
+}
+
 export function atomicWrite(path: string, data: string | Buffer): void {
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
@@ -105,6 +113,20 @@ export class JobStore {
   write(meta: JobMeta): void {
     meta.updatedAt = Date.now();
     atomicWrite(join(this.dir(meta.id), 'meta.json'), JSON.stringify(meta));
+  }
+
+  // Quota pauses are shared state: read and change them only under the machine lock.
+  pauses(): QuotaPause[] {
+    try {
+      return JSON.parse(readFileSync(join(this.home, 'pauses.json'), 'utf8')) as QuotaPause[];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+  }
+
+  writePauses(pauses: QuotaPause[]): void {
+    atomicWrite(join(this.home, 'pauses.json'), JSON.stringify(pauses));
   }
 
   read(id: string, name: JobFile): string {
