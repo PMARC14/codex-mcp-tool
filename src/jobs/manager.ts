@@ -660,17 +660,40 @@ export class JobManager {
     return result;
   }
 
+  // The whole collect runs under the shared lock. That is the reservation: promotion, requeue and
+  // other collects cannot start a job in this worktree while it is saved and possibly removed.
+  // Trade-off: the git calls (30s timeout each) stall both forks' queues while they run.
   async collect(jobId: string, remove: 'none' | 'worktree' | 'worktree+branch' = 'none') {
     await this.initialize();
-    const job = this.store.get(jobId);
-    if (!job.worktree) throw new Error('This job has no worktree');
-    if (job.state === 'running' || job.reserved || job.state === 'queued')
-      throw new Error('Wait for the job to stop before collecting its worktree');
-    if (!this.owns(job))
-      throw new Error('Only the owning server can collect this job; requeue a lost job first');
-    const result = await collectWorktree(job.worktree, this.store.path(jobId, 'patch'), remove);
-    this.store.save(job, this.owner);
-    return result;
+    return withLock(this.config.home, async () => {
+      const job = this.store.get(jobId);
+      if (!job.worktree) throw new Error('This job has no worktree');
+      if (job.state === 'running' || job.reserved || job.state === 'queued')
+        throw new Error('Wait for the job to stop before collecting its worktree');
+      if (!this.owns(job))
+        throw new Error('Only the owning server can collect this job; requeue a lost job first');
+      // Requeue copies the worktree reference, so every job that points at it must be idle.
+      // A paused job that was requeued will never resume and does not count.
+      const sharing = this.store
+        .list()
+        .filter(other => other.id !== job.id && other.worktree?.path === job.worktree!.path);
+      const busy = sharing.find(
+        other =>
+          other.reserved || (!terminal(other) && !(other.state === 'paused' && other.pauseCleared))
+      );
+      if (busy)
+        throw new Error(`Job ${busy.id} still uses this worktree; wait for it to stop first`);
+      const result = await collectWorktree(job.worktree, this.store.path(jobId, 'patch'), remove);
+      if (job.worktree.removed && job.state === 'paused') job.pauseCleared = true;
+      this.store.save(job, this.owner);
+      if (job.worktree.removed)
+        for (const other of sharing) {
+          if (!other.worktree) continue;
+          other.worktree.removed = true;
+          this.store.write(other);
+        }
+      return result;
+    });
   }
 
   async dispose(): Promise<void> {

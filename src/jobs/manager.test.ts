@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, fakeConnector, meta, until } from './test-helpers.js';
 import { JobManager } from './manager.js';
 import { JobStore } from './store.js';
-import { currentOwner, isAlive } from './proc.js';
+import { currentOwner, isAlive, runCommand } from './proc.js';
+import { createWorktree } from './worktree.js';
 
 test('two managers own their jobs exclusively and share the machine limit across connectors', async () => {
   const f = fixture();
@@ -357,6 +358,53 @@ test('a manual requeue on the same connector bypasses the pause, and its success
     await until(() => manager.store.pauses().length === 0, 'pause lifted by the success');
     const next = await manager.start({ prompt: 'after', cwd: f.home });
     assert.equal((await manager.result(next.jobId, 10)).state, 'completed');
+  } finally {
+    await manager.dispose();
+    f.cleanup();
+  }
+});
+
+test('collect refuses to remove a worktree that a requeued replacement still uses', async () => {
+  const f = fixture();
+  const manager = new JobManager(fakeConnector(f.script), f.config);
+  try {
+    await manager.initialize();
+    const root = join(f.home, 'repo');
+    mkdirSync(root);
+    const git = (...args: string[]) => runCommand('git', args, root);
+    await git('init');
+    await git('config', 'user.email', 'agent-jobs-test@example.invalid');
+    await git('config', 'user.name', 'Agent jobs tests');
+    await git('config', 'commit.gpgsign', 'false');
+    writeFileSync(join(root, 'tracked.txt'), 'base\n');
+    await git('add', '-A');
+    await git('commit', '-m', 'base');
+    const worktree = await createWorktree(root, 'shared', 'shared-wt', 'codex');
+    const mine = {
+      owner: await currentOwner(),
+      managerId: (manager as unknown as { id: string }).id,
+    };
+    const store = manager.store;
+    store.create(meta(f.home, { id: 'orig', state: 'failed', worktree, ...mine }), 'p');
+    store.create(
+      meta(f.home, {
+        id: 'repl',
+        state: 'running',
+        reserved: true,
+        requeuedFrom: 'orig',
+        worktree,
+        ...mine,
+      }),
+      'p'
+    );
+    await assert.rejects(() => manager.collect('orig', 'worktree'), /still uses this worktree/);
+    assert.equal(existsSync(worktree.path), true);
+    assert.notEqual(store.get('orig').worktree?.removed, true);
+    store.write({ ...store.get('repl'), state: 'completed', reserved: false });
+    const result = await manager.collect('orig', 'worktree');
+    assert.equal(result.removed, true);
+    assert.equal(existsSync(worktree.path), false);
+    assert.equal(store.get('repl').worktree?.removed, true, 'every job sharing it is updated');
   } finally {
     await manager.dispose();
     f.cleanup();
