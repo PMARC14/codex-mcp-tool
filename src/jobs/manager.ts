@@ -1,7 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { Connector, JobEvent, JobLogger, JobMeta, JobSpec, Owner } from './connector.js';
+import type {
+  Connector,
+  JobEvent,
+  JobLogger,
+  JobMeta,
+  JobSpec,
+  JobState,
+  Owner,
+} from './connector.js';
 import { readConfig, type JobsConfig } from './config.js';
 import {
   JobStore,
@@ -113,6 +121,20 @@ export class JobManager {
       finishedAt: job.finishedAt ?? now,
     });
     if (confirmed) this.cleanupTried.delete(job.id);
+  }
+
+  /**
+   * Subscribes to job state changes written by this process. The listener runs synchronously after
+   * the record is persisted, with a copy of the job and its previous state; it receives records
+   * for every owner, so use isOwn() to filter. Returns an unsubscribe function.
+   */
+  onTransition(listener: (job: JobMeta, previous: JobState | undefined) => void): () => void {
+    return this.store.onWrite(listener);
+  }
+
+  /** True when this manager (not another server or an earlier run) owns the job. */
+  isOwn(job: JobMeta): boolean {
+    return this.owns(job);
   }
 
   private owns(job: JobMeta): boolean {

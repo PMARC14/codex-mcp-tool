@@ -14,7 +14,9 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { JobMeta, Owner } from './connector.js';
+import type { JobMeta, JobState, Owner } from './connector.js';
+
+export type TransitionListener = (job: JobMeta, previous: JobState | undefined) => void;
 
 export const files = {
   prompt: 'prompt.txt',
@@ -63,6 +65,8 @@ export function atomicWrite(path: string, data: string | Buffer): void {
 }
 
 export class JobStore {
+  private readonly listeners = new Set<TransitionListener>();
+
   constructor(readonly home: string) {
     mkdirSync(join(home, 'jobs'), { recursive: true });
   }
@@ -111,8 +115,29 @@ export class JobStore {
 
   // Recovery and claiming unowned records must be performed under the machine lock.
   write(meta: JobMeta): void {
+    let previous: JobState | undefined;
+    if (this.listeners.size) {
+      try {
+        previous = this.get(meta.id).state;
+      } catch {
+        /* No readable previous record. */
+      }
+    }
     meta.updatedAt = Date.now();
     atomicWrite(join(this.dir(meta.id), 'meta.json'), JSON.stringify(meta));
+    for (const listener of [...this.listeners]) {
+      try {
+        listener({ ...meta }, previous);
+      } catch {
+        /* A listener must never break persistence. */
+      }
+    }
+  }
+
+  /** Subscribes to every persisted record write; returns an unsubscribe function. */
+  onWrite(listener: TransitionListener): () => void {
+    this.listeners.add(listener);
+    return () => void this.listeners.delete(listener);
   }
 
   // Quota pauses are shared state: read and change them only under the machine lock.
