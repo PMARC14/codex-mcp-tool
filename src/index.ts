@@ -34,18 +34,28 @@ import {
 import { getCompletionValues } from './utils/completions.js';
 import { ProgressReporter } from './utils/progress.js';
 
+import {
+  startChannelNotifier,
+  withChannelCapabilities,
+  withChannelInstructions,
+} from './jobs/channel.js';
+
+const CHANNEL_INSTRUCTIONS = withChannelInstructions(undefined, 'codex');
+let stopChannel = () => {};
+
 const server = new Server(
   {
     name: 'codex-cli-mcp',
     version: '2.6.0',
   },
   {
-    capabilities: {
+    capabilities: withChannelCapabilities({
       tools: {},
       prompts: {},
       logging: {},
       completions: {},
-    },
+    }),
+    ...(CHANNEL_INSTRUCTIONS ? { instructions: CHANNEL_INSTRUCTIONS } : {}),
   }
 );
 
@@ -262,7 +272,9 @@ async function main() {
   await codexJobManager.initialize();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  stopChannel = startChannelNotifier(codexJobManager, server, 'codex', Logger);
   server.onclose = () => {
+    stopChannel();
     void codexJobManager.dispose();
   };
   Logger.debug('codex-mcp-tool listening on stdio');
@@ -270,6 +282,7 @@ async function main() {
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
+    stopChannel();
     void codexJobManager.dispose().finally(() => process.exit(0));
   });
 }
