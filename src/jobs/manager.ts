@@ -574,55 +574,58 @@ export class JobManager {
 
   async requeue(jobId: string, model?: string, agent = this.connector.id) {
     await this.initialize();
-    const original = this.store.get(jobId);
-    if (!['paused', 'lost', 'failed'].includes(original.state))
-      throw new Error('Only paused, lost or failed jobs can be requeued');
-    if (original.reserved)
-      throw new Error(
-        'The process is still alive after kill-failed or owner loss; wait until cleanup is confirmed before requeueing'
-      );
+    // The slow availability check stays outside the lock; the record is read again inside it.
     if (agent === this.connector.id) await this.available();
-    const id = randomUUID();
-    const meta: JobMeta = {
-      ...original,
-      id,
-      connector: agent,
-      model:
-        agent === this.connector.id
-          ? this.selectModel(model ?? (agent === original.connector ? original.model : undefined))
-          : (model ?? (agent === original.connector ? original.model : undefined)),
-      state: 'queued',
-      owner: agent === this.connector.id ? this.owner : undefined,
-      managerId: agent === this.connector.id ? this.id : undefined,
-      process: undefined,
-      descendants: undefined,
-      reserved: false,
-      sessionId: undefined,
-      reason: undefined,
-      error: undefined,
-      resetAt: undefined,
-      pauseModel: undefined,
-      exitCode: undefined,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      startedAt: undefined,
-      finishedAt: undefined,
-      finalPath: this.store.path(id, 'final'),
-    };
-    meta.pauseCleared = false;
-    meta.manualRequeue = true;
-    meta.requeuedFrom = original.id;
-    if (meta.worktree?.removed)
-      throw new Error('The worktree was removed; start a new job with the saved prompt');
-    this.store.create(meta, this.store.read(jobId, 'prompt'));
-    if (this.owns(original) && original.state === 'paused') {
-      await withLock(this.config.home, () => {
+    const result = await withLock(this.config.home, () => {
+      const original = this.store.get(jobId);
+      if (!['paused', 'lost', 'failed'].includes(original.state))
+        throw new Error('Only paused, lost or failed jobs can be requeued');
+      if (original.reserved)
+        throw new Error(
+          'The process is still alive after kill-failed or owner loss; wait until cleanup is confirmed before requeueing'
+        );
+      if (original.worktree?.removed)
+        throw new Error('The worktree was removed; start a new job with the saved prompt');
+      const id = randomUUID();
+      const meta: JobMeta = {
+        ...original,
+        id,
+        connector: agent,
+        model:
+          agent === this.connector.id
+            ? this.selectModel(model ?? (agent === original.connector ? original.model : undefined))
+            : (model ?? (agent === original.connector ? original.model : undefined)),
+        state: 'queued',
+        owner: agent === this.connector.id ? this.owner : undefined,
+        managerId: agent === this.connector.id ? this.id : undefined,
+        process: undefined,
+        descendants: undefined,
+        reserved: false,
+        sessionId: undefined,
+        reason: undefined,
+        error: undefined,
+        resetAt: undefined,
+        pauseModel: undefined,
+        exitCode: undefined,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        startedAt: undefined,
+        finishedAt: undefined,
+        finalPath: this.store.path(id, 'final'),
+      };
+      meta.pauseCleared = false;
+      meta.manualRequeue = true;
+      meta.requeuedFrom = original.id;
+      this.store.create(meta, this.store.read(jobId, 'prompt'));
+      // Publishing the replacement and suppressing the original's retry are one critical section.
+      if (original.state === 'paused') {
         original.pauseCleared = true;
-        this.store.save(original, this.owner);
-      });
-    }
+        this.store.write(original);
+      }
+      return { jobId: id, state: meta.state };
+    });
     void this.pump().catch(error => this.logger.warn('Job queue error', error));
-    return { jobId: id, state: meta.state };
+    return result;
   }
 
   async collect(jobId: string, remove: 'none' | 'worktree' | 'worktree+branch' = 'none') {

@@ -298,3 +298,30 @@ test('failed orphan cleanup keeps the slot and cleanup identities until terminat
     f.cleanup();
   }
 });
+
+test('requeue revalidates the original under the lock and cannot clobber a job promoted meanwhile', async () => {
+  const f = fixture();
+  const connector = fakeConnector(f.script, 'codex', Date.now() + 60000);
+  const manager = new JobManager(connector, f.config);
+  try {
+    const one = await manager.start({ prompt: JSON.stringify({ limit: true }), cwd: f.home });
+    await until(() => manager.store.get(one.jobId).state === 'paused', 'usage pause');
+    const before = manager.store.list().length;
+    const detect = connector.detect.bind(connector);
+    connector.detect = async () => {
+      // Reset-time promotion wins the race while requeue awaits availability.
+      connector.detect = detect;
+      manager.store.write({ ...manager.store.get(one.jobId), state: 'running', reserved: true });
+      return detect();
+    };
+    await assert.rejects(() => manager.requeue(one.jobId), /Only paused/);
+    assert.equal(manager.store.list().length, before, 'no replacement job is created');
+    const original = manager.store.get(one.jobId);
+    assert.equal(original.state, 'running');
+    assert.equal(original.reserved, true);
+    assert.notEqual(original.pauseCleared, true);
+  } finally {
+    await manager.dispose();
+    f.cleanup();
+  }
+});
