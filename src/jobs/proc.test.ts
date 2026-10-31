@@ -13,6 +13,7 @@ import {
   processStartTime,
   killTree,
   snapshotDescendants,
+  runCommandBuffer,
 } from './proc.js';
 import type { Owner } from './connector.js';
 
@@ -186,5 +187,16 @@ test('snapshot rejects PID-reuse edges so an old orphan is never adopted as a de
       .map(p => p.pid)
       .sort(),
     [101, 102]
+  );
+});
+
+test('runCommand decodes UTF-8 once, so a character split across chunks survives', async () => {
+  const script =
+    'const b=Buffer.from("é€x  \\n");process.stdout.write(b.subarray(0,3));setTimeout(()=>process.stdout.write(b.subarray(3)),150)';
+  assert.equal(await runCommand(process.execPath, ['-e', script]), 'é€x');
+  // The raw form keeps every byte, including trailing whitespace.
+  assert.deepEqual(
+    await runCommandBuffer(process.execPath, ['-e', script]),
+    Buffer.from('é€x  \n')
   );
 });

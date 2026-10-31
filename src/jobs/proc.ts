@@ -91,16 +91,17 @@ export function safeSpawn(exe: string, args: string[], options: SpawnOptions): C
   return spawn(command.exe, command.args, spawnArgs);
 }
 
-export function runCommand(
+/** Raw stdout bytes; callers that need exact content (patches) must not go through a string. */
+export function runCommandBuffer(
   exe: string,
   args: string[],
   cwd?: string,
   timeoutMs = 30000
-): Promise<string> {
+): Promise<Buffer> {
   return new Promise((resolveResult, reject) => {
     const child = safeSpawn(exe, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
     const timer = setTimeout(() => {
       child.kill();
       reject(new Error(`${exe} timed out`));
@@ -109,18 +110,32 @@ export function runCommand(
       clearTimeout(timer);
       reject(error);
     });
-    child.stdout?.on('data', data => {
-      stdout += data;
+    child.stdout?.on('data', (data: Buffer) => {
+      stdout.push(data);
     });
-    child.stderr?.on('data', data => {
-      stderr += data;
+    child.stderr?.on('data', (data: Buffer) => {
+      stderr.push(data);
     });
     child.on('close', code => {
       clearTimeout(timer);
-      if (code === 0) resolveResult(stdout.trimEnd());
-      else reject(new Error(`${exe} exited ${code}: ${stderr || stdout}`));
+      if (code === 0) resolveResult(Buffer.concat(stdout));
+      else
+        reject(
+          new Error(
+            `${exe} exited ${code}: ${Buffer.concat(stderr).toString('utf8') || Buffer.concat(stdout).toString('utf8')}`
+          )
+        );
     });
   });
+}
+
+export async function runCommand(
+  exe: string,
+  args: string[],
+  cwd?: string,
+  timeoutMs = 30000
+): Promise<string> {
+  return (await runCommandBuffer(exe, args, cwd, timeoutMs)).toString('utf8').trimEnd();
 }
 
 export function systemBinary(name: string): string {

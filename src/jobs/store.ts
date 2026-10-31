@@ -29,7 +29,7 @@ export const terminal = (job: JobMeta) =>
 export const sameOwner = (a: Owner | undefined, b: Owner) =>
   a?.pid === b.pid && a.startTime === b.startTime;
 
-export function atomicWrite(path: string, data: string): void {
+export function atomicWrite(path: string, data: string | Buffer): void {
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temp, data, { flag: 'wx' });

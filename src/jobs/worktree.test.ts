@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture } from './test-helpers.js';
-import { runCommand } from './proc.js';
+import { runCommand, runCommandBuffer } from './proc.js';
 import { createWorktree, collectWorktree, sanitizeLabel } from './worktree.js';
 
 test('worktree labels are safe, bounded and never empty', () => {
@@ -104,6 +104,28 @@ test('collection reports branch removal failure while preserving the saved patch
     const result = await collectWorktree(worktree, patchPath, 'worktree+branch');
     assert.match(result.removalError!, /branch-that-does-not-exist/);
     assert.match(readFileSync(patchPath, 'utf8'), /saved before removal/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('saved patch keeps trailing whitespace and multi-byte text byte for byte', async () => {
+  const f = fixture();
+  try {
+    const { root } = await repo(f.home);
+    const worktree = await createWorktree(root, 'bytes', 'byte-exact', 'codex');
+    writeFileSync(join(worktree.path, 'zz.txt'), 'café €\nvalue   \n');
+    const patchPath = join(f.home, 'patch.diff');
+    await collectWorktree(worktree, patchPath, 'none');
+    const saved = readFileSync(patchPath);
+    assert.ok(saved.toString('utf8').endsWith('+value   \n'));
+    const raw = await runCommandBuffer(
+      'git',
+      ['diff', '--binary', '--cached', worktree.baseSha],
+      worktree.path
+    );
+    assert.deepEqual(saved, raw);
+    await runCommand('git', ['apply', '--check', patchPath], root);
   } finally {
     f.cleanup();
   }

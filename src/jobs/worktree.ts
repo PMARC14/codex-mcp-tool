@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { runCommand } from './proc.js';
+import { runCommand, runCommandBuffer } from './proc.js';
 import { atomicWrite } from './store.js';
 import type { Worktree } from './connector.js';
 
@@ -81,12 +81,15 @@ export async function collectWorktree(
 ) {
   if (worktree.removed) throw new Error(`Worktree already removed; saved patch: ${patchPath}`);
   await runCommand('git', ['add', '-A'], worktree.path);
-  const patch = await runCommand(
+  // The patch is saved as git's raw bytes: no trimming and no text round trip, because the
+  // worktree may be removed right after.
+  const raw = await runCommandBuffer(
     'git',
     ['diff', '--binary', '--cached', worktree.baseSha],
     worktree.path
   );
-  atomicWrite(patchPath, patch ? `${patch}\n` : '');
+  atomicWrite(patchPath, raw);
+  const patch = raw.toString('utf8').trimEnd();
   const stat = await runCommand(
     'git',
     ['diff', '--stat', '--cached', worktree.baseSha],
