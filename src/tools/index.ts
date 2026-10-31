@@ -12,6 +12,7 @@ import { healthTool } from './health.tool.js';
 import { listSkillsTool } from './list-skills.tool.js';
 import { doActTool } from './do-act.tool.js';
 import { imageGenTool } from './image-gen.tool.js';
+import { codexUsageTool } from './codex-usage.tool.js';
 import { CodexConnector } from '../connectors/codex.js';
 import { JobManager } from '../jobs/manager.js';
 import { registerJobTools } from '../jobs/tools.js';
@@ -34,7 +35,8 @@ toolRegistry.push(
   healthTool,
   listSkillsTool,
   doActTool,
-  imageGenTool
+  imageGenTool,
+  codexUsageTool
 );
 
 export * from './registry.js';
