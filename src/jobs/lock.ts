@@ -1,4 +1,4 @@
-import { openSync, closeSync, readFileSync, writeFileSync, statSync, unlinkSync } from 'node:fs';
+import { linkSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Owner } from './connector.js';
@@ -6,20 +6,75 @@ import { currentOwner, ownerAlive } from './proc.js';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function stale(path: string): Promise<boolean> {
+/** The raw content of the lock when its owner is dead (or it is abandoned garbage), else undefined. */
+async function staleContent(path: string): Promise<string | undefined> {
+  let raw: string;
   try {
-    const raw = readFileSync(path, 'utf8');
+    raw = readFileSync(path, 'utf8');
+  } catch {
+    return undefined;
+  }
+  try {
     const record = JSON.parse(raw) as Owner;
     if (!Number.isInteger(record.pid) || record.pid < 1 || typeof record.startTime !== 'string')
       throw new Error('Incomplete lock');
     const alive = await ownerAlive(record);
-    return !alive && readFileSync(path, 'utf8') === raw;
+    return !alive && readFileSync(path, 'utf8') === raw ? raw : undefined;
   } catch {
     try {
-      return Date.now() - statSync(path).mtimeMs > 30000;
+      return Date.now() - statSync(path).mtimeMs > 30000 ? raw : undefined;
     } catch {
-      return false;
+      return undefined;
     }
+  }
+}
+
+/**
+ * Removes the lock at `path` only if it still holds `judged`, the content that was found stale.
+ *
+ * Node has no OS-managed lock (flock/LockFileEx) and no compare-and-delete, so a separate
+ * "reaper" sentinel only moves the unlink race one level down. Instead the lock is renamed to a
+ * unique tombstone: rename is atomic, so exactly one waiter takes a given file. Its content is
+ * then compared with what was judged stale. Every acquisition writes a unique token, so equal
+ * content means it really is the dead holder's lock, and the tombstone is deleted. If a live lock
+ * was taken by mistake (it replaced the stale one after the judgement), it is put back with
+ * linkSync, which never overwrites. Everything after the rename is synchronous, so the only
+ * remaining window is the few microseconds in which a wrongly taken live lock is absent.
+ */
+export function reclaimStale(path: string, judged: string): void {
+  const tombstone = `${path}.stale.${randomUUID()}`;
+  try {
+    renameSync(path, tombstone);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; // another waiter won
+    throw error;
+  }
+  try {
+    if (readFileSync(tombstone, 'utf8') !== judged) {
+      try {
+        linkSync(tombstone, path);
+      } catch (error) {
+        // EEXIST: a newer lock already took the name, so the wrongly taken one stays gone.
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    }
+  } finally {
+    unlinkSync(tombstone);
+  }
+}
+
+/** Creates the lock with its complete content or not at all, so it is never visible empty. */
+function tryAcquire(path: string, content: string): boolean {
+  const temp = `${path}.${randomUUID()}.tmp`;
+  writeFileSync(temp, content, { flag: 'wx' });
+  try {
+    linkSync(temp, path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    return false;
+  } finally {
+    unlinkSync(temp);
   }
 }
 
@@ -27,51 +82,26 @@ export async function withLock<T>(home: string, action: () => T | Promise<T>): P
   const path = join(home, 'lock');
   const owner = await currentOwner();
   const token = randomUUID();
+  const content = JSON.stringify({ ...owner, token });
   const deadline = Date.now() + 60000;
   while (true) {
-    let fd: number;
-    try {
-      fd = openSync(path, 'wx');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (await stale(path)) {
-        // Serialize stale reclamation so two waiters cannot unlink a new lock.
-        const reap = `${path}.reap`;
-        let reaper: number | undefined;
-        try {
-          reaper = openSync(reap, 'wx');
-          writeFileSync(reaper, JSON.stringify(owner));
-          if (await stale(path)) unlinkSync(path);
-        } catch (error) {
-          if (
-            (error as NodeJS.ErrnoException).code !== 'EEXIST' &&
-            (error as NodeJS.ErrnoException).code !== 'ENOENT'
-          )
-            throw error;
-          if (reaper === undefined && (await stale(reap))) {
-            try {
-              unlinkSync(reap);
-            } catch {
-              /* Another waiter reclaimed it. */
-            }
-          }
-        } finally {
-          if (reaper !== undefined) {
-            closeSync(reaper);
-            unlinkSync(reap);
-          }
-        }
+    if (!tryAcquire(path, content)) {
+      const judged = await staleContent(path);
+      if (judged !== undefined) reclaimStale(path, judged);
+      else {
+        if (Date.now() >= deadline) throw new Error('Timed out waiting for the agent-jobs lock');
+        await sleep(30);
       }
-      if (Date.now() >= deadline) throw new Error('Timed out waiting for the agent-jobs lock');
-      await sleep(30);
       continue;
     }
     try {
-      writeFileSync(fd, JSON.stringify({ ...owner, token }));
       return await action();
     } finally {
-      closeSync(fd);
-      if (JSON.parse(readFileSync(path, 'utf8')).token === token) unlinkSync(path);
+      try {
+        if (JSON.parse(readFileSync(path, 'utf8')).token === token) unlinkSync(path);
+      } catch {
+        /* Never mask the action's result; a missing or foreign lock is not ours to remove. */
+      }
     }
   }
 }
