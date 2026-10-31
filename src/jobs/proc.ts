@@ -193,11 +193,22 @@ export async function descendants(root: Owner, known: Owner[] = []): Promise<Own
   const raw = await powershell(
     `@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='Start';e={[math]::Floor($_.CreationDate.ToUniversalTime().Ticks / 10000).ToString('0')}}) | ConvertTo-Json -Compress`
   );
-  const rows = JSON.parse(raw || '[]') as {
-    ProcessId: number;
-    ParentProcessId: number;
-    Start: string;
-  }[];
+  const rows = JSON.parse(raw || '[]') as ProcessRow[];
+  return snapshotDescendants(rows, root, known);
+}
+
+export interface ProcessRow {
+  ProcessId: number;
+  ParentProcessId: number;
+  Start: string;
+}
+
+/**
+ * Pure tree walk over one process snapshot. An orphan keeps its dead parent's PID, and Windows
+ * may hand that PID to a newer process, so an edge is only trusted when the child did not
+ * start before its parent.
+ */
+export function snapshotDescendants(rows: ProcessRow[], root: Owner, known: Owner[] = []): Owner[] {
   const byPid = new Map(rows.map(row => [row.ProcessId, row]));
   const parents = new Set(
     [root, ...known].filter(p => byPid.get(p.pid)?.Start === p.startTime).map(p => p.pid)
@@ -207,11 +218,11 @@ export async function descendants(root: Owner, known: Owner[] = []): Promise<Own
   while (changed) {
     changed = false;
     for (const row of rows) {
-      if (parents.has(row.ParentProcessId) && !parents.has(row.ProcessId)) {
-        parents.add(row.ProcessId);
-        found.set(row.ProcessId, { pid: row.ProcessId, startTime: row.Start });
-        changed = true;
-      }
+      if (!parents.has(row.ParentProcessId) || parents.has(row.ProcessId)) continue;
+      if (Number(row.Start) < Number(byPid.get(row.ParentProcessId)!.Start)) continue;
+      parents.add(row.ProcessId);
+      found.set(row.ProcessId, { pid: row.ProcessId, startTime: row.Start });
+      changed = true;
     }
   }
   return [...found.values()];

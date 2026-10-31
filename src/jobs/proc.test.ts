@@ -12,6 +12,7 @@ import {
   safeSpawn,
   processStartTime,
   killTree,
+  snapshotDescendants,
 } from './proc.js';
 import type { Owner } from './connector.js';
 
@@ -167,4 +168,23 @@ test('child exiting without consuming a large stdin cannot crash the server with
   } finally {
     f.cleanup();
   }
+});
+
+test('snapshot rejects PID-reuse edges so an old orphan is never adopted as a descendant', () => {
+  const root = { pid: 100, startTime: '5000' };
+  const rows = [
+    { ProcessId: 100, ParentProcessId: 1, Start: '5000' },
+    // Legitimate child and grandchild, started after their parents.
+    { ProcessId: 101, ParentProcessId: 100, Start: '5100' },
+    { ProcessId: 102, ParentProcessId: 101, Start: '5100' },
+    // Orphan left by an earlier process that had PID 100; it predates the current root.
+    { ProcessId: 200, ParentProcessId: 100, Start: '1000' },
+    { ProcessId: 201, ParentProcessId: 200, Start: '1500' },
+  ];
+  assert.deepEqual(
+    snapshotDescendants(rows, root)
+      .map(p => p.pid)
+      .sort(),
+    [101, 102]
+  );
 });
