@@ -262,34 +262,61 @@ export async function killTree(root?: Owner, recorded: Owner[] = []): Promise<vo
     return;
   }
   if (!root?.startTime) return;
-  const current = await processStartTime(root.pid);
+  await killProcessGroup(root);
+}
+
+export interface GroupKillDeps {
+  kill(pid: number, signal: NodeJS.Signals | 0): void;
+  startTime(pid: number): Promise<string | undefined>;
+  graceMs: number;
+  killWaitMs: number;
+  pollMs: number;
+}
+
+// Grace plus the post-SIGKILL wait stays inside the 10 second cancel deadline in startProcess.
+const groupKillDeps: GroupKillDeps = {
+  kill: (pid, signal) => process.kill(pid, signal),
+  startTime: processStartTime,
+  graceMs: 5000,
+  killWaitMs: 4000,
+  pollMs: 50,
+};
+
+/** POSIX tree kill by process group, injectable so it is unit-tested on every platform. */
+export async function killProcessGroup(root: Owner, deps = groupKillDeps): Promise<void> {
+  const current = await deps.startTime(root.pid);
   if (current && current !== root.startTime) return;
   try {
-    process.kill(-root.pid, 'SIGTERM');
+    deps.kill(-root.pid, 'SIGTERM');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
     throw error;
   }
   const groupAlive = () => {
     try {
-      process.kill(-root.pid, 0);
+      deps.kill(-root.pid, 0);
       return true;
     } catch (error) {
       return (error as NodeJS.ErrnoException).code !== 'ESRCH';
     }
   };
-  const grace = Date.now() + 5000;
-  while (groupAlive() && Date.now() < grace)
-    await new Promise(resolveWait => setTimeout(resolveWait, 50));
-  if (groupAlive()) {
-    const identity = await processStartTime(root.pid);
-    if (identity && identity !== root.startTime) return;
-    try {
-      process.kill(-root.pid, 'SIGKILL');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
-    }
+  const wait = async (ms: number) => {
+    const limit = Date.now() + ms;
+    while (groupAlive() && Date.now() < limit)
+      await new Promise(resolveWait => setTimeout(resolveWait, deps.pollMs));
+  };
+  await wait(deps.graceMs);
+  if (!groupAlive()) return;
+  const identity = await deps.startTime(root.pid);
+  if (identity && identity !== root.startTime) return;
+  try {
+    deps.kill(-root.pid, 'SIGKILL');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
   }
+  // The root may be gone while a descendant keeps the group alive, so confirm the group itself.
+  await wait(deps.killWaitMs);
+  if (groupAlive()) throw new Error('kill-failed: process group is still alive after SIGKILL');
 }
 
 export interface ProcessOutcome {

@@ -14,6 +14,8 @@ import {
   killTree,
   snapshotDescendants,
   runCommandBuffer,
+  killProcessGroup,
+  type GroupKillDeps,
 } from './proc.js';
 import type { Owner } from './connector.js';
 
@@ -198,5 +200,43 @@ test('runCommand decodes UTF-8 once, so a character split across chunks survives
   assert.deepEqual(
     await runCommandBuffer(process.execPath, ['-e', script]),
     Buffer.from('é€x  \n')
+  );
+});
+
+function groupDeps(deadAfterKill: number | undefined): GroupKillDeps & { signals: string[] } {
+  const signals: string[] = [];
+  let killed = false;
+  let polls = 0;
+  return {
+    signals,
+    graceMs: 20,
+    killWaitMs: 300,
+    pollMs: 5,
+    startTime: async () => '42',
+    kill(pid, signal) {
+      assert.equal(pid, -77);
+      if (signal === 0) {
+        // The group outlives its root: a descendant keeps it alive until deadAfterKill polls.
+        if (killed && deadAfterKill !== undefined && ++polls > deadAfterKill)
+          throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+        return;
+      }
+      signals.push(String(signal));
+      if (signal === 'SIGKILL') killed = true;
+    },
+  };
+}
+
+test('POSIX group kill waits for the group to disappear after SIGKILL', async () => {
+  const deps = groupDeps(4);
+  await killProcessGroup({ pid: 77, startTime: '42' }, deps);
+  assert.deepEqual(deps.signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('POSIX group kill reports kill-failed when a descendant keeps the group alive', async () => {
+  const deps = groupDeps(undefined);
+  await assert.rejects(
+    () => killProcessGroup({ pid: 77, startTime: '42' }, deps),
+    /^Error: kill-failed/
   );
 });
