@@ -1,0 +1,59 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { zodToJsonSchema } from 'zod-to-json-schema';
+import { registerJobTools, type JobTool } from './tools.js';
+import { JobManager } from './manager.js';
+import { fixture, fakeConnector } from './test-helpers.js';
+
+test('portable registration exposes all eight prefixed tools with bounded schemas and explicit full mode', async () => {
+  const f = fixture();
+  const manager = new JobManager(fakeConnector(f.script), f.config);
+  try {
+    const tools: JobTool[] = [];
+    registerJobTools(tools, 'codex', manager);
+    assert.deepEqual(
+      tools.map(tool => tool.name),
+      [
+        'codex_job_start',
+        'codex_job_status',
+        'codex_job_result',
+        'codex_job_cancel',
+        'codex_job_list',
+        'codex_job_read',
+        'codex_job_requeue',
+        'codex_worktree_collect',
+      ]
+    );
+    for (const tool of tools)
+      assert.ok(JSON.stringify(zodToJsonSchema(tool.zodSchema)).includes('object'));
+    const start = tools[0];
+    assert.equal(start.zodSchema.parse({ prompt: 'p', cwd: f.home }).mode, 'read');
+    assert.equal(start.zodSchema.parse({ prompt: 'p', cwd: f.home, mode: 'full' }).mode, 'full');
+    assert.throws(() => tools[2].zodSchema.parse({ jobId: 'a', waitSec: 11 }));
+    assert.throws(() => tools[5].zodSchema.parse({ jobId: 'a', name: 'stdout', limit: 20001 }));
+    await assert.rejects(() => start.execute({ cwd: f.home }), /exactly one/);
+    await assert.rejects(
+      () => start.execute({ cwd: f.home, prompt: 'a', promptFile: 'b' }),
+      /exactly one/
+    );
+  } finally {
+    await manager.dispose();
+    f.cleanup();
+  }
+});
+
+test('registered tools execute the manager and return JSON results', async () => {
+  const f = fixture();
+  const manager = new JobManager(fakeConnector(f.script), f.config);
+  try {
+    const tools: JobTool[] = [];
+    registerJobTools(tools, 'codex', manager);
+    const start = tools[0];
+    const job = JSON.parse(await start.execute({ prompt: 'tool prompt', cwd: f.home }));
+    const result = JSON.parse(await tools[2].execute({ jobId: job.jobId, waitSec: 10 }));
+    assert.equal(result.final, 'tool prompt');
+  } finally {
+    await manager.dispose();
+    f.cleanup();
+  }
+});

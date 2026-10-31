@@ -29,8 +29,10 @@ import {
   executeTool,
   toolExists,
   getPromptMessage,
+  codexJobManager,
 } from './tools/index.js';
 import { getCompletionValues } from './utils/completions.js';
+import { ProgressReporter } from './utils/progress.js';
 
 const server = new Server(
   {
@@ -49,38 +51,6 @@ const server = new Server(
 
 // Removed global state - using per-request state instead
 
-/**
- * @param progressToken The progress token provided by the client
- * @param progress The current progress value
- * @param total Optional total value
- * @param message Optional status message
- */
-async function sendProgressNotification(
-  progressToken: string | number | undefined,
-  progress: number,
-  total?: number,
-  message?: string
-) {
-  if (!progressToken) return; // Only send if client requested progress
-
-  try {
-    const params: any = {
-      progressToken,
-      progress,
-    };
-
-    if (total !== undefined) params.total = total; // future cache progress
-    if (message) params.message = message;
-
-    await server.notification({
-      method: PROTOCOL.NOTIFICATIONS.PROGRESS,
-      params,
-    });
-  } catch (error) {
-    Logger.error('Failed to send progress notification:', error);
-  }
-}
-
 function startProgressUpdates(operationName: string, progressToken?: string | number) {
   // Per-request state
   const state = {
@@ -97,25 +67,20 @@ function startProgressUpdates(operationName: string, progressToken?: string | nu
     `🔍 ${operationName} - Still working... hang tight for quality results...`,
   ];
 
+  const reporter = new ProgressReporter(progressToken, async params => {
+    try {
+      await server.notification({ method: PROTOCOL.NOTIFICATIONS.PROGRESS, params });
+    } catch (error) {
+      Logger.error('Failed to send progress notification:', error);
+    }
+  });
   let messageIndex = 0;
-  let progress = 0;
 
-  // Send immediate acknowledgment if progress requested
-  if (progressToken) {
-    sendProgressNotification(
-      progressToken,
-      0,
-      undefined, // No total - indeterminate progress
-      `🔍 Starting ${operationName}`
-    );
-  }
+  void reporter.send(`Starting ${operationName}`);
 
   // Keep client alive with periodic updates
   const progressInterval = setInterval(async () => {
-    if (state.isProcessing && progressToken) {
-      // Simply increment progress value
-      progress += 1;
-
+    if (state.isProcessing && progressToken !== undefined) {
       // Include latest output if available
       const baseMessage = progressMessages[messageIndex % progressMessages.length];
       const outputPreview = state.latestOutput.slice(-150).trim(); // Last 150 chars
@@ -123,24 +88,20 @@ function startProgressUpdates(operationName: string, progressToken?: string | nu
         ? `${baseMessage}\n📝 Output: ...${outputPreview}`
         : baseMessage;
 
-      await sendProgressNotification(
-        progressToken,
-        progress,
-        undefined, // No total - indeterminate progress
-        message
-      );
+      await reporter.send(message);
       messageIndex++;
     } else if (!state.isProcessing) {
       clearInterval(progressInterval);
     }
   }, PROTOCOL.KEEPALIVE_INTERVAL); // Every 25 seconds
 
-  return { interval: progressInterval, progressToken, state };
+  return { interval: progressInterval, progressToken, state, reporter };
 }
 
 function stopProgressUpdates(
   progressData: {
     interval: NodeJS.Timeout;
+    reporter: ProgressReporter;
     progressToken?: string | number;
     state?: any;
   },
@@ -152,17 +113,10 @@ function stopProgressUpdates(
   }
   clearInterval(progressData.interval);
 
-  // Send final progress notification if client requested progress
-  if (progressData.progressToken) {
-    sendProgressNotification(
-      progressData.progressToken,
-      100,
-      100,
-      success ? `✅ ${operationName} completed successfully` : `❌ ${operationName} failed`
-    );
-  }
+  void progressData.reporter.send(
+    success ? `${operationName} completed successfully` : `${operationName} failed`
+  );
 }
-
 // logging/setLevel
 server.setRequestHandler(
   SetLevelRequestSchema,
@@ -305,9 +259,19 @@ server.setRequestHandler(CompleteRequestSchema, async (request: CompleteRequest)
 // Start the server
 async function main() {
   Logger.debug('init codex-mcp-tool');
+  await codexJobManager.initialize();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  server.onclose = () => {
+    void codexJobManager.dispose();
+  };
   Logger.debug('codex-mcp-tool listening on stdio');
+}
+
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => {
+    void codexJobManager.dispose().finally(() => process.exit(0));
+  });
 }
 
 main().catch(error => {

@@ -1,5 +1,7 @@
-import spawn from 'cross-spawn';
-import { statSync } from 'fs';
+import { startProcess } from '../jobs/proc.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { statSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { Logger } from './logger.js';
 import {
   resolveBinary,
@@ -139,154 +141,87 @@ async function executeOnce(
   args: string[],
   { onProgress, timeoutMs, maxOutputBytes, cwd, stdinInput }: Omit<ExecuteOptions, 'retry'>
 ): Promise<CommandResult> {
-  return new Promise(resolve => {
-    const startTime = Date.now();
-    const command = resolution.command;
-    Logger.commandExecution(command, args, startTime);
-
-    const childProcess = spawn(command, args, {
-      // Resolving the executable is not enough: `codex` is a JS file with a
-      // `#!/usr/bin/env node` shebang, so the child re-runs a PATH lookup for
-      // `node`. Under a GUI client's minimal PATH that fails with
-      // `env: node: No such file or directory` despite a correct codex path.
-      env: childEnvWithAugmentedPath(),
-      shell: false,
-      // stdin is only opened when we have something to write; otherwise the
-      // child must never be able to read this process's stdin.
-      stdio: [stdinInput !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-      ...(cwd ? { cwd } : {}),
-    });
-
-    if (stdinInput !== undefined) {
-      const stdin = childProcess.stdin;
-      if (stdin) {
-        // The child may exit before consuming the whole prompt; EPIPE here is
-        // expected and must not crash the server.
-        stdin.on('error', (error: NodeJS.ErrnoException) => {
-          if (error.code === 'EPIPE') {
-            Logger.debug('Child closed stdin before the prompt was fully written');
-          } else {
-            Logger.warn('Failed writing prompt to child stdin:', error);
-          }
-        });
-        stdin.end(stdinInput, 'utf8');
-        Logger.debug(`Wrote ${stdinInput.length} chars to child stdin`);
-      } else {
-        Logger.warn('stdin pipe unavailable; prompt could not be delivered');
-      }
+  const startedAt = Date.now();
+  Logger.commandExecution(resolution.command, args, startedAt);
+  const directory = mkdtempSync(join(tmpdir(), 'codex-mcp-exec-'));
+  const stdoutPath = join(directory, 'stdout');
+  const stderrPath = join(directory, 'stderr');
+  let timer: NodeJS.Timeout | undefined;
+  let outputExceeded = false;
+  let bytes = 0;
+  let closed = false;
+  let retain = false;
+  const cleanup = () => {
+    try {
+      rmSync(directory, { recursive: true, force: true });
+    } catch (error) {
+      Logger.warn('Failed removing command output files', error);
     }
-
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    let totalStdoutBytes = 0;
-    let isResolved = false;
-    let outputExceeded = false;
-    // Tracks whether *we* killed the child for running too long. A child that
-    // catches SIGTERM and exits(0) on its own (Codex CLI does this) reports
-    // `signal: null, code: 0` to the 'close' handler — indistinguishable from
-    // a clean finish unless we remember the kill ourselves.
-    let killedByTimeout = false;
-
-    // Set up timeout with SIGKILL fallback
-    const timeoutId = setTimeout(() => {
-      if (!isResolved) {
-        killedByTimeout = true;
-        childProcess.kill('SIGTERM');
-        Logger.warn(`Process timeout after ${timeoutMs}ms, sending SIGTERM`);
-
-        // Give process 5 seconds to terminate gracefully
-        setTimeout(() => {
-          if (!isResolved) {
-            childProcess.kill('SIGKILL');
-            Logger.error(`Process did not terminate, sending SIGKILL`);
-          }
-        }, 5000);
+  };
+  const running = startProcess({
+    exe: resolution.command,
+    args,
+    stdin: stdinInput,
+    env: childEnvWithAugmentedPath(),
+    cwd: cwd ?? process.cwd(),
+    stdout: stdoutPath,
+    stderr: stderrPath,
+    async onSpawn() {
+      timer = setTimeout(() => void running.stop('timeout'), timeoutMs ?? 600000);
+    },
+    onSnapshot() {},
+    onLine() {},
+    onClosed() {
+      closed = true;
+      if (retain) cleanup();
+    },
+    onData(data, stream) {
+      if (stream !== 'stdout') return;
+      bytes += Buffer.byteLength(data);
+      if (maxOutputBytes && bytes > maxOutputBytes) {
+        outputExceeded = true;
+        void running.stop();
+      } else {
+        onProgress?.(data);
       }
-    }, timeoutMs || 600000);
-
-    childProcess.stdout?.on('data', (data: Buffer) => {
-      // Check output size limit
-      if (maxOutputBytes && totalStdoutBytes + data.length > maxOutputBytes) {
-        if (!outputExceeded) {
-          outputExceeded = true;
-          Logger.warn(`Output exceeded ${maxOutputBytes} bytes, stopping collection`);
-          childProcess.kill('SIGTERM');
-        }
-        return;
-      }
-
-      stdoutChunks.push(data);
-      totalStdoutBytes += data.length;
-
-      // Stream progress without buffering
-      if (onProgress) {
-        onProgress(data.toString('utf8'));
-      }
-    });
-
-    // Capture stderr for error reporting
-    childProcess.stderr?.on('data', (data: Buffer) => {
-      stderrChunks.push(data);
-    });
-    childProcess.on('error', error => {
-      if (!isResolved) {
-        isResolved = true;
-        clearTimeout(timeoutId);
-        Logger.error(`Process error:`, error);
-
-        // Check for common errors
-        const errorMessage = error.message;
-        if ((error as any).code === 'ENOENT') {
-          // The executable was verified on disk before spawning, so ENOENT here
-          // points at the environment around it — most often a working
-          // directory that vanished between validation and spawn, or a broken
-          // symlink/interpreter line.
-          resolve({
-            ok: false,
-            code: null,
-            stdout: '',
-            stderr:
-              `Failed to start '${command}' (ENOENT). The executable was found at this path, ` +
-              `so the cause is likely the working directory${cwd ? ` (${cwd})` : ''} ` +
-              `or a broken symlink/interpreter for the executable.`,
-            timedOut: false,
-          });
-        } else {
-          resolve({
-            ok: false,
-            code: null,
-            stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-            stderr: errorMessage,
-            timedOut: false,
-          });
-        }
-      }
-    });
-    childProcess.on('close', (code, signal) => {
-      if (!isResolved) {
-        isResolved = true;
-        clearTimeout(timeoutId);
-
-        const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-        const stderr = Buffer.concat(stderrChunks).toString('utf8');
-        const timedOut = killedByTimeout || signal === 'SIGTERM' || signal === 'SIGKILL';
-
-        Logger.commandComplete(startTime, code, stdout.length);
-
-        resolve({
-          ok: code === 0 && !outputExceeded && !timedOut,
-          code,
-          signal: signal || undefined,
-          stdout: stdout.trim(),
-          stderr: stderr.trim(),
-          timedOut,
-          partialStdout: timedOut || outputExceeded ? stdout : undefined,
-        });
-      }
-    });
+    },
   });
+  try {
+    const outcome = await running.done;
+    clearTimeout(timer);
+    retain = !!outcome.killFailed && !closed;
+    const read = (path: string) => {
+      try {
+        return readFileSync(path)
+          .subarray(0, maxOutputBytes ?? 50 * 1024 * 1024)
+          .toString('utf8')
+          .trim();
+      } catch {
+        return '';
+      }
+    };
+    const stdout = read(stdoutPath);
+    const stderr =
+      outcome.error ||
+      (outcome.killFailed
+        ? 'kill-failed: process termination could not be confirmed'
+        : read(stderrPath));
+    const timedOut = outcome.kind === 'timeout';
+    Logger.commandComplete(startedAt, outcome.code, stdout.length);
+    return {
+      ok: outcome.kind === 'exit' && outcome.code === 0 && !outputExceeded,
+      code: outcome.code,
+      signal: outcome.signal,
+      stdout,
+      stderr,
+      timedOut,
+      partialStdout: timedOut || outputExceeded ? stdout : undefined,
+    };
+  } finally {
+    clearTimeout(timer);
+    if (!retain) cleanup();
+  }
 }
-
 /**
  * Backward compatible wrapper that returns stdout string
  */

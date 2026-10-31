@@ -79,6 +79,7 @@ export default withMermaid(
               text: 'Tools',
               items: [
                 { text: 'ask-codex', link: '/api/tools/ask-codex' },
+                { text: 'Background jobs', link: '/agent-jobs' },
                 { text: 'brainstorm', link: '/api/tools/brainstorm' },
                 { text: 'ping', link: '/api/tools/ping' },
                 { text: 'help', link: '/api/tools/help' },

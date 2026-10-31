@@ -5,6 +5,7 @@ import { MODELS, CLI } from '../constants.js';
 import { Logger } from '../utils/logger.js';
 import { resolveWorkingDirectory } from '../utils/workingDirResolver.js';
 import { isValidModel, assertReasoningEffortSupported } from '../utils/modelDetection.js';
+import { readConfig } from '../jobs/config.js';
 
 const reviewCodexArgsSchema = z.object({
   prompt: z
@@ -29,7 +30,7 @@ const reviewCodexArgsSchema = z.object({
     .string()
     .optional()
     .describe(
-      `Optional model override. Known: ${Object.values(MODELS).join(', ')}. If omitted, uses your Codex CLI default (~/.codex/config.toml).`
+      `Optional model override. Known: ${Object.values(MODELS).join(', ')}. Default: gpt-6-astra.`
     ),
   reasoningEffort: z
     .enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
@@ -91,8 +92,10 @@ export const reviewCodexTool: UnifiedTool = {
         cmdArgs.push(CLI.FLAGS.WORKING_DIR, resolvedDir);
       }
 
-      // Model selection via config. When omitted, defer to Codex CLI config/default.
-      const selectedModel = model as string | undefined;
+      const selectedModel =
+        (model as string | undefined) ??
+        readConfig().connectors.codex?.reviewModel ??
+        MODELS.GPT6_ASTRA;
       if (selectedModel) {
         if (!isValidModel(selectedModel)) {
           Logger.warn(`Model '${selectedModel}' not in known list — passing through to Codex CLI`);
@@ -102,13 +105,7 @@ export const reviewCodexTool: UnifiedTool = {
 
       // Reasoning effort (defaults to 'high' via zod schema — code review benefits from depth)
       const effort = reasoningEffort as
-        | 'low'
-        | 'medium'
-        | 'high'
-        | 'xhigh'
-        | 'max'
-        | 'ultra'
-        | undefined;
+        'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | undefined;
       if (effort) {
         // This tool builds its own argument list, so it does not inherit
         // CodexCommandBuilder's validation — check the pairing explicitly.
@@ -136,9 +133,9 @@ export const reviewCodexTool: UnifiedTool = {
         cmdArgs.push('--title', title as string);
       }
 
-      // Custom review instructions (positional arg after flags)
+      // Custom instructions always go through stdin, including short prompts.
       if (prompt) {
-        cmdArgs.push(prompt as string);
+        cmdArgs.push('-');
       }
 
       if (onProgress) {
@@ -152,6 +149,7 @@ export const reviewCodexTool: UnifiedTool = {
         onProgress,
         timeoutMs: (timeout as number) || 600000, // 10 minutes default
         cwd: resolvedDir || undefined,
+        stdinInput: prompt as string | undefined,
       });
 
       // Codex CLI may output to stderr, so check both

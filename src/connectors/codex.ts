@@ -1,0 +1,137 @@
+import type { Connector, JobEvent, JobSpec } from '../jobs/connector.js';
+import {
+  resolveBinary,
+  describeUnresolvedBinary,
+  CODEX_PATH_ENV,
+} from '../utils/binaryResolver.js';
+import { MODELS } from '../constants.js';
+import { getCodexVersion, checkMinimumCodexVersion } from '../utils/versionDetection.js';
+import { runCommand } from '../jobs/proc.js';
+
+export function usageReset(message: string, now = new Date()): number | undefined {
+  const time = /try again at\s+(\d{1,2}):(\d{2})\s*(AM|PM)\b/i.exec(message);
+  if (!time) return undefined;
+  const hour = Number(time[1]);
+  const minute = Number(time[2]);
+  if (hour < 1 || hour > 12 || minute > 59) return undefined;
+  const reset = new Date(now);
+  reset.setHours((hour % 12) + (time[3].toUpperCase() === 'PM' ? 12 : 0), minute, 0, 0);
+  if (reset.getTime() <= now.getTime()) reset.setDate(reset.getDate() + 1);
+  return reset.getTime();
+}
+
+export class CodexConnector implements Connector {
+  readonly id = 'codex';
+  readonly reviewModel = 'gpt-6-astra';
+
+  constructor(
+    private run = runCommand,
+    private resolve = () => resolveBinary('codex', CODEX_PATH_ENV)
+  ) {}
+
+  async detect() {
+    const resolution = this.resolve();
+    if (!resolution.resolved)
+      return {
+        available: false,
+        reason: describeUnresolvedBinary('codex', resolution, CODEX_PATH_ENV),
+      };
+    const version = await getCodexVersion();
+    const minimum = await checkMinimumCodexVersion();
+    if (!version.isValid || !minimum.ok)
+      return {
+        available: false,
+        exe: resolution.command,
+        version: version.raw,
+        reason:
+          minimum.message ||
+          'Codex CLI could not start. Install a supported CLI, run codex login, and reconnect this MCP server.',
+      };
+    return { available: true, exe: resolution.command, version: version.raw };
+  }
+
+  async models(): Promise<string[]> {
+    try {
+      const resolution = this.resolve();
+      if (resolution.resolved) {
+        const catalog = JSON.parse(
+          await this.run(resolution.command, ['debug', 'models'], undefined, 10000)
+        );
+        const entries = Array.isArray(catalog) ? catalog : catalog.models;
+        if (Array.isArray(entries)) {
+          const models = entries
+            .map(item => (typeof item === 'string' ? item : (item.slug ?? item.id ?? item.model)))
+            .filter((id): id is string => typeof id === 'string');
+          if (models.length) return models;
+        }
+      }
+    } catch {
+      /* Older/offline CLIs still have a useful known-model list. */
+    }
+    return Object.values(MODELS);
+  }
+
+  async health() {
+    const detection = await this.detect();
+    return {
+      ...detection,
+      version: detection.available ? (await getCodexVersion()).raw : undefined,
+      models: await this.models(),
+      reviewModel: this.reviewModel,
+    };
+  }
+
+  sandboxDirs(job: JobSpec): string[] {
+    return job.worktree ? [job.worktree.gitDir] : [];
+  }
+
+  build(job: JobSpec) {
+    const args: string[] = [];
+    // Sandbox flags are global; exec resume accepts only a subset of exec flags.
+    if (job.mode === 'full') args.push('--dangerously-bypass-approvals-and-sandbox');
+    else args.push('-s', job.mode === 'write' ? 'workspace-write' : 'read-only');
+    if (job.model) args.push('-m', job.model);
+    if (job.effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(job.effort)}`);
+    for (const dir of this.sandboxDirs(job)) args.push('--add-dir', dir);
+    args.push('exec');
+    if (job.resumeSession) args.push('resume', job.resumeSession);
+    args.push('--json', '-o', job.finalPath, '-');
+    return { exe: this.resolve().command, args, stdin: job.prompt };
+  }
+
+  parse(line: string, _stream: 'stdout' | 'stderr'): JobEvent | null {
+    let event: Record<string, any>;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      if (!/usage limit/i.test(line)) return null;
+      event = { type: 'error', message: line };
+    }
+    if (!event || typeof event !== 'object') return null;
+    if (event.type === 'thread.started' && typeof event.thread_id === 'string')
+      return { sessionId: event.thread_id };
+    if (
+      event.type === 'item.completed' &&
+      event.item?.type === 'agent_message' &&
+      typeof event.item.text === 'string'
+    )
+      return { final: event.item.text };
+    if (event.type === 'error' || event.type === 'turn.failed') {
+      const message =
+        event.message ??
+        event.error?.message ??
+        (typeof event.error === 'string' ? event.error : JSON.stringify(event.error ?? event));
+      const error = String(message);
+      return {
+        error,
+        usageLimit: /(?:hit your|reached|exceeded|hit the)?\s*usage limit/i.test(error)
+          ? {
+              resetAt: usageReset(error),
+              model: /\bmodel\s+["']?([a-z0-9][a-z0-9._-]*)/i.exec(error)?.[1],
+            }
+          : undefined,
+      };
+    }
+    return null;
+  }
+}

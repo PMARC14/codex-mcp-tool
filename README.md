@@ -13,6 +13,8 @@ MCP server connecting Claude/Cursor to Codex CLI. Enables code analysis via `@` 
 
 ## Features
 
+- **Background jobs and worktrees** — `codex_job_*` tools share a persistent queue and machine-wide limit with the agy fork. See [agent jobs](docs/agent-jobs.md).
+
 - **File Analysis** — Reference files with `@src/`, `@package.json` syntax
 - **Multi-Turn Sessions** — Conversation continuity with workspace isolation
 - **Native Resume** — Uses `codex resume` for context preservation (CLI v0.36.0+)
@@ -119,7 +121,7 @@ came back opaque is flagged.
 
 ## Models
 
-By default the `model` parameter is **omitted** and Codex CLI applies the
+Except for `review-changes` (default `gpt-6-astra`), the `model` parameter is **omitted** and Codex CLI applies the
 default model from your `~/.codex/config.toml` (for example `model = "gpt-6.1-sol"`).
 Pass `model` only when you need to override the configured default for a
 single call. Reasoning depth is calibrated per tool:

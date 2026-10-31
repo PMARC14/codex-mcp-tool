@@ -528,24 +528,9 @@ export class CodexCommandBuilder {
       finalPrompt = `Please provide a focused, concise response without unnecessary elaboration. ${finalPrompt}`;
     }
 
-    // Large prompts are delivered over stdin rather than argv. Codex CLI reads
-    // instructions from stdin when the prompt argument is `-`; that avoids both
-    // the OS argv length limit (E2BIG) and any dependence on the agent choosing
-    // to read a file for us.
-    const MAX_COMMAND_LINE_LENGTH = 100000;
-    const useStdin =
-      options?.useStdinForLongPrompts !== false && finalPrompt.length > MAX_COMMAND_LINE_LENGTH;
-
-    let stdinInput: string | undefined;
-
-    if (useStdin) {
-      stdinInput = finalPrompt;
-      this.args.push('-');
-      Logger.debug(`Prompt is ${finalPrompt.length} chars, sending it over stdin via '-'`);
-    } else {
-      // Normal prompt handling
-      this.args.push(finalPrompt);
-    }
+    // Always use stdin: Windows command lines are limited to 32,767 characters.
+    const stdinInput = finalPrompt;
+    this.args.push('-');
 
     return {
       args: this.args,

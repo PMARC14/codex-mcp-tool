@@ -13,6 +13,8 @@ import {
   CODEX_PATH_ENV,
 } from '../utils/binaryResolver.js';
 import { Logger } from '../utils/logger.js';
+import { CodexConnector } from '../connectors/codex.js';
+import { readConfig } from '../jobs/config.js';
 
 const healthArgsSchema = z.object({
   sessionId: z.string().optional().describe('Optional session ID to check specific session health'),
@@ -29,6 +31,10 @@ interface HealthStatus {
     path: string;
     /** How the path was found: override, PATH lookup, or unresolved. */
     resolvedVia: string;
+    models?: string[];
+    reviewModel?: string;
+    defaultModel?: string | null;
+    jobsEnabled?: boolean;
   };
   features: Record<string, boolean>;
   sessions: {
@@ -66,6 +72,7 @@ async function checkAuthentication(): Promise<boolean> {
  */
 async function buildHealthStatus(sessionId?: string, verbose?: boolean): Promise<HealthStatus> {
   const issues: string[] = [];
+  const jobsConfig = readConfig().connectors.codex;
   let overallStatus: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
 
   // 1. Check Codex CLI
@@ -139,6 +146,10 @@ async function buildHealthStatus(sessionId?: string, verbose?: boolean): Promise
       authenticated: isAuthenticated,
       path: resolution.resolved ? resolution.command : 'not found',
       resolvedVia: resolution.source,
+      models: await new CodexConnector().models(),
+      reviewModel: jobsConfig?.reviewModel ?? 'gpt-6-astra',
+      defaultModel: jobsConfig?.defaultModel ?? null,
+      jobsEnabled: jobsConfig?.enabled !== false,
     },
     features,
     sessions: {
@@ -169,6 +180,7 @@ function formatHealthReport(health: HealthStatus, verbose: boolean): string {
   output += `| Version | ${health.codexCli.version} |\n`;
   output += `| Executable | \`${health.codexCli.path}\` (${health.codexCli.resolvedVia}) |\n`;
   output += `| Authenticated | ${health.codexCli.authenticated ? '✅ Yes' : '⚠️ Unknown'} |\n\n`;
+  output += `Review model: ${health.codexCli.reviewModel ?? 'gpt-6-astra'}\n\nKnown models: ${(health.codexCli.models ?? []).join(', ')}\n\n`;
 
   // Compatibility
   if (verbose) {
