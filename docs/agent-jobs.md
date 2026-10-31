@@ -56,6 +56,6 @@ After the job stops, collect with `remove: "none"`, `"worktree"`, or `"worktree+
 
 ## Development
 
-`src/jobs/` is the portable source of truth in this fork. From Git Bash or Bash, `scripts/sync-jobs.sh [sibling-repository]` copies it into the agy fork. The comparison test fails on differences when the sibling copy exists; it skips until that fork installs the module. Set `AGENT_JOBS_MIRROR` to require comparison against a specific copy.
+`src/jobs/` is the portable source of truth in this fork. From Git Bash or Bash, `scripts/sync-jobs.sh [sibling-repository]` copies it into the agy fork (the script is identical in both repos and expects both to sit side by side). The comparison test fails on differences when the sibling copy exists. Set `AGENT_JOBS_MIRROR` to require comparison against a specific copy.
 
 Run `npm test` for the fake-worker suite; it starts no real Codex jobs. Real CLI integration, resume behavior, orphan cleanup with CLI-created commands, Fedora wake inhibition, and a human check for window flashes require a separate opt-in integration run.
