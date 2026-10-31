@@ -43,12 +43,16 @@ export class JobManager {
   private active = new Map<string, { process: RunningProcess; finished: Promise<void> }>();
   private hold: WakeHold;
   private disposed = false;
+  private readonly kill: typeof killTree;
+  private cleanupTried = new Map<string, number>();
 
   constructor(
     readonly connector: Connector,
     config = readConfig(),
-    private logger = quiet
+    private logger = quiet,
+    deps: { killTree?: typeof killTree } = {}
   ) {
+    this.kill = deps.killTree ?? killTree;
     this.config = config;
     this.store = new JobStore(config.home);
     this.hold = new WakeHold(config.home, logger);
@@ -71,16 +75,7 @@ export class JobManager {
               this.store.write(job);
             }
           } else {
-            await killTree(job.process, job.descendants).catch(error =>
-              this.logger.warn(`Lost job ${job.id} cleanup failed`, error)
-            );
-            this.store.write({
-              ...job,
-              state: 'lost',
-              reserved: false,
-              reason: 'owner_gone',
-              finishedAt: Date.now(),
-            });
+            await this.recoverOrphan(job, Date.now());
           }
         }
         this.store.prune();
@@ -91,6 +86,26 @@ export class JobManager {
       );
       this.timer.unref();
     })());
+  }
+
+  // Must run under the shared lock. The slot and the identities needed to retry the cleanup are
+  // only dropped once the tree is confirmed dead; a later recovery pass retries the same record.
+  private async recoverOrphan(job: JobMeta, now: number): Promise<void> {
+    if (job.state === 'lost' && now - (this.cleanupTried.get(job.id) ?? 0) < 2000) return;
+    this.cleanupTried.set(job.id, now);
+    let confirmed = true;
+    await this.kill(job.process, job.descendants).catch(error => {
+      confirmed = false;
+      this.logger.warn(`Lost job ${job.id} cleanup failed; keeping its slot`, error);
+    });
+    this.store.write({
+      ...job,
+      state: 'lost',
+      reserved: !confirmed,
+      reason: 'owner_gone',
+      finishedAt: job.finishedAt ?? now,
+    });
+    if (confirmed) this.cleanupTried.delete(job.id);
   }
 
   private owns(job: JobMeta): boolean {
@@ -224,16 +239,7 @@ export class JobManager {
               }
               continue;
             }
-            await killTree(job.process, job.descendants).catch(error =>
-              this.logger.warn(`Lost job ${job.id} cleanup failed`, error)
-            );
-            Object.assign(job, {
-              state: 'lost',
-              reserved: false,
-              reason: 'owner_gone',
-              finishedAt: now,
-            });
-            this.store.write(job);
+            await this.recoverOrphan(job, now);
           }
         }
         // Pauses are records in the common store, including after a restart.
@@ -573,7 +579,7 @@ export class JobManager {
       throw new Error('Only paused, lost or failed jobs can be requeued');
     if (original.reserved)
       throw new Error(
-        'The process is still alive after kill-failed; cancel it from its owner before requeueing'
+        'The process is still alive after kill-failed or owner loss; wait until cleanup is confirmed before requeueing'
       );
     if (agent === this.connector.id) await this.available();
     const id = randomUUID();

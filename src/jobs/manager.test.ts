@@ -248,3 +248,53 @@ test('unavailable or disabled CLI fails start immediately with an install hint',
     f.cleanup();
   }
 });
+
+test('failed orphan cleanup keeps the slot and cleanup identities until termination is confirmed', async () => {
+  const f = fixture();
+  const store = new JobStore(f.home);
+  const dead = { ...(await currentOwner()), startTime: 'reused-pid' };
+  const root = { pid: 424242, startTime: '1' };
+  const child = { pid: 424243, startTime: '2' };
+  store.create(
+    meta(f.home, {
+      id: 'orphan',
+      state: 'running',
+      reserved: true,
+      owner: dead,
+      process: root,
+      descendants: [child],
+    }),
+    'p'
+  );
+  let terminated = false;
+  const attempts: unknown[] = [];
+  const manager = new JobManager(fakeConnector(f.script), f.config, undefined, {
+    async killTree(rootIdentity, children) {
+      attempts.push([rootIdentity, children]);
+      if (!terminated) throw new Error('kill-failed: processes in the tree are still alive');
+    },
+  });
+  try {
+    await manager.initialize();
+    const orphan = store.get('orphan');
+    assert.equal(orphan.state, 'lost');
+    assert.equal(orphan.reserved, true);
+    assert.deepEqual(orphan.process, root);
+    assert.deepEqual(orphan.descendants, [child]);
+    await assert.rejects(() => manager.requeue('orphan'), /still alive/);
+    const next = await manager.start({ prompt: 'next', cwd: f.home });
+    await new Promise(resolveWait => setTimeout(resolveWait, 1500));
+    assert.equal(
+      store.get(next.jobId).state,
+      'queued',
+      'the orphan still counts against the limit'
+    );
+    terminated = true;
+    await until(() => store.get('orphan').reserved === false, 'cleanup retried');
+    assert.deepEqual(attempts.at(-1), [root, [child]]);
+    assert.equal((await manager.result(next.jobId, 10)).state, 'completed');
+  } finally {
+    await manager.dispose();
+    f.cleanup();
+  }
+});
