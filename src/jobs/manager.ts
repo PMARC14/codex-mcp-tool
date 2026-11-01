@@ -415,6 +415,9 @@ export class JobManager {
           const parsed = this.connector.parse(line, stream);
           if (!parsed) return;
           event = { ...event, ...parsed, usageLimit: parsed.usageLimit ?? event.usageLimit };
+          // A later answer supersedes an earlier error: agy read mode runs a plan
+          // turn (which can end empty, with denials) before the real answer.
+          if (parsed.final && !parsed.error) event.error = undefined;
           if (parsed.sessionId) {
             job.sessionId = parsed.sessionId;
             this.store.save(job, this.owner);

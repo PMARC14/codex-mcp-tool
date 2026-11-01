@@ -410,3 +410,30 @@ test('collect refuses to remove a worktree that a requeued replacement still use
     f.cleanup();
   }
 });
+
+test('a final answer after an intermediate error completes the job (agy read mode answers on turn 2)', async () => {
+  const f = fixture();
+  const base = fakeConnector(f.script);
+  // The fake worker writes opts.stderr first, then the final answer on stdout.
+  const connector = {
+    ...base,
+    parse(line: string, stream: 'stdout' | 'stderr') {
+      if (stream === 'stderr' && line.includes('empty turn')) return { error: 'agy produced no response' };
+      return base.parse(line, stream);
+    },
+  };
+  const manager = new JobManager(connector, f.config);
+  try {
+    const { jobId } = await manager.start({
+      prompt: JSON.stringify({ stderr: 'empty turn\n', final: 'the review', waitMs: 50 }),
+      cwd: f.home,
+    });
+    await until(async () => !['queued', 'running'].includes((await manager.result(jobId)).state), 'job end');
+    const result = await manager.result(jobId);
+    assert.equal(result.state, 'completed');
+    assert.equal(result.final, 'the review');
+  } finally {
+    await manager.dispose?.();
+    f.cleanup();
+  }
+});
