@@ -47,6 +47,18 @@ export interface StartOptions {
 const sleep = (ms: number) => new Promise(resolveResult => setTimeout(resolveResult, ms));
 const quiet: JobLogger = { warn() {} };
 
+/** The last 30 lines of stderr then stdout, each cut to 300 characters, at most 4000 in total. */
+export function compactDiagnostics(stderr: string, stdout: string): string {
+  const lines = `${stderr.trim()}\n${stdout.trim()}`
+    .split(/\r?\n/)
+    .filter(line => line.trim())
+    .slice(-30)
+    .map(line => (line.length > 300 ? `${line.slice(0, 300)}…` : line));
+  // Drop the oldest lines first, so the newest (most telling) ones survive.
+  while (lines.length > 1 && lines.join('\n').length > 4000) lines.shift();
+  return lines.join('\n').slice(-4000);
+}
+
 export class JobManager {
   readonly store: JobStore;
   readonly config: JobsConfig;
@@ -562,9 +574,12 @@ export class JobManager {
       final: final.text,
       truncated: final.total > 20000,
       finalPath: job.finalPath,
-      diagnostics: final.text.trim()
-        ? undefined
-        : `${this.tail(jobId, 'stderr', 30)}\n${this.tail(jobId, 'stdout', 30)}`.slice(-20000),
+      // Only once a job has stopped with no final text: while it runs, the
+      // stdout tail is raw event JSON that would flood the caller's context.
+      diagnostics:
+        final.text.trim() || ['queued', 'running'].includes(job.state)
+          ? undefined
+          : compactDiagnostics(this.tail(jobId, 'stderr', 30), this.tail(jobId, 'stdout', 30)),
     };
   }
 
