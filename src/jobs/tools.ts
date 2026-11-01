@@ -57,10 +57,10 @@ export function registerJobTools(
           .min(1)
           .describe('Absolute working directory. Resume runs in this directory too.'),
         mode: z
-          .enum(['read', 'write', 'full'])
+          .enum(['read', 'write', 'trusted', 'full'])
           .default('read')
           .describe(
-            'read: inspect only; write: edit in workspace sandbox; full: explicitly bypass all sandboxing and approvals.'
+            'read: inspect only; write: edit in workspace sandbox; trusted: edit and run commands with no sandbox (needed for bash/npm tests on Windows), for worktree jobs on the user\'s own repos; full: explicitly bypass all sandboxing and approvals.'
           ),
         model: z
           .string()

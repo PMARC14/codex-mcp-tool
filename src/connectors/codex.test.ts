@@ -23,6 +23,7 @@ const spec: JobSpec = {
 for (const [mode, expected] of [
   ['read', 'read-only'],
   ['write', 'workspace-write'],
+  ['trusted', 'danger-full-access'],
   ['full', '--dangerously-bypass-approvals-and-sandbox'],
 ] as const) {
   test(`Codex build ${mode} mode keeps prompt off argv and supports resume`, () => {

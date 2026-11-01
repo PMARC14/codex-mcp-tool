@@ -23,7 +23,10 @@ export interface JobSpec {
   connector: string;
   prompt: string;
   cwd: string;
-  mode: 'read' | 'write' | 'full';
+  // trusted: no sandbox but the CLI's normal approval rules. Windows CLI
+  // sandboxes break Git Bash/MSYS2 (CreateFileMapping error 5), so jobs that
+  // run bash or npm tests need it. full also bypasses approvals.
+  mode: 'read' | 'write' | 'trusted' | 'full';
   model?: string;
   effort?: string;
   label?: string;

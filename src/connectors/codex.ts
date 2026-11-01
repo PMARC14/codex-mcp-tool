@@ -89,7 +89,7 @@ export class CodexConnector implements Connector {
     const args: string[] = [];
     // Sandbox flags are global; exec resume accepts only a subset of exec flags.
     if (job.mode === 'full') args.push('--dangerously-bypass-approvals-and-sandbox');
-    else args.push('-s', job.mode === 'write' ? 'workspace-write' : 'read-only');
+    else args.push('-s', { read: 'read-only', write: 'workspace-write', trusted: 'danger-full-access' }[job.mode]);
     if (job.model) args.push('-m', job.model);
     if (job.effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(job.effort)}`);
     for (const dir of this.sandboxDirs(job)) args.push('--add-dir', dir);
