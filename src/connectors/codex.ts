@@ -95,7 +95,8 @@ export class CodexConnector implements Connector {
     for (const dir of this.sandboxDirs(job)) args.push('--add-dir', dir);
     args.push('exec');
     if (job.resumeSession) args.push('resume', job.resumeSession);
-    args.push('--json', '-o', job.finalPath, '-');
+    // Advice and debate jobs run outside any repo; Codex refuses those without this.
+    args.push('--skip-git-repo-check', '--json', '-o', job.finalPath, '-');
     return { exe: this.resolve().command, args, stdin: job.prompt };
   }
 

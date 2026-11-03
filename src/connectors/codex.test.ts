@@ -114,3 +114,11 @@ test('usage reset uses local time and rolls over midnight', () => {
   assert.equal(usageReset('try again at 25:99 PM', now), undefined);
   assert.equal(usageReset('no reset'), undefined);
 });
+
+test('Codex jobs run outside git repos too (advice and debate need no repo)', () => {
+  for (const resumeSession of [undefined, 'session-id']) {
+    const { args } = connector.build({ ...spec, mode: 'read', resumeSession });
+    assert.ok(args.includes('--skip-git-repo-check'), `missing for resume=${resumeSession}`);
+    assert.ok(args.indexOf('--skip-git-repo-check') > args.indexOf('exec'));
+  }
+});
