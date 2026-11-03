@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Background jobs and worktrees**: shared queue and store, four execution modes, cancellation, usage-limit pause and requeue, and binary patch collection.
+- **`codex_usage`**: report rate-limit snapshots from Codex session logs.
+- **Claude Code channels**: opt-in metadata notifications when jobs stop.
+- **Windows job support**: hidden processes, shim resolution, process-tree cleanup, and wake hold.
+
 ## [2.6.0] - 2026-09-30
 
 ### Changed
