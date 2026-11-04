@@ -4,6 +4,7 @@ import { closeSync, openSync, readFileSync, readSync, writeSync, statSync } from
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { Owner } from './connector.js';
 import { updateStdin, type StdinPlan } from './stdin.js';
+import { jobWrapper } from './jobobject.js';
 
 /** stdin write errors that only mean the child stopped reading (EOF is the Windows form of EPIPE). */
 const CLOSED_PIPE_CODES = new Set(['EPIPE', 'EOF', 'ECONNRESET']);
@@ -43,7 +44,7 @@ export function spawnOptions(platform = process.platform): SpawnOptions {
   return { windowsHide: true, shell: false, ...(platform === 'win32' ? {} : { detached: true }) };
 }
 
-export function safeSpawn(exe: string, args: string[], options: SpawnOptions): ChildProcess {
+export function safeSpawn(exe: string, args: string[], options: SpawnOptions, wrapJob = false): ChildProcess {
   if (process.platform === 'win32') {
     if (!isAbsolute(exe) && !/[\\/]/.test(exe)) {
       const env = options.env ?? process.env;
@@ -89,7 +90,10 @@ export function safeSpawn(exe: string, args: string[], options: SpawnOptions): C
       throw new Error(`Not a working directory: ${options.cwd}`);
   }
   if (process.platform === 'win32') delete spawnArgs.detached;
-  return spawn(command.exe, command.args, spawnArgs);
+  const wrapper = wrapJob ? jobWrapper() : undefined;
+  return wrapper
+    ? spawn(wrapper, [command.exe, ...command.args], spawnArgs)
+    : spawn(command.exe, command.args, spawnArgs);
 }
 
 /** Raw stdout bytes; callers that need exact content (patches) must not go through a string. */
@@ -445,7 +449,7 @@ export function startProcess(options: {
       cwd: options.cwd,
       env: options.env,
       stdio: [options.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-    });
+    }, true);
     child.once('close', () => {
       void complete();
     });
