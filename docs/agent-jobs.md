@@ -33,11 +33,61 @@ The default mode is `read` (`read-only`) for inspection. `write` allows edits in
 
 `codex_job_result` returns diagnostics only when a job has stopped without final text. Diagnostics are capped at 30 lines, 300 characters per line, and 4,000 characters total. A later final answer supersedes an earlier intermediate error.
 
-`codex_job_watch` keeps its MCP call pending until the job is completed, failed, killed, paused, or lost, or the wait expires. With a client-supplied progress token it reports immediately on local state changes and at least every 20 seconds while waiting. Messages have the form `running | 42s | last event or step summary`, on one line and capped at 120 characters. The heartbeat reads only metadata and the stdout tail; it never starts a process or probes process liveness. Changes written by another server are observed on the next heartbeat. Without a progress token no notifications are sent. A wait timeout returns `timedOut: true`; cancelling the watch only cancels the wait, leaving the job running. A client disconnect also ends the watch; running jobs continue and save their results after the MCP connection closes. In Claude Code the pending call becomes a background task after two minutes, showing the latest progress message and delivering the result when the watch settles.
+`codex_job_watch` keeps its MCP call pending until the job is completed, failed, killed, paused, or lost, or the wait expires. With a client-supplied progress token it reports immediately on local state changes and at least every 20 seconds while waiting. Messages have the form `running | 42s | last event or step summary`, on one line and capped at 120 characters. The heartbeat reads only metadata and the stdout tail; it never starts a process or probes process liveness. Changes written by another server are observed on the next heartbeat. Without a progress token no notifications are sent. A wait timeout returns `timedOut: true`; cancelling the watch only cancels the wait, leaving the job running. A client disconnect also ends the watch; running jobs continue and save their results after the MCP connection closes. When called without MCP task augmentation, Claude Code can background the pending call after two minutes. Task-augmented calls return their task handle immediately, as described below.
 
 `codex_job_send` requires a stopped job (`completed`, `failed`, `killed`, `paused`, or `lost`) with a `sessionId`. It starts a new job with the message as its prompt, resumes that native CLI session, and records `followUpOf` in its metadata. It preserves the connector, mode, model, effort, timeout, and existing worktree. If the worktree was removed or is missing, it falls back to the original working directory (older records fall back to the repository root). Follow-ups use the same queue, usage budgets, and machine-wide slot limit as `codex_job_start`; another connector's follow-up waits for that server to pick it up. Sending to a paused job atomically marks the original `killed` with `reason: "superseded"`, `supersededBy` pointing to the follow-up, and a new `finishedAt`, while preserving the connector/model quota pause. Status, result, and watch expose `supersededBy`; watching the original returns immediately. For a running or queued job, first use `codex_job_watch` and send once it stops, or call `codex_job_cancel`. A job whose process cleanup is still unconfirmed cannot receive a follow-up.
 
 `codex_job_requeue` creates a replacement from a paused, lost, or failed job's saved prompt, optionally changing its model or handing it to another connector with `agent`. For a paused original, replacement creation and the transition to `killed`/`superseded` happen under the same lock, recording `supersededBy` and `finishedAt`. The connector/model quota pause remains in force for new jobs; a manual requeue can still attempt a retry, and a successful retry can lift that pause. Older paused originals whose retry was cleared and which have a `requeuedFrom` or `followUpOf` replacement are migrated to this terminal state when their owning server's pump next sees them.
+
+## MCP tasks (no launch flag)
+
+Only `codex_job_start` and `codex_job_watch` support task augmentation. Ordinary calls retain their existing responses, progress notifications, cancellation semantics, and optional channels. A task start launches the same job as an ordinary start. A task watch adopts the supplied `jobId` immediately; it tracks the job through pauses and automatic retries, independent of `maxWaitSec`. Its final payload is `job_result`, without the ordinary watch's `watchedSec` and `timedOut` fields.
+
+Task IDs equal job IDs. State and results come from the shared job store; a small `jobs/<id>/mcp-task.json` marker records membership in `tasks/list` across reconnects. Listing includes task-augmented jobs for this connector only. Read-only `tasks/get` and `tasks/result` also accept any known job ID for this connector, without subscribing the new connection to notifications. Cancellation retains the job manager's existing ownership checks: another server process can read a job but cannot cancel it.
+
+| Job state | Task status | Message |
+| --- | --- | --- |
+| queued, running | `working` | The same bounded progress line as ordinary watch |
+| paused | `working` | Paused until the ISO reset time, or reset time unknown |
+| completed | `completed` | Watch progress line |
+| failed, lost | `failed` | Watch progress line |
+| killed | `cancelled` | Watch progress line |
+| killed with reason superseded | `cancelled` | Names `supersededBy`; the replacement has its own job/task ID |
+
+Polling is suggested every 5,000 ms. Status reads use saved metadata and a bounded stdout tail; they never spawn a process or probe process liveness. The server sends `notifications/tasks/status` on local state transitions only for tasks started or adopted through the current connection. Closing the connection removes its subscription and leaves workers running. Foreign writes are visible on polling. `tasks/result` waits for a terminal state using transitions plus a 5-second metadata check, and returns exactly the same JSON text and MCP content wrapper as `codex_job_result`. Cancelling that pending request only stops the wait; `tasks/cancel` stops the job. Requested TTLs do not shorten job retention: `ttl` / `ttlMs` is `null`, with no separate task expiry timer; the existing cleanup of terminal jobs older than seven days still applies.
+
+### Negotiation and wire shapes
+
+The installed SDK inspected during implementation is `@modelcontextprotocol/sdk` **1.32.2**. It supports the **2025-11-25** task schemas, tool execution metadata, experimental task helpers, and raw request handlers. It does not implement 2026-07-28 discovery or result envelopes. No dependency change is needed: `src/tools/mcp-tasks.ts` provides the task handlers and a stdio envelope adapter for the newer era.
+
+The 2025 initialize handshake advertises `tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } }`. `tools/list` includes `execution: { taskSupport: "optional" }` on just the two tools. A legacy task request is:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex_job_start","arguments":{"prompt":"Inspect this repository","cwd":"C:/repo"},"task":{}}}
+```
+
+It returns `{ "task": { "taskId": "<jobId>", "status": "working", "ttl": null, "createdAt": "<ISO>", "lastUpdatedAt": "<ISO>", "pollInterval": 5000, "statusMessage": "queued | 0s" } }`. The optional `task.ttl` request field is accepted. `tasks/get`, `tasks/result`, and `tasks/cancel` take `{ "taskId": "<jobId>" }`; get/cancel return the task fields directly, result returns the tool content. `tasks/list` takes no parameters (or `{}`) and returns `{ "tasks": [...] }`, with no pagination. Status notifications put the task fields directly in `params`.
+
+Claude Code **2.1.318** binary inspection found that its default **v2** runtime probes `server/discover` for modern protocol support. This server offers `supportedVersions: ["2026-07-28"]` and `capabilities.extensions: { "io.modelcontextprotocol/tasks": {} }`. Claude's modern tool-call path accepts tasks only when the negotiated era is modern and its own task gates permit them (`allowTask: true`). The client declares task permission per request in its metadata envelope:
+
+```json
+{
+  "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+  "params": {
+    "name": "codex_job_watch", "arguments": { "jobId": "<jobId>" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": { "extensions": { "io.modelcontextprotocol/tasks": {} } }
+    }
+  }
+}
+```
+
+There is no separate `task` parameter in that path. The response is `{ "resultType": "task", "taskId": "<jobId>", "status": "working", "ttlMs": null, "pollIntervalMs": 5000, ... }`. Modern `tasks/get` uses the same task ID params and metadata envelope: it returns a task handle while working, then `{ "resultType": "complete", "content": [...], "isError": false, ... }` containing the job result when terminal. Other modern replies include `resultType: "complete"`; list/discovery replies also carry `ttlMs: 0` and `cacheScope: "private"`. Without the client tasks extension on a modern call, start/watch keep ordinary behavior.
+
+The binary's `execution` / capabilities `tasks` stripping function belongs to the **modern server result encoder**, called by that era's `encodeResult`. It is not a legacy client filter. The adapter follows that projection: modern tool lists omit `execution`, and modern discovery advertises the extension instead of the old capability. In the embedded legacy SDK, `cacheToolMetadata` records optional/required tool support, `isToolTask` additionally checks `tasks.requests.tools.call`, and `experimental.tasks.callToolStream` then supplies `task: {}`. These embedded helpers alone do not make Claude's current v2 tool-call path use legacy tasks.
+
+No channel environment variable or development-channel launch flag is required for tasks. Claude's own feature gates still apply: the inspected binary checks `CLAUDE_CODE_DISABLE_MCP_TASKS`, its task rollout/server policy, background-session restrictions, and a separate worker-wake gate. The server can provide immediate handles, notifications, and terminal results; it cannot override a client setting that disables `/tasks` or model wake delivery. The stdio tests use fake workers and raw JSON-RPC for both eras; they do not run Claude Code or authenticate a real Codex CLI.
 
 ## Shared store and ownership
 

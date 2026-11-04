@@ -102,6 +102,8 @@ claude mcp add codex-cli -- npx -y @trishchuk/codex-mcp-tool
 
 See [agent jobs](docs/agent-jobs.md) and the [symmetry audit](docs/job-surface-audit.md) for shared behavior and vendor differences.
 
+`codex_job_start` and `codex_job_watch` also support MCP tasks, with no server launch flag. Task requests return a handle immediately and expose completion through task polling and status notifications, allowing Claude Code to show the job in `/tasks` and deliver its result. Both the 2025-11-25 protocol and the 2026-07-28 tasks extension are supported; Claude Code's own task feature settings still apply. Calls that do not request tasks retain their existing job ID, watch progress, and channel behavior. See [MCP tasks](docs/agent-jobs.md#mcp-tasks-no-launch-flag) for negotiation and request shapes.
+
 ## Image generation
 
 `image-gen` drives Codex's built-in `image_gen` tool, so it uses your ChatGPT

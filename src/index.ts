@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -19,6 +18,7 @@ import {
   Prompt,
   GetPromptResult,
   CallToolResult,
+  CreateTaskResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import { Logger } from './utils/logger.js';
 import { PROTOCOL, ToolArguments } from './constants.js';
@@ -34,6 +34,7 @@ import {
 import { getCompletionValues } from './utils/completions.js';
 import { ProgressReporter } from './utils/progress.js';
 import { executeJobWatch } from './tools/job-watch-progress.js';
+import { registerMcpTasks, TaskStdioTransport, taskCapabilities } from './tools/mcp-tasks.js';
 
 import {
   startChannelNotifier,
@@ -43,6 +44,9 @@ import {
 
 const CHANNEL_INSTRUCTIONS = withChannelInstructions(undefined, 'codex');
 let stopChannel = () => {};
+const capabilities = withChannelCapabilities({
+  tools: {}, prompts: {}, logging: {}, completions: {}, tasks: taskCapabilities,
+});
 
 const server = new Server(
   {
@@ -50,15 +54,13 @@ const server = new Server(
     version: '2.6.0',
   },
   {
-    capabilities: withChannelCapabilities({
-      tools: {},
-      prompts: {},
-      logging: {},
-      completions: {},
-    }),
+    capabilities,
     ...(CHANNEL_INSTRUCTIONS ? { instructions: CHANNEL_INSTRUCTIONS } : {}),
   }
 );
+const mcpTasks = registerMcpTasks(server, 'codex', codexJobManager, {
+  capabilities, instructions: CHANNEL_INSTRUCTIONS,
+});
 
 // Removed global state - using per-request state instead
 
@@ -149,8 +151,12 @@ server.setRequestHandler(
 // tools/get
 server.setRequestHandler(
   CallToolRequestSchema,
-  async (request: CallToolRequest, extra): Promise<CallToolResult> => {
+  async (request: CallToolRequest, extra): Promise<CallToolResult | CreateTaskResult> => {
     const toolName: string = request.params.name;
+
+    if (request.params.task !== undefined) {
+      return mcpTasks.call(toolName, request.params.arguments || {});
+    }
 
     if (toolExists(toolName)) {
       // Check if client requested progress updates
@@ -287,9 +293,10 @@ server.setRequestHandler(CompleteRequestSchema, async (request: CompleteRequest)
 async function main() {
   Logger.debug('init codex-mcp-tool');
   await codexJobManager.initialize();
-  const transport = new StdioServerTransport();
+  const transport = new TaskStdioTransport('codex');
   server.onclose = () => {
     stopChannel();
+    mcpTasks.close();
     // The SDK aborts in-flight requests. Job processes and their queue keep running;
     // their open pipes keep this server alive until their results have been saved.
   };
@@ -311,6 +318,7 @@ async function main() {
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
     stopChannel();
+    mcpTasks.close();
     void codexJobManager.dispose().finally(() => process.exit(0));
   });
 }
