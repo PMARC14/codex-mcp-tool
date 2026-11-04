@@ -1,3 +1,5 @@
+import type { StdinPlan } from './stdin.js';
+
 export interface JobLogger {
   warn(message: string, ...details: unknown[]): void;
 }
@@ -73,7 +75,7 @@ export interface Connector {
   id: string;
   detect(): Promise<{ available: boolean; reason?: string; version?: string; exe?: string }>;
   models(): Promise<string[]>;
-  build(job: JobSpec): { exe: string; args: string[]; stdin: string };
+  build(job: JobSpec): { exe: string; args: string[]; stdin: string; stdinPlan?: StdinPlan };
   parse(line: string, stream: 'stdout' | 'stderr'): JobEvent | null;
   sandboxDirs(job: JobSpec): string[];
 }

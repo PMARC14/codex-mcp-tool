@@ -3,6 +3,7 @@ import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import { closeSync, openSync, readFileSync, readSync, writeSync, statSync } from 'node:fs';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { Owner } from './connector.js';
+import { updateStdin, type StdinPlan } from './stdin.js';
 
 /** stdin write errors that only mean the child stopped reading (EOF is the Windows form of EPIPE). */
 const CLOSED_PIPE_CODES = new Set(['EPIPE', 'EOF', 'ECONNRESET']);
@@ -357,6 +358,7 @@ export function startProcess(options: {
   exe: string;
   args: string[];
   stdin?: string;
+  stdinPlan?: StdinPlan;
   cwd: string;
   env?: NodeJS.ProcessEnv;
   stdout: string;
@@ -387,10 +389,17 @@ export function startProcess(options: {
   });
   const fds: number[] = [];
   const buffers = { stdout: '', stderr: '' };
+  const inputHandler = options.stdinPlan?.();
+  const onLine = (line: string, stream: 'stdout' | 'stderr') => {
+    const action = inputHandler?.(line, stream);
+    if (action) updateStdin(child.stdin, action);
+    options.onLine(line, stream);
+  };
   const claim = (value: ProcessOutcome) => {
     outcome ??= value;
   };
   const beginTermination = () => {
+    try { updateStdin(child?.stdin, { close: true }); } catch { /* Continue cleanup. */ }
     termination ??= spawnEvent
       .then(() => spawnReady)
       .then(async () => {
@@ -409,6 +418,7 @@ export function startProcess(options: {
       });
   };
   const complete = async () => {
+    try { updateStdin(child?.stdin, { close: true }); } catch { /* Child has exited. */ }
     closed = true;
     clearInterval(snapshot);
     await spawnReady;
@@ -416,7 +426,7 @@ export function startProcess(options: {
     clearTimeout(killTimer);
     try {
       for (const stream of ['stdout', 'stderr'] as const) {
-        if (buffers[stream]) options.onLine(buffers[stream], stream);
+        if (buffers[stream]) onLine(buffers[stream], stream);
       }
     } catch (error) {
       setupError = String(error);
@@ -500,7 +510,7 @@ export function startProcess(options: {
           buffers[stream] += data;
           let newline: number;
           while ((newline = buffers[stream].indexOf('\n')) >= 0) {
-            options.onLine(buffers[stream].slice(0, newline).replace(/\r$/, ''), stream);
+            onLine(buffers[stream].slice(0, newline).replace(/\r$/, ''), stream);
             buffers[stream] = buffers[stream].slice(newline + 1);
           }
         } catch (error) {
@@ -513,7 +523,10 @@ export function startProcess(options: {
     child.once('exit', (code, signal) => {
       claim({ kind: 'exit', code, signal: signal ?? undefined });
     });
-    if (options.stdin !== undefined) child.stdin?.end(options.stdin, 'utf8');
+    if (options.stdin !== undefined) {
+      if (inputHandler) updateStdin(child.stdin, { write: options.stdin });
+      else child.stdin?.end(options.stdin, 'utf8');
+    }
   } catch (error) {
     setupError = String(error);
     claim({ kind: 'error', code: null, error: String(error) });

@@ -43,6 +43,7 @@ for (const [mode, expected] of [
         },
       });
       assert.equal(command.stdin, spec.prompt);
+      assert.equal('stdinPlan' in command, false, 'Codex still writes the prompt and closes stdin');
       assert.equal(command.args.includes(spec.prompt), false);
       assert.ok(command.args.includes(expected));
       assert.equal(

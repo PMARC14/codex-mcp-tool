@@ -7,7 +7,7 @@ import {
 import { MODELS } from '../constants.js';
 import { getCodexVersion, checkMinimumCodexVersion } from '../utils/versionDetection.js';
 import { runCommand } from '../jobs/proc.js';
-import { usageReset } from '../jobs/usage-reset.js';
+import { usageLimit } from '../jobs/usage-reset.js';
 
 export { usageReset } from '../jobs/usage-reset.js';
 
@@ -66,7 +66,6 @@ export class CodexConnector implements Connector {
     const detection = await this.detect();
     return {
       ...detection,
-      version: detection.available ? (await getCodexVersion()).raw : undefined,
       models: await this.models(),
       reviewModel: this.reviewModel,
     };
@@ -117,10 +116,7 @@ export class CodexConnector implements Connector {
       return {
         error,
         usageLimit: /(?:hit your|reached|exceeded|hit the)?\s*usage limit/i.test(error)
-          ? {
-              resetAt: usageReset(error),
-              model: /\bmodel\s+["']?([a-z0-9][a-z0-9._-]*)/i.exec(error)?.[1],
-            }
+          ? usageLimit(error)
           : undefined,
       };
     }

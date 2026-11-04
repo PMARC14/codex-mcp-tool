@@ -3,13 +3,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import spawn from 'cross-spawn';
 
-export interface UsageWindow {
-  usedPercent: number;
-  windowMinutes?: number;
-  resetsAt: number;
-  resetAtIso: string;
-  resetIn: string;
-}
+import { usageWindow, type UsageWindow } from '../jobs/usage.js';
+export type { UsageWindow } from '../jobs/usage.js';
 
 export interface CodexUsage {
   available: boolean;
@@ -87,20 +82,8 @@ function findLatestSnapshot(
   return undefined;
 }
 
-function resetIn(resetsAtSec: number, nowMs: number): string {
-  const minutes = Math.floor((resetsAtSec * 1000 - nowMs) / 60000);
-  if (minutes <= 0) return 'reset';
-  return `in ${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-}
-
 function windowOf(raw: any, nowMs: number): UsageWindow {
-  return {
-    usedPercent: Number(raw.used_percent),
-    windowMinutes: raw.window_minutes,
-    resetsAt: Number(raw.resets_at),
-    resetAtIso: new Date(Number(raw.resets_at) * 1000).toISOString(),
-    resetIn: resetIn(Number(raw.resets_at), nowMs),
-  };
+  return usageWindow(Number(raw.used_percent), Number(raw.resets_at), nowMs, raw.window_minutes);
 }
 
 const bar = (percent: number) => {
@@ -217,5 +200,5 @@ export function readCodexUsage(
     if (!snapshot) continue;
     return { ...usageFromLimits(snapshot.limits, snapshot.timestamp ?? file.mtime, nowMs), source: 'session-log' };
   }
-  return { available: false, reason: `no Codex usage snapshot found under ${dir}` };
+  return { available: false, source: 'session-log', reason: `no Codex usage snapshot found under ${dir}` };
 }

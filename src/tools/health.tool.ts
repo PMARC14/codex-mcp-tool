@@ -24,6 +24,9 @@ const healthArgsSchema = z.object({
 interface HealthStatus {
   status: 'healthy' | 'degraded' | 'unhealthy';
   codexCli: {
+    available: boolean;
+    exe?: string;
+    reason?: string;
     installed: boolean;
     version: string;
     authenticated: boolean;
@@ -141,6 +144,9 @@ async function buildHealthStatus(sessionId?: string, verbose?: boolean): Promise
   return {
     status: overallStatus,
     codexCli: {
+      available: isInstalled && minimumCheck.ok,
+      exe: resolution.resolved ? resolution.command : undefined,
+      reason: !isInstalled ? 'Codex CLI unavailable' : minimumCheck.ok ? undefined : minimumCheck.message,
       installed: isInstalled,
       version: version.raw || 'unknown',
       authenticated: isAuthenticated,
@@ -284,6 +290,7 @@ export const healthTool: UnifiedTool = {
       const failed: HealthStatus & { error: string } = {
         status: 'unhealthy',
         codexCli: {
+          available: false,
           installed: false,
           version: 'unknown',
           authenticated: false,

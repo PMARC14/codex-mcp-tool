@@ -14,7 +14,7 @@ The existing synchronous tools remain available. The `codex_*` job tools provide
 | `codex_job_read`         | Read `prompt`, `stdout`, `stderr`, `final`, or `patch` by character offset, at most 20,000 characters per page.                                                          |
 | `codex_job_requeue`      | Create a new queued job from a paused, lost, or failed job's saved prompt. Optional `model` overrides the model; optional `agent: "agy"` hands it to the sibling server. |
 | `codex_worktree_collect` | Save a binary patch and diff stat, then optionally remove the worktree or worktree and branch.                                                                           |
-| `codex_usage`            | Read the latest Codex rate-limit snapshot from session logs. |
+| `codex_usage`            | Read live Codex quota, with a marked session-log fallback. |
 
 Example tool arguments:
 
@@ -75,7 +75,13 @@ The payload is metadata only. The content is `codex job <state>: call codex_job_
 
 ## Usage
 
-`codex_usage` reads the latest `rate_limits` snapshot in `~/.codex/sessions` logs. The primary window is five hours and the secondary window is weekly.
+`codex_usage` first asks a short-lived `codex app-server` for live quota without a model turn. If unavailable, it reads the newest `rate_limits` snapshot in `~/.codex/sessions`. `source` is `live` or `session-log` (also present when unavailable), with `available` and optional `reason`. Successful reports include `snapshotAt` (ISO), `snapshotAgeSec`, `meter`, and `fiveHour` / `weekly` windows. Each window has `usedPercent`, `windowMinutes`, `resetsAt` (epoch seconds), `resetAtIso`, and `resetIn`. Reset credits are reported when supplied; they are never spent automatically.
+
+The sibling `agy_usage` uses the same snapshot, meter and window fields, nested under vendor-specific `groups`, with `source: live | cache`. Its optional `refresh` bypasses a five-minute cache; `tallies` adds local job token totals. Compatibility aliases `takenAt`, `summary`, and window `resetAt` remain available. Quota messages in either connector share absolute ISO, relative duration / retry-delay, and clock-only reset parsing, including the just-passed-time rule above. A model named in a quota message scopes the pause to that model.
+
+`health` includes CLI detection (`available`, `exe`, `reason` when known), version, authentication, model IDs, effective `reviewModel`, `defaultModel`, and `jobsEnabled` within `codexCli` / `agyCli`. Codex additionally reports binary resolution and minimum-version features. Failed health checks retain their structured output shape.
+
+Agy read jobs and legacy synchronous tools send one NDJSON prompt initially. Only an empty first response or non-empty `denied_actions` triggers the recovery turn; stdin then closes. A complete first response closes stdin immediately. An empty recovery response preserves an earlier non-empty answer. Timeouts and cancellation close stdin before cleanup. Codex continues to write its prompt and close stdin immediately.
 
 ## Development
 

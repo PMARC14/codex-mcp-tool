@@ -94,6 +94,13 @@ claude mcp add codex-cli -- npx -y @trishchuk/codex-mcp-tool
 | `help`           | Return current `codex --help` output                                |
 | `version`        | Report Codex CLI, Node.js, platform, and package versions           |
 | `timeout-test`   | Exercise keepalive and timeout behavior                             |
+| `codex_job_start`, `codex_job_status`, `codex_job_result`, `codex_job_cancel` | Start, inspect, retrieve or cancel shared background jobs. |
+| `codex_job_watch`, `codex_job_send` | Wait with progress or resume a stopped job with a follow-up. |
+| `codex_job_list`, `codex_job_read`, `codex_job_requeue` | List jobs, page saved files or retry a stopped job. |
+| `codex_worktree_collect` | Save a patch and optionally remove a stopped worktree. |
+| `codex_usage` | Live quota without a model turn; session-log fallback is marked by source. |
+
+See [agent jobs](docs/agent-jobs.md) and the [symmetry audit](docs/job-surface-audit.md) for shared behavior and vendor differences.
 
 ## Image generation
 
