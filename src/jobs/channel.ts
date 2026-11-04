@@ -66,6 +66,7 @@ export function channelEvent(job: JobMeta, prefix: string) {
   if (label) meta.label = label;
   const reason = safe(job.reason, 40);
   if (reason) meta.reason = reason;
+  if (job.supersededBy) meta.superseded_by = job.supersededBy;
   let content = `${prefix} job ${job.state}: call ${prefix}_job_result with this job_id`;
   if (job.state === 'paused' && job.resetAt) {
     const reset = new Date(job.resetAt);

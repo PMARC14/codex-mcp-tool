@@ -7,18 +7,9 @@ import {
 import { MODELS } from '../constants.js';
 import { getCodexVersion, checkMinimumCodexVersion } from '../utils/versionDetection.js';
 import { runCommand } from '../jobs/proc.js';
+import { usageReset } from '../jobs/usage-reset.js';
 
-export function usageReset(message: string, now = new Date()): number | undefined {
-  const time = /try again at\s+(\d{1,2}):(\d{2})\s*(AM|PM)\b/i.exec(message);
-  if (!time) return undefined;
-  const hour = Number(time[1]);
-  const minute = Number(time[2]);
-  if (hour < 1 || hour > 12 || minute > 59) return undefined;
-  const reset = new Date(now);
-  reset.setHours((hour % 12) + (time[3].toUpperCase() === 'PM' ? 12 : 0), minute, 0, 0);
-  if (reset.getTime() <= now.getTime()) reset.setDate(reset.getDate() + 1);
-  return reset.getTime();
-}
+export { usageReset } from '../jobs/usage-reset.js';
 
 export class CodexConnector implements Connector {
   readonly id = 'codex';

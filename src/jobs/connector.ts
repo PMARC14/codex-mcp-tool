@@ -57,6 +57,7 @@ export interface JobMeta extends Omit<JobSpec, 'prompt'> {
   manualRequeue?: boolean;
   requeuedFrom?: string;
   followUpOf?: string;
+  supersededBy?: string;
   /** Working directory supplied before creating an isolated worktree. */
   originalCwd?: string;
 }

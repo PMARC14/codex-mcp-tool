@@ -77,9 +77,7 @@ test('Codex parses real thread, agent message and limit events from this machine
   const event = connector.parse(line, 'stdout');
   assert.ok(event?.usageLimit?.resetAt);
   assert.match(event!.error!, /hit your usage limit/);
-  const date = new Date(event!.usageLimit!.resetAt!);
-  assert.equal(date.getHours(), 20);
-  assert.equal(date.getMinutes(), 37);
+  assert.ok(Math.abs(event!.usageLimit!.resetAt! - usageReset(line)!) < 1000);
   assert.equal(connector.parse('not an event', 'stderr'), null);
   assert.equal(connector.parse('null', 'stdout'), null);
   assert.equal(
@@ -113,6 +111,35 @@ test('usage reset uses local time and rolls over midnight', () => {
   assert.equal(usageReset('try again at 12:01 AM', now), new Date(2026, 9, 30, 0, 1).getTime());
   assert.equal(usageReset('try again at 25:99 PM', now), undefined);
   assert.equal(usageReset('no reset'), undefined);
+});
+
+test('usage reset retries recently passed clock times in 60 seconds', () => {
+  const now = new Date(2026, 9, 29, 17, 37, 20);
+  const originalNow = now.getTime();
+  for (const time of ['5:37 PM', '4:00 PM', '3:38 PM']) {
+    assert.equal(usageReset(`try again at ${time}`, now), originalNow + 60000, time);
+  }
+  assert.equal(now.getTime(), originalNow, 'the supplied clock is not mutated');
+  assert.equal(
+    usageReset('try again at 5:37 PM', new Date(2026, 9, 29, 17, 37)),
+    new Date(2026, 9, 29, 17, 38).getTime()
+  );
+});
+
+test('usage reset rolls older clock times to tomorrow and keeps future times today', () => {
+  const now = new Date(2026, 9, 29, 17, 37, 20);
+  for (const [message, expected] of [
+    ['try again at 9:00 AM', new Date(2026, 9, 30, 9)],
+    ['try again at 3:00 PM', new Date(2026, 9, 30, 15)],
+    ['try again at 6:00 PM', new Date(2026, 9, 29, 18)],
+  ] as const) {
+    assert.equal(usageReset(message, now), expected.getTime(), message);
+  }
+  assert.equal(
+    usageReset('try again at 3:37 PM', new Date(2026, 9, 29, 17, 37)),
+    new Date(2026, 9, 30, 15, 37).getTime(),
+    'exactly two hours uses tomorrow'
+  );
 });
 
 test('Codex jobs run outside git repos too (advice and debate need no repo)', () => {

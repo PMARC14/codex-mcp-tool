@@ -253,10 +253,7 @@ export class JobManager {
         };
         this.store.create(meta, prompt);
         // A follow-up supersedes a paused job's automatic retry, like requeue does.
-        if (original.state === 'paused') {
-          original.pauseCleared = true;
-          this.store.write(original);
-        }
+        if (original.state === 'paused') this.supersede(original, id);
       } else this.store.create(meta, prompt);
     };
     if (followUpOf) await withLock(this.config.home, create);
@@ -297,6 +294,18 @@ export class JobManager {
 
   watch(jobId: string, maxWaitSec = 1800, options: WatchOptions = {}) {
     return watchJob(this, jobId, maxWaitSec, options, this.watchShutdown.signal);
+  }
+
+  // Must run under the shared lock after the replacement exists. Quota pauses are independent.
+  private supersede(job: JobMeta, replacementId: string): void {
+    Object.assign(job, {
+      state: 'killed',
+      reason: 'superseded',
+      supersededBy: replacementId,
+      pauseCleared: true,
+      finishedAt: Date.now(),
+    });
+    this.store.write(job);
   }
 
   private pump(): Promise<void> {
@@ -377,7 +386,14 @@ export class JobManager {
         }
         // Pauses live in their own per-connector (and per-model) state, so handing a paused job
         // to another connector cannot lift them. Expired ones are dropped here.
-        const requeued = new Set(jobs.map(job => job.requeuedFrom).filter(Boolean));
+        const replacements = new Map<string, string>();
+        // list() is newest first; prefer the latest replacement when recovering old records.
+        for (const job of jobs) {
+          for (const originalId of [job.requeuedFrom, job.followUpOf]) {
+            if (originalId && !replacements.has(originalId))
+              replacements.set(originalId, job.id);
+          }
+        }
         const saved = this.store.pauses();
         const pauses = saved.filter(pause => !pause.resetAt || pause.resetAt > now);
         if (pauses.length !== saved.length) this.store.writePauses(pauses);
@@ -401,9 +417,10 @@ export class JobManager {
           }
           if (terminal(job)) continue;
           if (!this.owns(job) || job.state === 'running' || job.reserved) continue;
-          if (job.state === 'paused' && requeued.has(job.id)) {
-            job.pauseCleared = true;
-            this.store.save(job, this.owner);
+          const replacementId = replacements.get(job.id);
+          if (job.state === 'paused' && replacementId) {
+            this.supersede(job, replacementId);
+            continue;
           }
           if (job.state === 'paused' && job.pauseCleared) continue;
           if (job.state === 'paused' && job.resetAt && job.resetAt <= now) {
@@ -663,6 +680,7 @@ export class JobManager {
       jobId,
       state: job.state,
       reason: job.reason,
+      supersededBy: job.supersededBy,
       error: job.error?.slice(0, 20000),
       sessionId: job.sessionId,
       resetAt: job.resetAt,
@@ -782,10 +800,7 @@ export class JobManager {
       meta.requeuedFrom = original.id;
       this.store.create(meta, this.store.read(jobId, 'prompt'));
       // Publishing the replacement and suppressing the original's retry are one critical section.
-      if (original.state === 'paused') {
-        original.pauseCleared = true;
-        this.store.write(original);
-      }
+      if (original.state === 'paused') this.supersede(original, id);
       return { jobId: id, state: meta.state };
     });
     void this.pump().catch(error => this.logger.warn('Job queue error', error));
