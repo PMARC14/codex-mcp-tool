@@ -34,6 +34,8 @@ export interface JobSpec {
   label?: string;
   resumeSession?: string;
   timeoutMin: number;
+  stallTimeoutMin?: number;
+  onStall?: 'report' | 'kill';
   verifyCommand?: string;
   verifyTimeoutMin?: number;
   finalPath: string;
@@ -43,6 +45,8 @@ export interface JobSpec {
 export interface JobMeta extends Omit<JobSpec, 'prompt'> {
   verify?: { command: string; exitCode: number | null; passed: boolean; durationSec: number; timedOut: boolean };
   state: JobState;
+  stalled?: boolean;
+  stalledSince?: number;
   owner?: Owner;
   managerId?: string;
   reserved?: boolean;
@@ -68,6 +72,7 @@ export interface JobMeta extends Omit<JobSpec, 'prompt'> {
 }
 
 export interface JobEvent {
+  reasoning?: string;
   sessionId?: string;
   final?: string;
   error?: string;

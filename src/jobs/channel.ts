@@ -1,3 +1,5 @@
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { JobMeta, JobState, JobLogger } from './connector.js';
 
 /**
@@ -19,6 +21,7 @@ export interface ChannelServer {
 }
 
 export interface ChannelManager {
+  store?: { dir(id: string): string };
   onTransition(listener: (job: JobMeta, previous: JobState | undefined) => void): () => void;
   isOwn(job: JobMeta): boolean;
 }
@@ -98,6 +101,13 @@ export function startChannelNotifier(
     if (!manager.isOwn(job)) return;
     const key = `${job.id}:${job.state}`;
     if (sent.has(key)) return;
+    if (manager.store) {
+      try { writeFileSync(join(manager.store.dir(job.id), 'woken'), '', { flag: 'wx' }); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') logger?.warn('Unable to create channel marker', error);
+        return;
+      }
+    }
     sent.add(key);
     try {
       void Promise.resolve(

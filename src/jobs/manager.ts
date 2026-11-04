@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type {
   Connector,
@@ -43,6 +43,8 @@ export interface StartOptions {
   worktree?: boolean;
   resumeSession?: string;
   timeoutMin?: number;
+  stallTimeoutMin?: number;
+  onStall?: 'report' | 'kill';
   verify?: string;
   verifyTimeoutMin?: number;
 }
@@ -73,7 +75,7 @@ export class JobManager {
   private initialized?: Promise<void>;
   private timer?: NodeJS.Timeout;
   private pumping?: Promise<void>;
-  private active = new Map<string, { process: RunningProcess; finished: Promise<void> }>();
+  private active = new Map<string, { process: RunningProcess; finished: Promise<void>; sample?: () => void }>();
   private hold: WakeHold;
   private disposed = false;
   private readonly kill: typeof killTree;
@@ -206,6 +208,7 @@ export class JobManager {
       throw new Error('verify requires a non-empty command and a non-read mode');
     if (options.verifyTimeoutMin !== undefined && (!Number.isFinite(options.verifyTimeoutMin) || options.verifyTimeoutMin <= 0))
       throw new Error('verifyTimeoutMin must be positive');
+    if (!Number.isFinite(options.stallTimeoutMin ?? 10) || (options.stallTimeoutMin ?? 10) < 0) throw new Error('stallTimeoutMin must be non-negative');
     const id = randomUUID();
     const model = followUpOf ? undefined : this.selectModel(options.model);
     const worktree = options.worktree
@@ -222,6 +225,8 @@ export class JobManager {
       label: options.label,
       resumeSession: options.resumeSession,
       timeoutMin,
+      stallTimeoutMin: options.stallTimeoutMin ?? 10,
+      onStall: options.onStall ?? 'report',
       verifyCommand: options.verify,
       verifyTimeoutMin: options.verifyTimeoutMin ?? 10,
       worktree,
@@ -258,6 +263,8 @@ export class JobManager {
           model: this.selectModel(options.model ?? original.model, original.connector),
           effort: options.effort ?? original.effort,
           timeoutMin: options.timeoutMin ?? original.timeoutMin,
+          stallTimeoutMin: options.stallTimeoutMin ?? original.stallTimeoutMin ?? 10,
+          onStall: options.onStall ?? original.onStall ?? 'report',
           verifyCommand: original.verifyCommand,
           verifyTimeoutMin: original.verifyTimeoutMin,
           resumeSession: original.sessionId,
@@ -322,6 +329,7 @@ export class JobManager {
 
   private pump(): Promise<void> {
     if (this.disposed) return Promise.resolve();
+    for (const active of this.active.values()) active.sample?.();
     return (this.pumping ??= this.promote().finally(() => {
       this.pumping = undefined;
     }));
@@ -477,6 +485,10 @@ export class JobManager {
     let event: JobEvent = {};
     let timer: NodeJS.Timeout | undefined;
     let killFailed = false;
+    let stalledKill = false;
+    let workerDone = false;
+    let sizes = [0, 0];
+    let lastGrowth = Date.now();
     try {
       const prompt = this.store.read(job.id, 'prompt');
       atomicWrite(job.finalPath, '');
@@ -498,6 +510,8 @@ export class JobManager {
           job.state = 'running';
           job.process = identity;
           job.startedAt = Date.now();
+          lastGrowth = job.startedAt;
+          sizes = [statSync(this.store.path(job.id, 'stdout')).size, statSync(this.store.path(job.id, 'stderr')).size];
           this.store.save(job, this.owner);
           if (this.config.wakeHold) void this.hold.start();
           timer = setTimeout(() => void process.stop('timeout'), job.timeoutMin * 60000);
@@ -535,6 +549,14 @@ export class JobManager {
         onLine: (line, stream) => {
           const parsed = this.connector.parse(line, stream);
           if (!parsed) return;
+          if (parsed.reasoning) {
+            const path = this.store.path(job.id, 'reasoning');
+            const previous = readFileSync(path);
+            const combined = Buffer.concat([previous, Buffer.from(parsed.reasoning + '\n')]);
+            let tail = combined.subarray(Math.max(0, combined.length - 256 * 1024));
+            while (tail.length && (tail[0] & 0xc0) === 0x80) tail = tail.subarray(1);
+            atomicWrite(path, tail);
+          }
           event = { ...event, ...parsed, usageLimit: parsed.usageLimit ?? event.usageLimit };
           // A recovery answer supersedes an earlier error from an empty, denied turn.
           if (parsed.final && !parsed.error) event.error = undefined;
@@ -546,6 +568,7 @@ export class JobManager {
       });
       const finished = process.done
         .then(async outcome => {
+          workerDone = true;
           killFailed = outcome.killFailed ?? false;
           clearTimeout(timer);
           if (event.final && !(await this.store.page(job.id, 'final', 0, 20000)).text.trim())
@@ -571,7 +594,7 @@ export class JobManager {
             if (checked.kind === 'cancel') { await this.settle(job, checked, event); return; }
             if (checked.killFailed) { killFailed = true; await this.settle(job, checked, event); return; }
           }
-          await this.settle(job, outcome, event);
+          await this.settle(job, outcome, event, stalledKill);
         })
         .catch(error => {
           this.logger.warn(`Failed saving job ${job.id}`, error);
@@ -597,7 +620,20 @@ export class JobManager {
           if (!this.active.size) this.hold.stop();
           void this.pump().catch(error => this.logger.warn('Job queue error', error));
         });
-      this.active.set(job.id, { process, finished });
+      this.active.set(job.id, { process, finished, sample: () => {
+        if (workerDone || job.state !== 'running' || !(job.stallTimeoutMin ?? 10) || stalledKill) return;
+        const current = [statSync(this.store.path(job.id, 'stdout')).size, statSync(this.store.path(job.id, 'stderr')).size];
+        const now = Date.now();
+        if (current[0] > sizes[0] || current[1] > sizes[1]) {
+          lastGrowth = now;
+          if (job.stalled) { job.stalled = false; job.stalledSince = undefined; this.store.save(job, this.owner); }
+        }
+        sizes = current;
+        if (!job.stalled && now - lastGrowth >= (job.stallTimeoutMin ?? 10) * 60000) {
+          job.stalled = true; job.stalledSince = lastGrowth; this.store.save(job, this.owner);
+          if (job.onStall === 'kill') { stalledKill = true; void process.stop(); }
+        }
+      } });
     } catch (error) {
       this.store.save(
         {
@@ -613,7 +649,7 @@ export class JobManager {
     }
   }
 
-  private async settle(job: JobMeta, outcome: ProcessOutcome, event: JobEvent): Promise<void> {
+  private async settle(job: JobMeta, outcome: ProcessOutcome, event: JobEvent, stalledKill = false): Promise<void> {
     job.reserved = outcome.killFailed ?? false;
     job.exitCode = outcome.code;
     job.finishedAt = Date.now();
@@ -623,7 +659,7 @@ export class JobManager {
       job.reason = 'kill-failed';
     } else if (outcome.kind === 'cancel') {
       job.state = 'killed';
-      job.reason = 'cancelled';
+      job.reason = stalledKill ? 'stalled' : 'cancelled';
     } else if (outcome.kind === 'timeout') {
       job.state = 'failed';
       job.reason = 'timeout';
@@ -680,6 +716,13 @@ export class JobManager {
     return this.store.tail(id, name, count).slice(-10000);
   }
 
+  private publicEvents(id: string, count = 20): string {
+    return this.tail(id, 'stdout', count).split('\n').map(line => {
+      try { const event = JSON.parse(line); return event.item?.type === 'reasoning' ? JSON.stringify({ type: event.type, item: { type: 'reasoning' } }) : line; }
+      catch { return line.endsWith('"}}') ? '' : line; }
+    }).join('\n');
+  }
+
   async status(jobId?: string): Promise<unknown> {
     await this.initialize();
     if (!jobId)
@@ -695,11 +738,11 @@ export class JobManager {
       ...job,
       elapsedSec: ((job.finishedAt ?? Date.now()) - (job.startedAt ?? job.createdAt)) / 1000,
       stderr: this.tail(jobId, 'stderr'),
-      events: this.tail(jobId, 'stdout'),
+      events: this.publicEvents(jobId),
     };
   }
 
-  async result(jobId: string, waitSec = 0) {
+  async result(jobId: string, waitSec = 0, includeReasoning = false) {
     await this.initialize();
     const deadline = Date.now() + Math.min(10, Math.max(0, waitSec)) * 1000;
     let job = this.store.get(jobId);
@@ -708,7 +751,15 @@ export class JobManager {
       job = this.store.get(jobId);
     }
     const final = await this.store.page(jobId, 'final', 0, 20000);
+    if (!['queued', 'running'].includes(job.state)) writeFileSync(resolve(this.store.dir(jobId), 'collected'), '');
+    let reasoningTail: string | undefined;
+    if (includeReasoning) {
+      try { reasoningTail = readFileSync(this.store.path(jobId, 'reasoning'), 'utf8').slice(-4000); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
     return {
+      ...(includeReasoning && reasoningTail ? { reasoningTail } : {}),
+      stalled: job.stalled ?? false,
+      stalledSince: job.stalledSince,
       jobId,
       state: job.state,
       verify: job.verify,
@@ -725,7 +776,7 @@ export class JobManager {
       diagnostics:
         final.text.trim() || ['queued', 'running'].includes(job.state)
           ? undefined
-          : compactDiagnostics(this.tail(jobId, 'stderr', 30), this.tail(jobId, 'stdout', 30)),
+          : compactDiagnostics(this.tail(jobId, 'stderr', 30), this.publicEvents(jobId, 30)),
     };
   }
 
@@ -733,6 +784,12 @@ export class JobManager {
     await this.initialize();
     this.store.get(jobId);
     const start = Math.max(0, Math.floor(offset));
+    if (name === 'reasoning') {
+      try { statSync(this.store.path(jobId, name)); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        return { text: '', offset: start, nextOffset: 0, total: 0, path: this.store.path(jobId, name) };
+      }
+    }
     return this.store.page(jobId, name, start, Math.min(20000, Math.max(1, Math.floor(limit))));
   }
 
@@ -793,8 +850,8 @@ export class JobManager {
     if (agent === this.connector.id) await this.available();
     const result = await withLock(this.config.home, () => {
       const original = this.store.get(jobId);
-      if (!['paused', 'lost', 'failed'].includes(original.state))
-        throw new Error('Only paused, lost or failed jobs can be requeued');
+      if (!['paused', 'lost', 'failed'].includes(original.state) && !(original.state === 'killed' && original.reason === 'stalled'))
+        throw new Error('Only paused, lost, failed or stalled jobs can be requeued');
       if (original.reserved)
         throw new Error(
           'The process is still alive after kill-failed or owner loss; wait until cleanup is confirmed before requeueing'
@@ -826,6 +883,8 @@ export class JobManager {
         createdAt: Date.now(),
         updatedAt: Date.now(),
         startedAt: undefined,
+        stalled: false,
+        stalledSince: undefined,
         finishedAt: undefined,
         finalPath: this.store.path(id, 'final'),
       };

@@ -150,6 +150,8 @@ export class CodexConnector implements Connector {
       event = { type: 'error', message: line };
     }
     if (!event || typeof event !== 'object') return null;
+    if (event.type === 'item.completed' && event.item?.type === 'reasoning' && typeof event.item.text === 'string')
+      return { reasoning: event.item.text };
     if (event.type === 'thread.started' && typeof event.thread_id === 'string')
       return { sessionId: event.thread_id };
     if (

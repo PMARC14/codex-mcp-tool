@@ -251,3 +251,8 @@ test('Codex detect caches not-logged-in status', async () => {
   assert.equal(probeCalls, 1);
 });
 
+
+
+test('parses completed reasoning items', () => {
+  assert.deepEqual(connector.parse(JSON.stringify({ type: 'item.completed', item: { id: 'item_1', type: 'reasoning', text: 'Inspecting the files.' } }), 'stdout'), { reasoning: 'Inspecting the files.' });
+});

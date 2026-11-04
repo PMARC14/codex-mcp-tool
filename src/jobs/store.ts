@@ -25,6 +25,7 @@ export const files = {
   final: 'final.txt',
   patch: 'patch.diff',
   verify: 'verify',
+  reasoning: 'reasoning',
 } as const;
 export type JobFile = keyof typeof files;
 export const terminal = (job: JobMeta) =>
@@ -173,7 +174,7 @@ export class JobStore {
     return { text, offset, nextOffset: Math.min(offset + text.length, total), total, path };
   }
 
-  tail(id: string, name: 'stdout' | 'stderr', count: number): string {
+  tail(id: string, name: 'stdout' | 'stderr' | 'reasoning', count: number): string {
     const fd = openSync(this.path(id, name), 'r');
     try {
       const size = fstatSync(fd).size;

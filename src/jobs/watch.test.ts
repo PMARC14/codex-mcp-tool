@@ -44,7 +44,7 @@ test('watch resolves on fake-worker completion with the job_result shape and wat
     assert.equal(result.final, 'watched answer');
     assert.equal(result.sessionId, 'fake-session');
     assert.ok(result.watchedSec >= 0);
-    assert.ok(messages.some(text => text.startsWith('completed | ')));
+    assert.ok(messages.some(text => text.includes(' | completed | ')));
     const count = messages.length;
     await delay(60);
     assert.equal(messages.length, count, 'progress stops after completion');
@@ -74,7 +74,7 @@ test('watch wakes immediately on transitions and emits heartbeat summaries cappe
       controller.signal
     );
     await until(() => messages.length >= 2, 'initial progress and heartbeat');
-    assert.match(messages[0], /^running \| \d+s \| Step one x/);
+    assert.match(messages[0], /^codex default \u00b7 job \| running \| \d+s \| Step one x/);
     assert.ok(messages.every(text => text.length <= 120 && !text.includes('\n')));
     const before = messages.length;
     s.manager.store.write({ ...job, state: 'paused' });

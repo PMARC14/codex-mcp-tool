@@ -137,8 +137,8 @@ test('index dispatch sends watch state changes immediately and keeps other tools
     assert.equal(s.store.get(jobId).state, 'running', 'progress arrives before the job stops');
     const response = await pending;
     assert.equal(response.isError, false);
-    assert.match(progress.at(-1)!.message!, /^completed \| /);
-    assert.ok(progress.every(event => /^(running|completed) \| /.test(event.message!)));
+    assert.match(progress.at(-1)!.message!, /^codex [^|]+ \| completed \| /);
+    assert.ok(progress.every(event => /^codex [^|]+ \| (running|completed) \| /.test(event.message!)));
     assert.deepEqual(
       progress.map(event => event.progress),
       progress.map((_, i) => i)

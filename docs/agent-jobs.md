@@ -143,3 +143,12 @@ Run `npm test` for the fake-worker suite; it starts no real Codex jobs. Real CLI
 `codex_job_start` accepts `verify`, a shell command run through Git Bash in the job directory after the CLI succeeds, and `verifyTimeoutMin` (default 10 minutes). Verification is rejected in read mode. Its command, exit code, pass status, duration and timeout status appear as `verify` in job metadata, result and watch; the output tail is available through `job_read` as `verify`. A failed verification leaves the job `completed` so its patch remains collectable. Follow-ups and requeues inherit the command and timeout.
 
 Worktree creation and collection disable Git hooks and configured clean, smudge and process filters and skip LFS smudging for their Git commands.
+
+
+### Reasoning, stalls, and notification markers
+
+Codex reasoning is saved in the `reasoning` job file, retaining the most recent 256 KiB. It is omitted from results by default: set `includeReasoning` on `job_result` for its last 4,000 characters, or `showReasoning` on `job_watch` to use the latest sentence for progress. `job_read` can page through the file.
+
+`job_start` accepts `stallTimeoutMin` (default 10, zero disables detection) and `onStall` (`report`, the default, or `kill`). A stall means neither output file grew within the interval. Status and results expose `stalled` and `stalledSince`; output clears the flag. The kill option stops the worker with reason `stalled`, allowing requeue. Follow-ups and requeues inherit these settings.
+
+A channel notification creates `jobs/<id>/woken` atomically before sending; an existing marker suppresses subsequent notifications. Returning a stopped job from `job_result` or `job_watch` creates `jobs/<id>/collected`. Hooks can use these markers to avoid duplicate wakeups and delivery.

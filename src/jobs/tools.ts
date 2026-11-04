@@ -4,6 +4,7 @@ import { JobManager, type StartOptions } from './manager.js';
 // Structural registry contract keeps this directory independent of either fork.
 export interface JobTool {
   name: string;
+  title?: string;
   description: string;
   zodSchema: ZodTypeAny;
   execute(args: any, onProgress?: (message: string) => void, signal?: AbortSignal): Promise<string>;
@@ -33,6 +34,7 @@ export function registerJobTools(
   ) => {
     registry.push({
       name: `${prefix}_${name}`,
+      title: `${prefix === 'codex' ? 'Codex' : prefix} agent: ${name.startsWith('job_') ? `${name.slice(4).replaceAll('_', ' ')} job` : name.replaceAll('_', ' ')}`,
       description,
       zodSchema: schema,
       execute: async (args, onProgress, signal) =>
@@ -92,6 +94,8 @@ export function registerJobTools(
           .string()
           .optional()
           .describe('Native CLI session ID to resume, from an earlier result.'),
+        stallTimeoutMin: z.number().min(0).default(10),
+        onStall: z.enum(['report', 'kill']).default('report'),
         verify: z.string().min(1).optional().describe('Shell command to run after successful completion.'),
         verifyTimeoutMin: z.number().positive().default(10),
         timeoutMin: z
@@ -116,6 +120,7 @@ export function registerJobTools(
     'Get final text (up to 20,000 characters), full file path, session ID and diagnostics. Optional wait is limited to 10 seconds.',
     z.object({
       jobId,
+      includeReasoning: z.boolean().default(false),
       waitSec: z
         .number()
         .min(0)
@@ -123,13 +128,14 @@ export function registerJobTools(
         .default(0)
         .describe('Seconds to wait for a quick job, 0 to poll immediately.'),
     }),
-    args => manager.result(args.jobId, args.waitSec)
+    args => manager.result(args.jobId, args.waitSec, args.includeReasoning)
   );
   add(
     'job_watch',
     'Watch a job until it stops or pauses, with progress every 20 seconds and on state changes. Cancelling the watch leaves the job running. Returns job_result plus watchedSec and timedOut.',
     z.object({
       jobId,
+      showReasoning: z.boolean().default(false),
       maxWaitSec: z
         .number()
         .min(0)
@@ -140,6 +146,7 @@ export function registerJobTools(
     (args, onProgress, signal) =>
       manager.watch(args.jobId, args.maxWaitSec, {
         onProgress,
+        showReasoning: args.showReasoning,
         signal,
         heartbeatMs: options.watchHeartbeatMs,
       })
@@ -187,7 +194,7 @@ export function registerJobTools(
     z.object({
       jobId,
       name: z
-        .enum(['final', 'stdout', 'stderr', 'patch', 'prompt', 'verify'])
+        .enum(['final', 'stdout', 'stderr', 'patch', 'prompt', 'verify', 'reasoning'])
         .describe('Saved output or full original prompt to read.'),
       offset: z.number().int().min(0).default(0).describe('Zero-based character offset.'),
       limit: z

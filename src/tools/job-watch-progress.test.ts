@@ -100,7 +100,7 @@ test('MCP watch progress is immediate, monotonic, bounded and stops when the cal
     s.manager.store.write({ ...s.job, state: 'completed' });
     const response = await pending;
     assert.equal(response.isError, undefined);
-    assert.match(progress.at(-1)!.message!, /^completed \| /);
+    assert.match(progress.at(-1)!.message!, /^codex [^|]+ \| completed \| /);
     assert.ok(progress.every(item => item.message!.length <= 120));
     assert.deepEqual(
       progress.map(item => item.progress),
