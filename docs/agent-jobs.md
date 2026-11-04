@@ -9,6 +9,8 @@ The existing synchronous tools remain available. The `codex_*` job tools provide
 | `codex_job_result`       | Final text and full file path. `waitSec` is 0–10; output is capped at 20,000 characters.                                                                                 |
 | `codex_job_watch`        | Wait for a job to stop or pause, returning the result plus `watchedSec` and `timedOut`. `maxWaitSec` defaults to 1,800 and is capped at 7,200. |
 | `codex_job_send`         | Send `message` to a stopped job's session as a new resumed job. Optional `mode`, `model`, `effort`, and `timeoutMin` override inherited settings. Returns `{ jobId, state, followUpOf }`. |
+| `codex_job_steer`        | Send `{ jobId, message }` to an owned running job with interactive stdin. Returns `{ delivered: "mid-turn" \| "queued" }`. Codex requires `transport: "app-server"`. |
+| `codex_job_respond`      | Answer an owned app-server job's pending approval: `{ jobId, decision: "accept" \| "acceptForSession" \| "decline" \| "cancel" }`. |
 | `codex_job_cancel`       | Stop an owned job's process tree and wait for termination, up to 10 seconds.                                                                                             |
 | `codex_job_list`         | Recent jobs from the shared store, newest first.                                                                                                                         |
 | `codex_job_read`         | Read `prompt`, `stdout`, `stderr`, `final`, `patch`, or `verify` by character offset, at most 20,000 characters per page.                                                          |
@@ -39,6 +41,56 @@ The default mode is `read` (`read-only`) for inspection. `write` allows edits in
 
 `codex_job_requeue` creates a replacement from a paused, lost, or failed job's saved prompt, optionally changing its model or handing it to another connector with `agent`. For a paused original, replacement creation and the transition to `killed`/`superseded` happen under the same lock, recording `supersededBy` and `finishedAt`. The connector/model quota pause remains in force for new jobs; a manual requeue can still attempt a retry, and a successful retry can lift that pause. Older paused originals whose retry was cleared and which have a `requeuedFrom` or `followUpOf` replacement are migrated to this terminal state when their owning server's pump next sees them.
 
+## Steering and the opt-in Codex app-server transport
+
+`codex_job_start` accepts `transport: "exec" | "app-server"`, defaulting to `exec`. The default retains its existing CLI arguments and prompt write-and-close behavior. `app-server` instead launches `codex app-server` through the same process runner, Windows Job Object, hidden-window handling, log files and process-tree cleanup. Transport and `approvalTimeoutMin` are saved in metadata and inherited by send and requeue.
+
+```json
+{
+  "prompt": "Implement the parser change. Do not commit.",
+  "cwd": "C:/repo",
+  "mode": "write",
+  "transport": "app-server",
+  "approvalTimeoutMin": 30
+}
+```
+
+While the job is running, call `codex_job_steer` with its `jobId` and a nonblank `message`. A successful `turn/steer` acknowledgement returns `delivered: "mid-turn"`. If completion races delivery, the process stays open while the pending steer resolves and starts a new turn with the message, returning `delivered: "queued"`. Completion normally closes stdin on the next event-loop iteration; after the process input closes, use `job_send` on the stopped job. Unrelated steer errors are returned without starting another turn. Each delivered steer appends one JSON line containing an ISO `timestamp` and `message` to `jobs/<id>/steer.log`; status reports `steers: <n>` (zero for older records).
+
+The shared `<p>_job_steer` tool checks running state and server ownership. Its connector capability is generic: each process gets a fresh `StdinHandler` from `StdinPlan(context)`, optionally exposing `onSteer(message)` which returns (or resolves to) a stdin action plus `delivered`. `context.apply` supports asynchronous writes/EOF and `context.emit` produces job events. Optional `onInterrupt`, `onRespond` and `dispose` hooks manage interactive lifetimes; existing callable line handlers remain compatible. Connectors without `onSteer`, including default Codex exec and the current agy connector, reject with: `this job can't take mid-turn messages; use <p>_job_send after it stops, or start it with transport: app-server`. Agy can later supply its own queued stream-json user turn without depending on the Codex protocol.
+
+For app-server, modes map to sandbox `read-only`, `workspace-write`, and `danger-full-access` (`trusted` and `full`). Read/write use approval policy `on-request`; trusted/full use `never`. Thus full bypasses sandboxing and approvals. The existing exec mode mapping is unchanged. Model, reasoning effort, cwd and worktree Git writable directory are passed as thread settings. `resumeSession` uses `thread/resume` instead of `thread/start` before starting the prompt turn. Session IDs, final agent messages, reasoning and usage-limit/error events enter the same job event pipeline as exec.
+
+App-server cancellation first sends `turn/interrupt`, waits up to three seconds for the process to exit, and then performs the normal process-tree cleanup within the existing cancel deadline. Wall-clock timeouts still use normal cleanup directly.
+
+Command, file-change and permission approval requests set `pendingApproval: { id, kind, summary, requestedAt }` in metadata; `summary` is capped at 300 characters and `requestedAt` is epoch milliseconds. Watch progress shows `awaiting approval`, task status projects to `input_required`, and the opt-in channel notifier sends one metadata-only event with `state=input_required` for each pending request. This approval event also applies to MCP-task jobs; it does not consume their terminal notification marker. Worker summaries and commands never enter channel payloads. Concurrent requests are held in arrival order and the first is exposed for response. Stall detection waits while approval is pending; the wall-clock timeout still applies.
+
+Call `codex_job_respond` after inspecting `pendingApproval` in status. It sends the matching JSON-RPC response, clears the pending request (or exposes the next request), and returns `{ responded: true }`. `approvalTimeoutMin` is positive, defaults to 30, and automatically declines unanswered requests, persisting `approvalReason: "approval_timeout"` and `reason: "approval_timeout"` (a later cancellation, quota pause or wall-clock timeout can supersede `reason`). Permissions use a grant profile rather than a decision enum: accept grants the requested permissions for the turn, acceptForSession grants them for the session, decline/cancel grant nothing; permissions cancel also interrupts the turn. Turn completion, server-side resolution and process exit clear pending approvals and their timers.
+
+### Locally discovered app-server wire protocol
+
+Discovery used local **codex-cli 0.166.0** with `codex app-server --help`, `codex app-server generate-json-schema --out <temporary-directory>` and `codex app-server generate-ts --out <temporary-directory>`. The existing `readLiveCodexUsage` initialize exchange was also inspected. Discovery started no model turn; tests use a small Node JSON-RPC peer only. Messages are newline-delimited JSON on stdio, with numeric client request IDs and server request IDs echoed unchanged. The used methods/shapes are:
+
+| Method | Request / notification shape and handling |
+| --- | --- |
+| `initialize` | `{ id: 1, method: "initialize", params: { clientInfo: { name: "codex-mcp-tool", title: "Codex jobs", version: "1" }, capabilities: null } }`; await result. |
+| `initialized` | `{ method: "initialized" }`, a notification sent after initialize succeeds. |
+| `thread/start` | `{ id, method, params: { cwd, model?, sandbox, approvalPolicy, config } }`; result contains `{ thread: { id } }`. `config` carries `model_reasoning_effort` and, for write worktrees, `"sandbox_workspace_write.writable_roots": [gitDir]`. |
+| `thread/resume` | Same thread settings plus `threadId: resumeSession`; result contains `{ thread: { id } }`. |
+| `turn/start` | `{ id, method, params: { threadId, input: [{ type: "text", text, text_elements: [] }], effort? } }`; result contains `{ turn: { id } }`. |
+| `turn/steer` | `{ id, method, params: { threadId, expectedTurnId: currentTurnId, input: [{ type: "text", text, text_elements: [] }] } }`; result `{ turnId }`. The generated schema has **no separate `turnId` request field**. |
+| `turn/interrupt` | `{ id, method, params: { threadId, turnId: currentTurnId } }`; result `{}`. |
+| `thread/started` | `{ method, params: { thread: { id, ... } } }` records `sessionId`. |
+| `turn/started`, `turn/completed` | `{ method, params: { threadId, turn: { id, status, error, ... } } }`; track active ID, handle errors and close stdin after completion unless control is in flight. |
+| `item/completed` | `{ method, params: { threadId, turnId, item, completedAtMs } }`; `item: { type: "agentMessage", text, ... }` becomes final; `{ type: "reasoning", summary: string[], content: string[], ... }` becomes reasoning. |
+| `error` | `{ method, params: { threadId, turnId, error: { message, codexErrorInfo, ... }, willRetry } }`; nonretry errors enter the existing error/quota handling, including `usageLimitExceeded` / `rateLimitExceeded`. |
+| `item/commandExecution/requestApproval` | Server request `{ id, method, params: { threadId, turnId, itemId, command?, reason?, ... } }`; reply `{ id, result: { decision } }`. |
+| `item/fileChange/requestApproval` | Server request with `{ threadId, turnId, itemId, reason?, ... }`; reply `{ id, result: { decision } }`. |
+| `item/permissions/requestApproval` | Server request with `{ threadId, turnId, itemId, permissions: { network, fileSystem }, reason, ... }`; reply `{ id, result: { permissions: <granted non-null fields or {}>, scope: "turn" | "session" } }`. |
+| `serverRequest/resolved` | `{ method, params: { threadId, requestId } }` clears a request resolved by the server. |
+
+Command/file approval decisions are exactly `accept`, `acceptForSession`, `decline`, or `cancel`. Unsupported server request methods receive JSON-RPC error `-32601` instead of hanging silently. Client request responses are bounded to 30 seconds; the overall job timeout also bounds startup and processing.
+
 ## MCP tasks (no launch flag)
 
 Only `codex_job_start` and `codex_job_watch` support task augmentation. Ordinary calls retain their existing responses, progress notifications, cancellation semantics, and optional channels. A task start launches the same job as an ordinary start. A task watch adopts the supplied `jobId` immediately; it tracks the job through pauses and automatic retries, independent of `maxWaitSec`. Its final payload is `job_result`, without the ordinary watch's `watchedSec` and `timedOut` fields.
@@ -48,6 +100,7 @@ Task IDs equal job IDs. State and results come from the shared job store; a smal
 | Job state | Task status | Message |
 | --- | --- | --- |
 | queued, running | `working` | The same bounded progress line as ordinary watch |
+| running with pendingApproval | `input_required` | awaiting approval |
 | paused | `working` | Paused until the ISO reset time, or reset time unknown |
 | completed | `completed` | Watch progress line |
 | failed, lost | `failed` | Watch progress line |

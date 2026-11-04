@@ -34,7 +34,7 @@ export function progressMessage(manager: JobManager, job: JobMeta, showReasoning
   );
   const model = (job.model ?? 'default').split('/').pop()!.replace(/^gpt-[0-9.]+-/, '').replace(/^gemini-[0-9.]+-/, '');
   const identity = `${job.connector} ${model} \u00b7 ${job.label ?? 'job'}`;
-  const state = job.stalled && job.state === 'running' ? `stalled ${Math.floor((Date.now() - (job.stalledSince ?? Date.now())) / 60000)}m` : job.state;
+  const state = job.pendingApproval ? 'awaiting approval' : job.stalled && job.state === 'running' ? `stalled ${Math.floor((Date.now() - (job.stalledSince ?? Date.now())) / 60000)}m` : job.state;
   const suffix = ` | ${state} | ${elapsed}s`;
   const head = identity.slice(0, Math.max(0, 120 - suffix.length)) + suffix;
   const step = summary.replace(/\s+/g, ' ').trim();
@@ -67,6 +67,7 @@ export async function watchJob(
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let deadline: ReturnType<typeof setTimeout> | undefined;
   let abort = () => {};
+  let approvalKey: string | undefined;
   let ended = false;
   const cleanup = () => {
     if (ended) return;
@@ -88,6 +89,7 @@ export async function watchJob(
         try {
           checkAbort();
           const job = manager.store.get(jobId);
+          approvalKey = job.pendingApproval ? JSON.stringify([job.pendingApproval.id, job.pendingApproval.requestedAt]) : undefined;
           options.onProgress?.(progressMessage(manager, job, options.showReasoning));
           if (ended) return; // The callback may cancel the request.
           if (job.state !== 'queued' && job.state !== 'running') finish(false);
@@ -106,7 +108,8 @@ export async function watchJob(
         }
       };
       unsubscribe = manager.onTransition((job, previous) => {
-        if (job.id === jobId && job.state !== previous) sample();
+        const nextApproval = job.pendingApproval ? JSON.stringify([job.pendingApproval.id, job.pendingApproval.requestedAt]) : undefined;
+        if (job.id === jobId && (job.state !== previous || nextApproval !== approvalKey)) sample();
       });
       for (const signal of signals) signal.addEventListener('abort', abort, { once: true });
       heartbeat = setInterval(

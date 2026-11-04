@@ -2,8 +2,8 @@ import spawn from 'cross-spawn';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import { closeSync, openSync, readFileSync, readSync, writeSync, statSync } from 'node:fs';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
-import type { Owner } from './connector.js';
-import { updateStdin, type StdinPlan } from './stdin.js';
+import type { JobEvent, Owner } from './connector.js';
+import { updateStdin, type ApprovalDecision, type SteerResult, type StdinPlan } from './stdin.js';
 import { jobWrapper } from './jobobject.js';
 
 /** stdin write errors that only mean the child stopped reading (EOF is the Windows form of EPIPE). */
@@ -355,6 +355,8 @@ export interface ProcessOutcome {
 
 export interface RunningProcess {
   done: Promise<ProcessOutcome>;
+  steer?: (message: string) => Promise<SteerResult>;
+  respond?: (decision: ApprovalDecision) => void;
   stop(reason?: 'cancel' | 'timeout'): Promise<ProcessOutcome>;
 }
 
@@ -370,6 +372,7 @@ export function startProcess(options: {
   onSpawn(identity: Owner): Promise<void>;
   onSnapshot(identities: Owner[]): void;
   onLine(line: string, stream: 'stdout' | 'stderr'): void;
+  onEvent?(event: JobEvent): void;
   onClosed?(): void;
   onData?(data: string, stream: 'stdout' | 'stderr'): void;
 }): RunningProcess {
@@ -393,7 +396,10 @@ export function startProcess(options: {
   });
   const fds: number[] = [];
   const buffers = { stdout: '', stderr: '' };
-  const inputHandler = options.stdinPlan?.();
+  const inputHandler = options.stdinPlan?.({
+    apply: action => updateStdin(child?.stdin, action),
+    emit: event => options.onEvent?.(event),
+  });
   const onLine = (line: string, stream: 'stdout' | 'stderr') => {
     const action = inputHandler?.(line, stream);
     if (action) updateStdin(child.stdin, action);
@@ -424,6 +430,7 @@ export function startProcess(options: {
   const complete = async () => {
     try { updateStdin(child?.stdin, { close: true }); } catch { /* Child has exited. */ }
     closed = true;
+    inputHandler?.dispose?.();
     clearInterval(snapshot);
     await spawnReady;
     await termination;
@@ -543,6 +550,18 @@ export function startProcess(options: {
 
   return {
     done,
+    ...(inputHandler?.onSteer ? { steer: async (message: string) => {
+      if (closed || outcome || !child?.stdin?.writable || child.stdin.writableEnded)
+        throw new Error('Job input has closed; use job_send after it stops');
+      const action = await inputHandler.onSteer!(message);
+      updateStdin(child.stdin, action);
+      return action;
+    } } : {}),
+    ...(inputHandler?.onRespond ? { respond: (decision: ApprovalDecision) => {
+      if (closed || outcome || !child?.stdin?.writable || child.stdin.writableEnded)
+        throw new Error('Job input has closed');
+      updateStdin(child.stdin, inputHandler.onRespond!(decision));
+    } } : {}),
     async stop(reason = 'cancel') {
       if (closed) return done;
       claim({ kind: reason, code: null });
@@ -550,6 +569,13 @@ export function startProcess(options: {
       killTimer ??= setTimeout(() => {
         finish({ ...outcome!, killFailed: true });
       }, 10000);
+      if (reason === 'cancel' && inputHandler?.onInterrupt) {
+        try { const action = inputHandler.onInterrupt(); if (action) updateStdin(child.stdin, action); }
+        catch { /* Continue with process-tree cleanup. */ }
+        let interruptTimer: NodeJS.Timeout | undefined;
+        await Promise.race([done, new Promise<void>(resolve => { interruptTimer = setTimeout(resolve, 3000); })]);
+        clearTimeout(interruptTimer);
+      }
       beginTermination();
       return done;
     },

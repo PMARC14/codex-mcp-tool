@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, win32 } from 'node:path';
 import { existsSync } from 'node:fs';
 import type {
@@ -33,6 +33,7 @@ import {
 import { createWorktree, collectWorktree } from './worktree.js';
 import { WakeHold } from './wakehold.js';
 import { watchJob, type WatchOptions } from './watch.js';
+import type { ApprovalDecision } from './stdin.js';
 
 export interface StartOptions {
   prompt?: string;
@@ -44,6 +45,8 @@ export interface StartOptions {
   label?: string;
   worktree?: boolean;
   resumeSession?: string;
+  transport?: JobSpec['transport'];
+  approvalTimeoutMin?: number;
   timeoutMin?: number;
   stallTimeoutMin?: number;
   onStall?: 'report' | 'kill';
@@ -98,7 +101,7 @@ export class JobManager {
   private initialized?: Promise<void>;
   private timer?: NodeJS.Timeout;
   private pumping?: Promise<void>;
-  private active = new Map<string, { process: RunningProcess; finished: Promise<void>; sample?: () => void; cancelled: boolean }>();
+  private active = new Map<string, { job: JobMeta; process: RunningProcess; finished: Promise<void>; sample?: () => void; cancelled: boolean }>();
   private hold: WakeHold;
   private disposed = false;
   private readonly kill: typeof killTree;
@@ -240,6 +243,8 @@ export class JobManager {
     if (options.verifyTimeoutMin !== undefined && (!Number.isFinite(options.verifyTimeoutMin) || options.verifyTimeoutMin <= 0))
       throw new Error('verifyTimeoutMin must be positive');
     if (!Number.isFinite(options.stallTimeoutMin ?? 10) || (options.stallTimeoutMin ?? 10) < 0) throw new Error('stallTimeoutMin must be non-negative');
+    if (options.transport !== undefined && !['exec', 'app-server'].includes(options.transport)) throw new Error('Unknown job transport');
+    if (!Number.isFinite(options.approvalTimeoutMin ?? 30) || (options.approvalTimeoutMin ?? 30) <= 0) throw new Error('approvalTimeoutMin must be positive');
     return withLock(this.config.home, async () => {
       if (options.idempotencyKey && !followUpOf) {
         const existing = this.store.list().find(job => job.connector === connector && job.idempotencyKey === options.idempotencyKey && Date.now() - job.createdAt < 86400000);
@@ -269,6 +274,9 @@ export class JobManager {
         effort: options.effort,
         label: options.label,
         resumeSession: options.resumeSession,
+        transport: options.transport ?? 'exec',
+        approvalTimeoutMin: options.approvalTimeoutMin ?? 30,
+        steers: 0,
         timeoutMin,
         stallTimeoutMin: options.stallTimeoutMin ?? 10,
         onStall: options.onStall ?? 'report',
@@ -315,6 +323,8 @@ export class JobManager {
             verifyCommand: original.verifyCommand,
             verifyTimeoutMin: original.verifyTimeoutMin,
             resumeSession: original.sessionId,
+            transport: original.transport ?? 'exec',
+            approvalTimeoutMin: original.approvalTimeoutMin ?? 30,
             followUpOf,
           };
           this.store.create(meta, prompt);
@@ -360,6 +370,34 @@ export class JobManager {
 
   watch(jobId: string, maxWaitSec = 1800, options: WatchOptions = {}) {
     return watchJob(this, jobId, maxWaitSec, options, this.watchShutdown.signal);
+  }
+
+  async steer(jobId: string, message: string) {
+    await this.initialize();
+    const job = this.store.get(jobId);
+    if (!this.owns(job)) throw new Error('Only the owning server can steer this job');
+    if (job.state !== 'running') throw new Error('Only a running job can be steered');
+    if (!message.trim()) throw new Error('Steer message must not be blank');
+    const active = this.active.get(jobId);
+    if (!active?.process.steer) throw new Error(`this job can't take mid-turn messages; use ${this.connector.id}_job_send after it stops, or start it with transport: app-server`);
+    if (active.cancelled) throw new Error('Job is stopping');
+    const { delivered } = await active.process.steer(message);
+    appendFileSync(join(this.store.dir(jobId), 'steer.log'), JSON.stringify({ timestamp: new Date().toISOString(), message }) + '\n');
+    active.job.steers = (active.job.steers ?? 0) + 1;
+    this.store.save(active.job, this.owner);
+    return { delivered };
+  }
+
+  async respond(jobId: string, decision: ApprovalDecision) {
+    await this.initialize();
+    const job = this.store.get(jobId);
+    if (!this.owns(job)) throw new Error('Only the owning server can respond to this job');
+    if (!['accept', 'acceptForSession', 'decline', 'cancel'].includes(decision)) throw new Error('Invalid approval decision');
+    const active = this.active.get(jobId);
+    if (job.state !== 'running' || !job.pendingApproval || !active?.process.respond || active.cancelled)
+      throw new Error('No pending approval for this running job');
+    active.process.respond(decision);
+    return { responded: true };
   }
 
   // Must run under the shared lock after the replacement exists. Quota pauses are independent.
@@ -541,6 +579,8 @@ export class JobManager {
       atomicWrite(job.finalPath, '');
       job.finishedAt = undefined;
       job.error = undefined;
+      job.pendingApproval = undefined;
+      job.approvalReason = undefined;
       job.exitCode = undefined;
       const command = this.connector.build({
         ...job,
@@ -548,6 +588,24 @@ export class JobManager {
           ? `${prompt}\n\nDo not commit changes; the orchestrator will collect the patch.`
           : prompt,
       });
+      const receive = (parsed: JobEvent | null) => {
+        if (!parsed) return;
+        if (parsed.reasoning) {
+          const path = this.store.path(job.id, 'reasoning');
+          const previous = readFileSync(path);
+          const combined = Buffer.concat([previous, Buffer.from(parsed.reasoning + '\n')]);
+          let tail = combined.subarray(Math.max(0, combined.length - 256 * 1024));
+          while (tail.length && (tail[0] & 0xc0) === 0x80) tail = tail.subarray(1);
+          atomicWrite(path, tail);
+        }
+        event = { ...event, ...parsed, usageLimit: parsed.usageLimit ?? event.usageLimit };
+        if (parsed.final && !parsed.error) event.error = undefined;
+        let changed = false;
+        if (parsed.sessionId) { job.sessionId = parsed.sessionId; changed = true; }
+        if ('pendingApproval' in parsed) { job.pendingApproval = parsed.pendingApproval ?? undefined; changed = true; }
+        if (parsed.approvalReason) { job.approvalReason = parsed.approvalReason; job.reason = parsed.approvalReason; changed = true; }
+        if (changed) this.store.save(job, this.owner);
+      };
       const process = startProcess({
         ...command,
         cwd: job.cwd,
@@ -593,29 +651,13 @@ export class JobManager {
             }
           })().catch(error => this.logger.warn('Failed checking process cleanup', error));
         },
-        onLine: (line, stream) => {
-          const parsed = this.connector.parse(line, stream);
-          if (!parsed) return;
-          if (parsed.reasoning) {
-            const path = this.store.path(job.id, 'reasoning');
-            const previous = readFileSync(path);
-            const combined = Buffer.concat([previous, Buffer.from(parsed.reasoning + '\n')]);
-            let tail = combined.subarray(Math.max(0, combined.length - 256 * 1024));
-            while (tail.length && (tail[0] & 0xc0) === 0x80) tail = tail.subarray(1);
-            atomicWrite(path, tail);
-          }
-          event = { ...event, ...parsed, usageLimit: parsed.usageLimit ?? event.usageLimit };
-          // A recovery answer supersedes an earlier error from an empty, denied turn.
-          if (parsed.final && !parsed.error) event.error = undefined;
-          if (parsed.sessionId) {
-            job.sessionId = parsed.sessionId;
-            this.store.save(job, this.owner);
-          }
-        },
+        onEvent: receive,
+        onLine: (line, stream) => receive(this.connector.parse(line, stream)),
       });
       const finished = process.done
         .then(async outcome => {
           workerDone = true;
+          job.pendingApproval = undefined;
           killFailed = outcome.killFailed ?? false;
           clearTimeout(timer);
           if (event.final && !(await this.store.page(job.id, 'final', 0, 20000)).text.trim())
@@ -673,8 +715,8 @@ export class JobManager {
           if (!this.active.size) this.hold.stop();
           void this.pump().catch(error => this.logger.warn('Job queue error', error));
         });
-      this.active.set(job.id, { process, finished, cancelled: false, sample: () => {
-        if (workerDone || job.state !== 'running' || !(job.stallTimeoutMin ?? 10) || stalledKill) return;
+      this.active.set(job.id, { job, process, finished, cancelled: false, sample: () => {
+        if (workerDone || job.pendingApproval || job.state !== 'running' || !(job.stallTimeoutMin ?? 10) || stalledKill) return;
         const current = [statSync(this.store.path(job.id, 'stdout')).size, statSync(this.store.path(job.id, 'stderr')).size];
         const now = Date.now();
         if (current[0] > sizes[0] || current[1] > sizes[1]) {
@@ -724,10 +766,10 @@ export class JobManager {
       await this.recordQuota(job, event.usageLimit);
     } else if (outcome.kind === 'error' || outcome.code !== 0 || event.error) {
       job.state = 'failed';
-      job.reason = outcome.kind === 'error' ? 'spawn_error' : 'cli_error';
+      job.reason = job.approvalReason ?? (outcome.kind === 'error' ? 'spawn_error' : 'cli_error');
     } else {
       job.state = 'completed';
-      job.reason = undefined;
+      job.reason = job.approvalReason;
       await this.recordQuota(job);
     }
     this.store.save(job, this.owner);
@@ -789,6 +831,7 @@ export class JobManager {
     const job = this.store.get(jobId);
     return {
       ...job,
+      steers: job.steers ?? 0,
       elapsedSec: ((job.finishedAt ?? Date.now()) - (job.startedAt ?? job.createdAt)) / 1000,
       stderr: this.tail(jobId, 'stderr'),
       events: this.publicEvents(jobId),
@@ -929,6 +972,9 @@ export class JobManager {
         descendants: undefined,
         reserved: false,
         sessionId: undefined,
+        pendingApproval: undefined,
+        approvalReason: undefined,
+        steers: 0,
         reason: undefined,
         failureReason: undefined,
         partial: undefined,

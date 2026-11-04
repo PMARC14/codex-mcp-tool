@@ -20,6 +20,14 @@ const spec: JobSpec = {
   finalPath: '/jobs/job/final.txt',
 };
 
+test('explicit exec transport is identical to the default and app-server is opt-in', () => {
+  assert.deepEqual(connector.build({ ...spec, transport: 'exec' }), connector.build(spec));
+  const app = connector.build({ ...spec, transport: 'app-server' });
+  assert.deepEqual(app.args, ['app-server']);
+  assert.ok('stdinPlan' in app && typeof app.stdinPlan === 'function');
+  assert.equal(JSON.parse(app.stdin).method, 'initialize');
+});
+
 for (const [mode, expected] of [
   ['read', 'read-only'],
   ['write', 'workspace-write'],

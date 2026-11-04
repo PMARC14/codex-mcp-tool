@@ -1,5 +1,6 @@
 import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import type { JobMeta, JobState, JobLogger } from './connector.js';
 
 /**
@@ -64,7 +65,8 @@ const safe = (value: string | undefined, max: number): string | undefined => {
 
 /** Builds the metadata-only event for a job; never reads job output. */
 export function channelEvent(job: JobMeta, prefix: string) {
-  const meta: Record<string, string> = { job_id: job.id, state: job.state, agent: prefix };
+  const awaiting = job.state === 'running' && !!job.pendingApproval;
+  const meta: Record<string, string> = { job_id: job.id, state: awaiting ? 'input_required' : job.state, agent: prefix };
   const label = safe(job.label, 40);
   if (label) meta.label = label;
   const reason = safe(job.reason, 40);
@@ -74,6 +76,7 @@ export function channelEvent(job: JobMeta, prefix: string) {
   if (job.verify) meta.verify = job.verify.passed ? 'passed' : 'failed';
   if (job.supersededBy) meta.superseded_by = job.supersededBy;
   let content = `${prefix} job ${job.state}: call ${prefix}_job_result with this job_id`;
+  if (awaiting) content = `${prefix} job input_required: call ${prefix}_job_status then ${prefix}_job_respond with this job_id`;
   if (job.state === 'paused' && job.resetAt) {
     const reset = new Date(job.resetAt);
     if (!Number.isNaN(reset.getTime())) {
@@ -99,14 +102,16 @@ export function startChannelNotifier(
   const sent = new Set<string>();
   let stopped = false;
   const unsubscribe = manager.onTransition((job, previous) => {
-    if (job.state === 'queued' || job.state === 'running') { for (const key of sent) if (key.startsWith(`${job.id}:`)) sent.delete(key); }
-    if (stopped || !NOTIFY_STATES.includes(job.state) || previous === job.state) return;
+    const awaiting = job.state === 'running' && !!job.pendingApproval;
+    if (!awaiting && (job.state === 'queued' || job.state === 'running')) { for (const key of sent) if (key.startsWith(`${job.id}:`) && !key.includes(':input_required:')) sent.delete(key); }
+    if (stopped || (!awaiting && (!NOTIFY_STATES.includes(job.state) || previous === job.state))) return;
     if (!manager.isOwn(job)) return;
-    const key = `${job.id}:${job.state}`;
+    const key = awaiting ? `${job.id}:input_required:${job.pendingApproval!.id}:${job.pendingApproval!.requestedAt}` : `${job.id}:${job.state}`;
     if (sent.has(key)) return;
     if (manager.store) {
-      if (existsSync(join(manager.store.dir(job.id), 'mcp-task.json'))) return;
-      try { writeFileSync(join(manager.store.dir(job.id), 'woken'), '', { flag: 'wx' }); }
+      if (!awaiting && existsSync(join(manager.store.dir(job.id), 'mcp-task.json'))) return;
+      const marker = awaiting ? `approval-woken-${createHash('sha256').update(key).digest('hex')}` : 'woken';
+      try { writeFileSync(join(manager.store.dir(job.id), marker), '', { flag: 'wx' }); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') logger?.warn('Unable to create channel marker', error);
         return;

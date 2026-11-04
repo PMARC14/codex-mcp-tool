@@ -5,7 +5,7 @@ import { registerJobTools, type JobTool } from './tools.js';
 import { JobManager } from './manager.js';
 import { fixture, fakeConnector } from './test-helpers.js';
 
-test('portable registration exposes all ten prefixed tools with bounded schemas and explicit full mode', async () => {
+test('portable registration exposes prefixed tools with bounded schemas and explicit full mode', async () => {
   const f = fixture();
   const manager = new JobManager(fakeConnector(f.script), f.config);
   try {
@@ -19,6 +19,8 @@ test('portable registration exposes all ten prefixed tools with bounded schemas 
         'codex_job_result',
         'codex_job_watch',
         'codex_job_send',
+        'codex_job_steer',
+        'codex_job_respond',
         'codex_job_cancel',
         'codex_job_list',
         'codex_job_read',

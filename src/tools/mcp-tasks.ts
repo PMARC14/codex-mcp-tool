@@ -111,6 +111,7 @@ export function registerMcpTasks(
   };
   const taskFor = (job: JobMeta): Task => {
     let status: Task['status'] = 'working';
+    if (job.state === 'running' && job.pendingApproval) status = 'input_required';
     if (job.state === 'completed') status = 'completed';
     if (job.state === 'failed' || job.state === 'lost') status = 'failed';
     if (job.state === 'killed') status = 'cancelled';
@@ -140,6 +141,7 @@ export function registerMcpTasks(
         : 'Paused until the usage limit is reset; reset time unknown';
     if (job.reason === 'superseded')
       statusMessage = `Superseded by ${job.supersededBy ?? 'a replacement job'}`;
+    if (status === 'input_required') statusMessage = 'awaiting approval';
     return {
       taskId: job.id,
       status,

@@ -94,6 +94,10 @@ export function registerJobTools(
           .string()
           .optional()
           .describe('Native CLI session ID to resume, from an earlier result.'),
+        ...(prefix === 'codex' ? {
+          transport: z.enum(['exec', 'app-server']).default('exec').describe('Opt in to app-server for steering and interactive approvals.'),
+          approvalTimeoutMin: z.number().positive().default(30),
+        } : {}),
         idempotencyKey: z.string().min(1).optional(),
         priority: z.enum(['normal', 'optional']).default('normal'),
         stallTimeoutMin: z.number().min(0).default(10),
@@ -169,6 +173,18 @@ export function registerJobTools(
       timeoutMin: z.number().positive().optional(),
     }),
     ({ jobId, message, ...overrides }) => manager.send(jobId, message, overrides)
+  );
+  add(
+    'job_steer',
+    'Message a running job owned by this server. Requires a connector with interactive stdin (Codex: transport app-server). Returns mid-turn or queued delivery.',
+    z.object({ jobId, message: z.string().min(1).refine(message => !!message.trim(), 'Message must not be blank') }),
+    args => manager.steer(args.jobId, args.message)
+  );
+  if (prefix === 'codex') add(
+    'job_respond',
+    'Answer a running app-server job approval. Inspect pendingApproval in job_status first.',
+    z.object({ jobId, decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']) }),
+    args => manager.respond(args.jobId, args.decision)
   );
   add(
     'job_cancel',

@@ -9,6 +9,7 @@ import { getCodexVersion, checkMinimumCodexVersion } from '../utils/versionDetec
 import { runCommand } from '../jobs/proc.js';
 import { readCodexUsage, readLiveCodexUsage } from '../utils/codexUsage.js';
 import { usageLimit } from '../jobs/usage-reset.js';
+import { buildAppServer, parseAppServer } from './codexAppServer.js';
 
 export { usageReset } from '../jobs/usage-reset.js';
 
@@ -135,6 +136,7 @@ export class CodexConnector implements Connector {
   }
 
   build(job: JobSpec) {
+    if (job.transport === 'app-server') return buildAppServer(job, this.resolve().command);
     const args: string[] = [];
     // Sandbox flags are global; exec resume accepts only a subset of exec flags.
     if (job.mode === 'full') args.push('--dangerously-bypass-approvals-and-sandbox');
@@ -150,6 +152,8 @@ export class CodexConnector implements Connector {
   }
 
   parse(line: string, _stream: 'stdout' | 'stderr'): JobEvent | null {
+    const appEvent = parseAppServer(line, _stream);
+    if (appEvent) return appEvent;
     let event: Record<string, any>;
     try {
       event = JSON.parse(line);

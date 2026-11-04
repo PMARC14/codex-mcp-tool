@@ -33,6 +33,8 @@ export interface JobSpec {
   effort?: string;
   label?: string;
   resumeSession?: string;
+  transport?: 'exec' | 'app-server';
+  approvalTimeoutMin?: number;
   timeoutMin: number;
   stallTimeoutMin?: number;
   onStall?: 'report' | 'kill';
@@ -45,6 +47,9 @@ export interface JobSpec {
 export type FailureReason = 'quota_exhausted' | 'timeout' | 'cancelled' | 'stalled' | 'auth' | 'cli_error' | 'kill_failed' | 'lost' | 'superseded' | 'verify_failed';
 
 export interface JobMeta extends Omit<JobSpec, 'prompt'> {
+  steers?: number;
+  pendingApproval?: { id: string | number; kind: string; summary: string; requestedAt: number };
+  approvalReason?: 'approval_timeout';
   verify?: { command: string; exitCode: number | null; passed: boolean; durationSec: number; timedOut: boolean };
   state: JobState;
   stalled?: boolean;
@@ -78,6 +83,8 @@ export interface JobMeta extends Omit<JobSpec, 'prompt'> {
 }
 
 export interface JobEvent {
+  pendingApproval?: JobMeta['pendingApproval'] | null;
+  approvalReason?: 'approval_timeout';
   reasoning?: string;
   sessionId?: string;
   final?: string;
