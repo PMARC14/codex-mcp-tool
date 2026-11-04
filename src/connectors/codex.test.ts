@@ -150,3 +150,104 @@ test('Codex jobs run outside git repos too (advice and debate need no repo)', ()
     assert.ok(args.indexOf('--skip-git-repo-check') > args.indexOf('exec'));
   }
 });
+
+test('Codex detect succeeds when logged in', async () => {
+  let executedExe: string | undefined;
+  let executedArgs: string[] | undefined;
+  let executedTimeout: number | undefined;
+
+  const loggedIn = new CodexConnector(async (exe, args, _cwd, timeoutMs) => {
+    executedExe = exe;
+    executedArgs = args;
+    executedTimeout = timeoutMs;
+    return 'Logged in using ChatGPT';
+  }, binary);
+
+  const result = await loggedIn.detect();
+  assert.equal(result.available, true);
+  assert.equal(executedExe, '/fake/codex.exe');
+  assert.deepEqual(executedArgs, ['login', 'status']);
+  assert.equal(executedTimeout, 10000);
+});
+
+test('Codex detect reports unavailable when not logged in', async () => {
+  const notLoggedIn = new CodexConnector(async (_exe, args) => {
+    assert.deepEqual(args, ['login', 'status']);
+    return 'Not logged in';
+  }, binary);
+
+  const result = await notLoggedIn.detect();
+  assert.equal(result.available, false);
+  assert.equal(result.reason, 'Codex is not signed in: run codex login');
+});
+
+test('Codex detect probe failure fails open on timeout or error', async () => {
+  const failing = new CodexConnector(async () => {
+    throw new Error('timed out after 10000ms');
+  }, binary);
+
+  const result = await failing.detect();
+  assert.equal(result.available, true);
+});
+
+test('Codex detect probe failure fails open on unknown output', async () => {
+  const unknown = new CodexConnector(async () => {
+    return 'unknown status format from new CLI version';
+  }, binary);
+
+  const result = await unknown.detect();
+  assert.equal(result.available, true);
+});
+
+test('Codex detect caches login status for 10 minutes and refreshes after expiration', async () => {
+  let probeCalls = 0;
+  let now = 1000000;
+  const connector = new CodexConnector(
+    async () => {
+      probeCalls++;
+      return 'Logged in using ChatGPT';
+    },
+    binary,
+    () => now
+  );
+
+  const first = await connector.detect();
+  assert.equal(first.available, true);
+  assert.equal(probeCalls, 1);
+
+  // Immediate subsequent call uses cache
+  const second = await connector.detect();
+  assert.equal(second.available, true);
+  assert.equal(probeCalls, 1);
+
+  // Still within 10 minutes (9 minutes elapsed)
+  now += 9 * 60 * 1000;
+  const third = await connector.detect();
+  assert.equal(third.available, true);
+  assert.equal(probeCalls, 1);
+
+  // Past 10 minutes TTL (10 minutes + 1 ms elapsed)
+  now += 1 * 60 * 1000 + 1;
+  const fourth = await connector.detect();
+  assert.equal(fourth.available, true);
+  assert.equal(probeCalls, 2);
+});
+
+test('Codex detect caches not-logged-in status', async () => {
+  let probeCalls = 0;
+  const connector = new CodexConnector(async () => {
+    probeCalls++;
+    return 'Not logged in';
+  }, binary);
+
+  const first = await connector.detect();
+  assert.equal(first.available, false);
+  assert.equal(first.reason, 'Codex is not signed in: run codex login');
+  assert.equal(probeCalls, 1);
+
+  const second = await connector.detect();
+  assert.equal(second.available, false);
+  assert.equal(second.reason, 'Codex is not signed in: run codex login');
+  assert.equal(probeCalls, 1);
+});
+

@@ -11,14 +11,57 @@ import { usageLimit } from '../jobs/usage-reset.js';
 
 export { usageReset } from '../jobs/usage-reset.js';
 
+export const LOGIN_CACHE_TTL_MS = 10 * 60 * 1000;
+export const NOT_SIGNED_IN_REASON = 'Codex is not signed in: run codex login';
+
 export class CodexConnector implements Connector {
   readonly id = 'codex';
   readonly reviewModel = 'gpt-6-astra';
 
+  private loginStatusCache?: {
+    available: boolean;
+    reason?: string;
+    checkedAt: number;
+  };
+  private loginStatusPromise?: Promise<{ available: boolean; reason?: string }>;
+
   constructor(
     private run = runCommand,
-    private resolve = () => resolveBinary('codex', CODEX_PATH_ENV)
+    private resolve = () => resolveBinary('codex', CODEX_PATH_ENV),
+    private now = () => Date.now()
   ) {}
+
+  private async checkLogin(command: string): Promise<{ available: boolean; reason?: string }> {
+    if (
+      this.loginStatusCache &&
+      this.now() - this.loginStatusCache.checkedAt < LOGIN_CACHE_TTL_MS
+    ) {
+      return this.loginStatusCache;
+    }
+
+    if (!this.loginStatusPromise) {
+      this.loginStatusPromise = (async () => {
+        let available = true;
+        let reason: string | undefined;
+        try {
+          const status = await this.run(command, ['login', 'status'], undefined, 10000);
+          if (/\bnot (?:logged|signed) in\b/i.test(status)) {
+            available = false;
+            reason = NOT_SIGNED_IN_REASON;
+          }
+        } catch {
+          available = true;
+        }
+        const result = { available, reason };
+        this.loginStatusCache = { ...result, checkedAt: this.now() };
+        return result;
+      })().finally(() => {
+        this.loginStatusPromise = undefined;
+      });
+    }
+
+    return this.loginStatusPromise;
+  }
 
   async detect() {
     const resolution = this.resolve();
@@ -37,6 +80,14 @@ export class CodexConnector implements Connector {
         reason:
           minimum.message ||
           'Codex CLI could not start. Install a supported CLI, run codex login, and reconnect this MCP server.',
+      };
+    const login = await this.checkLogin(resolution.command);
+    if (!login.available)
+      return {
+        available: false,
+        exe: resolution.command,
+        version: version.raw,
+        reason: login.reason,
       };
     return { available: true, exe: resolution.command, version: version.raw };
   }
