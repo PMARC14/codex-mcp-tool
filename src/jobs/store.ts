@@ -24,6 +24,7 @@ export const files = {
   stderr: 'stderr',
   final: 'final.txt',
   patch: 'patch.diff',
+  verify: 'verify',
 } as const;
 export type JobFile = keyof typeof files;
 export const terminal = (job: JobMeta) =>

@@ -11,7 +11,7 @@ The existing synchronous tools remain available. The `codex_*` job tools provide
 | `codex_job_send`         | Send `message` to a stopped job's session as a new resumed job. Optional `mode`, `model`, `effort`, and `timeoutMin` override inherited settings. Returns `{ jobId, state, followUpOf }`. |
 | `codex_job_cancel`       | Stop an owned job's process tree and wait for termination, up to 10 seconds.                                                                                             |
 | `codex_job_list`         | Recent jobs from the shared store, newest first.                                                                                                                         |
-| `codex_job_read`         | Read `prompt`, `stdout`, `stderr`, `final`, or `patch` by character offset, at most 20,000 characters per page.                                                          |
+| `codex_job_read`         | Read `prompt`, `stdout`, `stderr`, `final`, `patch`, or `verify` by character offset, at most 20,000 characters per page.                                                          |
 | `codex_job_requeue`      | Create a new queued job from a paused, lost, or failed job's saved prompt. Optional `model` overrides the model; optional `agent: "agy"` hands it to the sibling server. |
 | `codex_worktree_collect` | Save a binary patch and diff stat, then optionally remove the worktree or worktree and branch.                                                                           |
 | `codex_usage`            | Read live Codex quota, with a marked session-log fallback. |
@@ -71,7 +71,7 @@ Claude Code Channels let an MCP server push events into a running session. To en
 
 When the variable is unset, the server declares no extra capability and sends nothing, so other MCP clients see no change. When it is set, the server declares `experimental: { 'claude/channel': {} }`, adds one line to its instructions, and sends one notification per job when this server's own job reaches `completed`, `failed`, `killed`, `paused`, or `lost`. Jobs owned by other servers are never announced, and a job is not announced twice for the same state. If the session did not load the server as a channel, Claude Code drops the events silently.
 
-The payload is metadata only. The content is `codex job <state>: call codex_job_result with this job_id` (with the reset time added for `paused`). The attributes are `job_id`, `state`, `agent`, plus `label` (sanitized to `[A-Za-z0-9_-]`, 40 characters at most), `reason`, and `reset_at` when known. Superseding a paused job sends one `killed` transition with `reason: "superseded"` and `superseded_by` identifying its replacement. Worker output (final text, stdout, stderr, patch) is never included, because it would be a prompt-injection vector; call `codex_job_result` to read it. A failed push is logged and never affects the job.
+The payload is metadata only. The content is `codex job <state>: call codex_job_result with this job_id` (with the reset time added for `paused`). The attributes are `job_id`, `state`, `agent`, and `verify` (`passed` or `failed` when verification ran), plus `label` (sanitized to `[A-Za-z0-9_-]`, 40 characters at most), `reason`, and `reset_at` when known. Superseding a paused job sends one `killed` transition with `reason: "superseded"` and `superseded_by` identifying its replacement. Worker output (final text, stdout, stderr, patch) is never included, because it would be a prompt-injection vector; call `codex_job_result` to read it. A failed push is logged and never affects the job.
 
 ## Usage
 
@@ -88,3 +88,8 @@ Agy read jobs and legacy synchronous tools send one NDJSON prompt initially. Onl
 `src/jobs/` is the portable source of truth in this fork. From Git Bash or Bash, `scripts/sync-jobs.sh [sibling-repository]` copies it into the agy fork (the script is identical in both repos and expects both to sit side by side). The comparison test fails on differences when the sibling copy exists. Set `AGENT_JOBS_MIRROR` to require comparison against a specific copy.
 
 Run `npm test` for the fake-worker suite; it starts no real Codex jobs. Real CLI integration, resume behavior, orphan cleanup with CLI-created commands, Fedora wake inhibition, and a human check for window flashes require a separate opt-in integration run.
+
+
+`codex_job_start` accepts `verify`, a shell command run through Git Bash in the job directory after the CLI succeeds, and `verifyTimeoutMin` (default 10 minutes). Verification is rejected in read mode. Its command, exit code, pass status, duration and timeout status appear as `verify` in job metadata, result and watch; the output tail is available through `job_read` as `verify`. A failed verification leaves the job `completed` so its patch remains collectable. Follow-ups and requeues inherit the command and timeout.
+
+Worktree creation and collection disable Git hooks and configured clean, smudge and process filters and skip LFS smudging for their Git commands.

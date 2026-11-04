@@ -92,6 +92,8 @@ export function registerJobTools(
           .string()
           .optional()
           .describe('Native CLI session ID to resume, from an earlier result.'),
+        verify: z.string().min(1).optional().describe('Shell command to run after successful completion.'),
+        verifyTimeoutMin: z.number().positive().default(10),
         timeoutMin: z
           .number()
           .positive()
@@ -185,7 +187,7 @@ export function registerJobTools(
     z.object({
       jobId,
       name: z
-        .enum(['final', 'stdout', 'stderr', 'patch', 'prompt'])
+        .enum(['final', 'stdout', 'stderr', 'patch', 'prompt', 'verify'])
         .describe('Saved output or full original prompt to read.'),
       offset: z.number().int().min(0).default(0).describe('Zero-based character offset.'),
       limit: z

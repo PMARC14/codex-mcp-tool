@@ -130,3 +130,32 @@ test('saved patch keeps trailing whitespace and multi-byte text byte for byte', 
     f.cleanup();
   }
 });
+
+
+test('worktree operations disable hooks and configured filters while preserving the patch', async () => {
+  const f = fixture();
+  try {
+    const { root, git } = await repo(f.home);
+    const hooks = join(f.home, 'hooks');
+    mkdirSync(hooks);
+    const hookMarker = join(f.home, 'hook-marker');
+    const filterMarker = join(f.home, 'filter-marker');
+    // Relative marker paths avoid shell quoting and platform-specific path syntax.
+    writeFileSync(join(hooks, 'post-checkout'), '#!/bin/sh\necho hook > ../../hook-marker\n', { mode: 0o755 });
+    await git('config', 'core.hooksPath', hooks);
+    writeFileSync(join(root, '.gitattributes'), 'tracked.txt filter=evil\n');
+    await git('add', '.gitattributes');
+    await git('commit', '-m', 'attributes');
+    await git('config', 'filter.evil.smudge', 'echo smudge > ../../filter-marker; cat');
+    await git('config', 'filter.evil.clean', 'echo clean > ../../filter-marker; cat');
+    await git('config', 'filter.evil.required', 'true');
+    const worktree = await createWorktree(root, 'guard', 'guard-id', 'codex', f.home);
+    assert.equal(existsSync(hookMarker), false);
+    assert.equal(existsSync(filterMarker), false);
+    writeFileSync(join(worktree.path, 'tracked.txt'), 'safe change\n');
+    const result = await collectWorktree(worktree, join(f.home, 'guard.patch'), 'worktree+branch', f.home);
+    assert.match(result.patch, /\+safe change/);
+    assert.equal(existsSync(hookMarker), false);
+    assert.equal(existsSync(filterMarker), false);
+  } finally { f.cleanup(); }
+});

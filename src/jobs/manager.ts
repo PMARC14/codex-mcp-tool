@@ -43,6 +43,8 @@ export interface StartOptions {
   worktree?: boolean;
   resumeSession?: string;
   timeoutMin?: number;
+  verify?: string;
+  verifyTimeoutMin?: number;
 }
 
 const sleep = (ms: number) => new Promise(resolveResult => setTimeout(resolveResult, ms));
@@ -200,10 +202,14 @@ export class JobManager {
     const timeoutMin = options.timeoutMin ?? 120;
     if (!Number.isFinite(timeoutMin) || timeoutMin <= 0)
       throw new Error('timeoutMin must be positive');
+    if (options.verify !== undefined && (!options.verify.trim() || (options.mode ?? 'read') === 'read'))
+      throw new Error('verify requires a non-empty command and a non-read mode');
+    if (options.verifyTimeoutMin !== undefined && (!Number.isFinite(options.verifyTimeoutMin) || options.verifyTimeoutMin <= 0))
+      throw new Error('verifyTimeoutMin must be positive');
     const id = randomUUID();
     const model = followUpOf ? undefined : this.selectModel(options.model);
     const worktree = options.worktree
-      ? await createWorktree(options.cwd, options.label, id, this.connector.id)
+      ? await createWorktree(options.cwd, options.label, id, this.connector.id, this.config.home)
       : undefined;
     if (worktree?.warning) this.logger.warn(worktree.warning);
     let meta: JobMeta = {
@@ -216,6 +222,8 @@ export class JobManager {
       label: options.label,
       resumeSession: options.resumeSession,
       timeoutMin,
+      verifyCommand: options.verify,
+      verifyTimeoutMin: options.verifyTimeoutMin ?? 10,
       worktree,
       originalCwd: resolve(options.cwd),
       finalPath: this.store.path(id, 'final'),
@@ -236,6 +244,8 @@ export class JobManager {
           this.isDirectory(original.worktree.path)
             ? original.worktree
             : undefined;
+        if ((options.mode ?? original.mode) === 'read' && original.verifyCommand)
+          throw new Error('verify requires a non-read mode');
         meta = {
           ...meta,
           connector: original.connector,
@@ -248,6 +258,8 @@ export class JobManager {
           model: this.selectModel(options.model ?? original.model, original.connector),
           effort: options.effort ?? original.effort,
           timeoutMin: options.timeoutMin ?? original.timeoutMin,
+          verifyCommand: original.verifyCommand,
+          verifyTimeoutMin: original.verifyTimeoutMin,
           resumeSession: original.sessionId,
           followUpOf,
         };
@@ -538,6 +550,27 @@ export class JobManager {
           clearTimeout(timer);
           if (event.final && !(await this.store.page(job.id, 'final', 0, 20000)).text.trim())
             atomicWrite(job.finalPath, event.final);
+          if (outcome.kind === 'exit' && outcome.code === 0 && !event.error && !event.usageLimit && job.verifyCommand) {
+            const started = Date.now();
+            let output = '';
+            const verifyProcess = startProcess({
+              exe: 'bash', args: ['-c', job.verifyCommand], cwd: job.cwd,
+              stdout: this.store.path(job.id, 'verify'), stderr: this.store.path(job.id, 'verify'),
+              onSpawn: async identity => { job.process = identity; job.descendants = []; this.store.save(job, this.owner); },
+              onSnapshot: identities => { job.descendants = identities; this.store.save(job, this.owner); },
+              onLine: () => {}, onData: data => { output = (output + data).slice(-65536); },
+            });
+            const active = this.active.get(job.id);
+            if (active) active.process = verifyProcess;
+            const verifyTimer = setTimeout(() => void verifyProcess.stop('timeout'), (job.verifyTimeoutMin ?? 10) * 60000);
+            const checked = await verifyProcess.done;
+            clearTimeout(verifyTimer);
+            // Keep a bounded output tail in the public verification file.
+            atomicWrite(this.store.path(job.id, 'verify'), output + (checked.error ? `\n${checked.error}` : ''));
+            job.verify = { command: job.verifyCommand, exitCode: checked.code, passed: checked.kind === 'exit' && checked.code === 0, durationSec: (Date.now() - started) / 1000, timedOut: checked.kind === 'timeout' };
+            if (checked.kind === 'cancel') { await this.settle(job, checked, event); return; }
+            if (checked.killFailed) { killFailed = true; await this.settle(job, checked, event); return; }
+          }
           await this.settle(job, outcome, event);
         })
         .catch(error => {
@@ -678,6 +711,7 @@ export class JobManager {
     return {
       jobId,
       state: job.state,
+      verify: job.verify,
       reason: job.reason,
       supersededBy: job.supersededBy,
       error: job.error?.slice(0, 20000),
@@ -788,6 +822,7 @@ export class JobManager {
         resetAt: undefined,
         pauseModel: undefined,
         exitCode: undefined,
+        verify: undefined,
         createdAt: Date.now(),
         updatedAt: Date.now(),
         startedAt: undefined,
@@ -829,7 +864,7 @@ export class JobManager {
       );
       if (busy)
         throw new Error(`Job ${busy.id} still uses this worktree; wait for it to stop first`);
-      const result = await collectWorktree(job.worktree, this.store.path(jobId, 'patch'), remove);
+      const result = await collectWorktree(job.worktree, this.store.path(jobId, 'patch'), remove, this.config.home);
       if (job.worktree.removed && job.state === 'paused') job.pauseCleared = true;
       this.store.save(job, this.owner);
       if (job.worktree.removed)

@@ -34,11 +34,14 @@ export interface JobSpec {
   label?: string;
   resumeSession?: string;
   timeoutMin: number;
+  verifyCommand?: string;
+  verifyTimeoutMin?: number;
   finalPath: string;
   worktree?: Worktree;
 }
 
 export interface JobMeta extends Omit<JobSpec, 'prompt'> {
+  verify?: { command: string; exitCode: number | null; passed: boolean; durationSec: number; timedOut: boolean };
   state: JobState;
   owner?: Owner;
   managerId?: string;

@@ -1,8 +1,44 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { runCommand, runCommandBuffer } from './proc.js';
+import { safeSpawn } from './proc.js';
+import { readConfig } from './config.js';
 import { atomicWrite } from './store.js';
 import type { Worktree } from './connector.js';
+
+// One configuration snapshot per operation; even discovery runs with hooks and LFS disabled.
+async function gitGroup(cwd: string, home: string) {
+  const hooks = join(home, 'empty-hooks');
+  mkdirSync(hooks, { recursive: true });
+  const base = ['-c', `core.hooksPath=${hooks}`];
+  const run = (dir: string, args: string[], allowMissing = false): Promise<Buffer> =>
+    new Promise((resolveResult, reject) => {
+      const child = safeSpawn('git', args, { cwd: dir, env: { ...process.env, GIT_LFS_SKIP_SMUDGE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      const out: Buffer[] = [], err: Buffer[] = [];
+      const timer = setTimeout(() => { child.kill(); reject(new Error('git timed out')); }, 30000);
+      child.stdout?.on('data', (data: Buffer) => out.push(data));
+      child.stderr?.on('data', (data: Buffer) => err.push(data));
+      child.on('error', error => { clearTimeout(timer); reject(error); });
+      child.on('close', code => {
+        clearTimeout(timer);
+        if (code === 0 || (allowMissing && code === 1)) resolveResult(Buffer.concat(out));
+        else reject(new Error(`git exited ${code}: ${Buffer.concat(err).toString('utf8') || Buffer.concat(out).toString('utf8')}`));
+      });
+    });
+  const config = (await run(cwd, [...base, 'config', '--null', '--get-regexp', '^filter\\.'], true)).toString('utf8');
+  const names = new Set<string>();
+  for (const entry of config.split('\0')) {
+    const key = entry.split('\n', 1)[0];
+    const match = /^filter\.(.+)\.[^.]+$/i.exec(key);
+    if (match) names.add(match[1]);
+  }
+  const overrides = [...base];
+  for (const name of names) for (const [key, value] of [['smudge', ''], ['clean', ''], ['process', ''], ['required', 'false']])
+    overrides.push('-c', `filter.${name}.${key}=${value}`);
+  return {
+    buffer: (dir: string, ...args: string[]) => run(dir, [...overrides, ...args]),
+    text: async (dir: string, ...args: string[]) => (await run(dir, [...overrides, ...args])).toString('utf8').trimEnd(),
+  };
+}
 
 export function sanitizeLabel(label = 'job'): string {
   return (
@@ -19,9 +55,11 @@ export async function createWorktree(
   cwd: string,
   label: string | undefined,
   id: string,
-  connector: string
+  connector: string,
+  home = readConfig().home
 ): Promise<Worktree> {
-  const git = (...args: string[]) => runCommand('git', args, cwd);
+  const group = await gitGroup(cwd, home);
+  const git = (...args: string[]) => group.text(cwd, ...args);
   const root = await git('rev-parse', '--show-toplevel');
   const baseSha = await git('rev-parse', 'HEAD');
   const dirty = await git('status', '--porcelain');
@@ -36,7 +74,7 @@ export async function createWorktree(
     mkdirSync(dirname(path), { recursive: true });
   }
   try {
-    await runCommand('git', ['worktree', 'add', path, '-b', branch, baseSha], root);
+    await group.text(root, 'worktree', 'add', path, '-b', branch, baseSha);
   } catch (error) {
     // Only filesystem/access failures should use the alternate location.
     if (
@@ -47,21 +85,13 @@ export async function createWorktree(
       throw error;
     path = join(commonDir, 'agent-jobs-worktrees', name);
     mkdirSync(dirname(path), { recursive: true });
-    const existing = await runCommand(
-      'git',
-      ['rev-parse', '--verify', `refs/heads/${branch}`],
-      root
-    ).catch(() => undefined);
+    const existing = await group.text(root, 'rev-parse', '--verify', `refs/heads/${branch}`).catch(() => undefined);
     if (existing && existing !== baseSha) throw error;
-    await runCommand(
-      'git',
-      existing
+    await group.text(root, ...(existing
         ? ['worktree', 'add', path, branch]
-        : ['worktree', 'add', path, '-b', branch, baseSha],
-      root
-    );
+        : ['worktree', 'add', path, '-b', branch, baseSha]));
   }
-  const gitDir = await runCommand('git', ['rev-parse', '--absolute-git-dir'], path);
+  const gitDir = await group.text(path, 'rev-parse', '--absolute-git-dir');
   return {
     root,
     path,
@@ -77,31 +107,25 @@ export async function createWorktree(
 export async function collectWorktree(
   worktree: Worktree,
   patchPath: string,
-  remove: 'none' | 'worktree' | 'worktree+branch'
+  remove: 'none' | 'worktree' | 'worktree+branch',
+  home = readConfig().home
 ) {
   if (worktree.removed) throw new Error(`Worktree already removed; saved patch: ${patchPath}`);
-  await runCommand('git', ['add', '-A'], worktree.path);
+  const group = await gitGroup(worktree.path, home);
+  await group.text(worktree.path, 'add', '-A');
   // The patch is saved as git's raw bytes: no trimming and no text round trip, because the
   // worktree may be removed right after.
-  const raw = await runCommandBuffer(
-    'git',
-    ['diff', '--binary', '--cached', worktree.baseSha],
-    worktree.path
-  );
+  const raw = await group.buffer(worktree.path, 'diff', '--binary', '--cached', worktree.baseSha);
   atomicWrite(patchPath, raw);
   const patch = raw.toString('utf8').trimEnd();
-  const stat = await runCommand(
-    'git',
-    ['diff', '--stat', '--cached', worktree.baseSha],
-    worktree.path
-  );
+  const stat = await group.text(worktree.path, 'diff', '--stat', '--cached', worktree.baseSha);
   let removalError: string | undefined;
   if (remove !== 'none') {
     try {
-      await runCommand('git', ['worktree', 'remove', '--force', worktree.path], worktree.root);
+      await group.text(worktree.root, 'worktree', 'remove', '--force', worktree.path);
       worktree.removed = true;
       if (remove === 'worktree+branch')
-        await runCommand('git', ['branch', '-D', worktree.branch], worktree.root);
+        await group.text(worktree.root, 'branch', '-D', worktree.branch);
     } catch (error) {
       removalError = String(error);
     }
