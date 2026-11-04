@@ -56,6 +56,9 @@ export interface JobMeta extends Omit<JobSpec, 'prompt'> {
   pauseCleared?: boolean;
   manualRequeue?: boolean;
   requeuedFrom?: string;
+  followUpOf?: string;
+  /** Working directory supplied before creating an isolated worktree. */
+  originalCwd?: string;
 }
 
 export interface JobEvent {

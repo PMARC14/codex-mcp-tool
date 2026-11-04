@@ -6,13 +6,14 @@ export interface JobTool {
   name: string;
   description: string;
   zodSchema: ZodTypeAny;
-  execute(args: any): Promise<string>;
+  execute(args: any, onProgress?: (message: string) => void, signal?: AbortSignal): Promise<string>;
 }
 
 export function registerJobTools(
   registry: { push(...tools: JobTool[]): unknown },
   prefix: string,
-  manager: JobManager
+  manager: JobManager,
+  options: { watchHeartbeatMs?: number } = {}
 ): void {
   const jobId = z
     .string()
@@ -24,13 +25,18 @@ export function registerJobTools(
     name: string,
     description: string,
     schema: ZodTypeAny,
-    execute: (args: any) => Promise<unknown>
+    execute: (
+      args: any,
+      onProgress?: (message: string) => void,
+      signal?: AbortSignal
+    ) => Promise<unknown>
   ) => {
     registry.push({
       name: `${prefix}_${name}`,
       description,
       zodSchema: schema,
-      execute: async args => JSON.stringify(await execute(schema.parse(args))),
+      execute: async (args, onProgress, signal) =>
+        JSON.stringify(await execute(schema.parse(args), onProgress, signal)),
     });
   };
   add(
@@ -60,7 +66,7 @@ export function registerJobTools(
           .enum(['read', 'write', 'trusted', 'full'])
           .default('read')
           .describe(
-            'read: inspect only; write: edit in workspace sandbox; trusted: edit and run commands with no sandbox (needed for bash/npm tests on Windows), for worktree jobs on the user\'s own repos; full: explicitly bypass all sandboxing and approvals.'
+            "read: inspect only; write: edit in workspace sandbox; trusted: edit and run commands with no sandbox (needed for bash/npm tests on Windows), for worktree jobs on the user's own repos; full: explicitly bypass all sandboxing and approvals."
           ),
         model: z
           .string()
@@ -116,6 +122,42 @@ export function registerJobTools(
         .describe('Seconds to wait for a quick job, 0 to poll immediately.'),
     }),
     args => manager.result(args.jobId, args.waitSec)
+  );
+  add(
+    'job_watch',
+    'Watch a job until it stops or pauses, with progress every 20 seconds and on state changes. Cancelling the watch leaves the job running. Returns job_result plus watchedSec and timedOut.',
+    z.object({
+      jobId,
+      maxWaitSec: z
+        .number()
+        .min(0)
+        .max(7200)
+        .default(1800)
+        .describe('Maximum seconds to watch, default 1800, at most 7200.'),
+    }),
+    (args, onProgress, signal) =>
+      manager.watch(args.jobId, args.maxWaitSec, {
+        onProgress,
+        signal,
+        heartbeatMs: options.watchHeartbeatMs,
+      })
+  );
+  add(
+    'job_send',
+    'Send a follow-up to a stopped job with a CLI session ID, creating a new resumed job. Inherits connector, directory, worktree, mode and model unless overridden. Running or queued jobs must stop first.',
+    z.object({
+      jobId,
+      message: z
+        .string()
+        .min(1)
+        .refine(message => message.trim().length > 0, 'Message must not be blank')
+        .describe('Follow-up instructions for the existing CLI session.'),
+      mode: z.enum(['read', 'write', 'trusted', 'full']).optional(),
+      model: z.string().optional(),
+      effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional(),
+      timeoutMin: z.number().positive().optional(),
+    }),
+    ({ jobId, message, ...overrides }) => manager.send(jobId, message, overrides)
   );
   add(
     'job_cancel',

@@ -33,6 +33,7 @@ import {
 } from './tools/index.js';
 import { getCompletionValues } from './utils/completions.js';
 import { ProgressReporter } from './utils/progress.js';
+import { executeJobWatch } from './tools/job-watch-progress.js';
 
 import {
   startChannelNotifier,
@@ -148,7 +149,7 @@ server.setRequestHandler(
 // tools/get
 server.setRequestHandler(
   CallToolRequestSchema,
-  async (request: CallToolRequest): Promise<CallToolResult> => {
+  async (request: CallToolRequest, extra): Promise<CallToolResult> => {
     const toolName: string = request.params.name;
 
     if (toolExists(toolName)) {
@@ -156,7 +157,8 @@ server.setRequestHandler(
       const progressToken = (request.params as any)._meta?.progressToken;
 
       // Start progress updates if client requested them
-      const progressData = startProgressUpdates(toolName, progressToken);
+      const watching = toolName === 'codex_job_watch';
+      const progressData = watching ? undefined : startProgressUpdates(toolName, progressToken);
 
       try {
         // Get prompt and other parameters from arguments with proper typing
@@ -165,14 +167,29 @@ server.setRequestHandler(
         Logger.toolInvocation(toolName, request.params.arguments);
 
         // Execute the tool using the unified registry with progress callback
-        const result = await executeTool(toolName, args, newOutput => {
-          if (progressData.state) {
-            progressData.state.latestOutput = newOutput;
-          }
-        });
+        const result = watching
+          ? await executeJobWatch(toolName, args, {
+              progressToken,
+              signal: extra.signal,
+              notify: params =>
+                extra.sendNotification({
+                  method: PROTOCOL.NOTIFICATIONS.PROGRESS,
+                  params,
+                }),
+            })
+          : await executeTool(
+              toolName,
+              args,
+              newOutput => {
+                if (progressData?.state) {
+                  progressData.state.latestOutput = newOutput;
+                }
+              },
+              extra.signal
+            );
 
         // Stop progress updates
-        stopProgressUpdates(progressData, true);
+        if (progressData) stopProgressUpdates(progressData, true);
 
         if (typeof result === 'string') {
           return {
@@ -198,7 +215,7 @@ server.setRequestHandler(
         }
       } catch (error) {
         // Stop progress updates on error
-        stopProgressUpdates(progressData, false);
+        if (progressData) stopProgressUpdates(progressData, false);
 
         Logger.error(`Error in tool '${toolName}':`, error);
 
@@ -271,12 +288,23 @@ async function main() {
   Logger.debug('init codex-mcp-tool');
   await codexJobManager.initialize();
   const transport = new StdioServerTransport();
-  await server.connect(transport);
-  stopChannel = startChannelNotifier(codexJobManager, server, 'codex', Logger);
   server.onclose = () => {
     stopChannel();
-    void codexJobManager.dispose();
+    // The SDK aborts in-flight requests. Job processes and their queue keep running;
+    // their open pipes keep this server alive until their results have been saved.
   };
+  let disconnected = false;
+  const disconnect = () => {
+    if (disconnected) return;
+    disconnected = true;
+    void server.close().catch(error => Logger.error('Failed to close MCP transport:', error));
+  };
+  // The stdio transport does not close itself on EOF or a broken output pipe.
+  process.stdin.once('end', disconnect);
+  process.stdin.once('close', disconnect);
+  process.stdout.once('error', disconnect);
+  await server.connect(transport);
+  stopChannel = startChannelNotifier(codexJobManager, server, 'codex', Logger);
   Logger.debug('codex-mcp-tool listening on stdio');
 }
 

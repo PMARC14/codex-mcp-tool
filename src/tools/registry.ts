@@ -33,7 +33,8 @@ export interface UnifiedTool {
 
   execute: (
     args: ToolArguments,
-    onProgress?: (newOutput: string) => void
+    onProgress?: (newOutput: string) => void,
+    signal?: AbortSignal
   ) => Promise<ToolExecuteResult>;
   category?: 'simple' | 'utility' | 'codex';
 }
@@ -96,7 +97,8 @@ export function getPromptDefinitions(): Prompt[] {
 export async function executeTool(
   toolName: string,
   args: ToolArguments,
-  onProgress?: (newOutput: string) => void
+  onProgress?: (newOutput: string) => void,
+  signal?: AbortSignal
 ): Promise<ToolExecuteResult> {
   const tool = toolRegistry.find(t => t.name === toolName);
   if (!tool) {
@@ -104,7 +106,7 @@ export async function executeTool(
   }
   try {
     const validatedArgs = tool.zodSchema.parse(args);
-    return tool.execute(validatedArgs, onProgress);
+    return tool.execute(validatedArgs, onProgress, signal);
   } catch (error) {
     if (error instanceof ZodError) {
       const issues = error.issues

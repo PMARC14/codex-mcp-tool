@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type {
   Connector,
@@ -30,6 +30,7 @@ import {
 } from './proc.js';
 import { createWorktree, collectWorktree } from './worktree.js';
 import { WakeHold } from './wakehold.js';
+import { watchJob, type WatchOptions } from './watch.js';
 
 export interface StartOptions {
   prompt?: string;
@@ -75,6 +76,7 @@ export class JobManager {
   private disposed = false;
   private readonly kill: typeof killTree;
   private cleanupTried = new Map<string, number>();
+  private readonly watchShutdown = new AbortController();
 
   constructor(
     readonly connector: Connector,
@@ -168,8 +170,8 @@ export class JobManager {
       );
   }
 
-  private selectModel(requested?: string): string | undefined {
-    const settings = this.config.connectors[this.connector.id];
+  private selectModel(requested?: string, connector = this.connector.id): string | undefined {
+    const settings = this.config.connectors[connector];
     const model = requested ?? settings?.defaultModel ?? undefined;
     if (
       !requested &&
@@ -185,10 +187,13 @@ export class JobManager {
     return model;
   }
 
-  async start(options: StartOptions) {
+  async start(options: StartOptions, followUpOf?: string) {
     await this.initialize();
     if (this.disposed) throw new Error('Job manager is shutting down');
-    await this.available();
+    const connector = followUpOf ? this.store.get(followUpOf).connector : this.connector.id;
+    if (connector === this.connector.id) await this.available();
+    else if (this.config.connectors[connector]?.enabled === false)
+      throw new Error(`${connector} is disabled in agent-jobs config`);
     if ((options.prompt === undefined) === (options.promptFile === undefined))
       throw new Error('Provide exactly one of prompt or promptFile');
     const prompt = options.prompt ?? readFileSync(options.promptFile!, 'utf8');
@@ -196,12 +201,12 @@ export class JobManager {
     if (!Number.isFinite(timeoutMin) || timeoutMin <= 0)
       throw new Error('timeoutMin must be positive');
     const id = randomUUID();
-    const model = this.selectModel(options.model);
+    const model = followUpOf ? undefined : this.selectModel(options.model);
     const worktree = options.worktree
       ? await createWorktree(options.cwd, options.label, id, this.connector.id)
       : undefined;
     if (worktree?.warning) this.logger.warn(worktree.warning);
-    const meta: JobMeta = {
+    let meta: JobMeta = {
       id,
       connector: this.connector.id,
       cwd: worktree?.path ?? resolve(options.cwd),
@@ -212,6 +217,7 @@ export class JobManager {
       resumeSession: options.resumeSession,
       timeoutMin,
       worktree,
+      originalCwd: resolve(options.cwd),
       finalPath: this.store.path(id, 'final'),
       state: 'queued',
       owner: this.owner,
@@ -219,10 +225,78 @@ export class JobManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
-    this.store.create(meta, prompt);
+    const create = () => {
+      if (followUpOf) {
+        // Re-read under the queue lock: a paused source may have resumed during detect().
+        const original = this.store.get(followUpOf);
+        this.assertSendable(original);
+        const reusable =
+          original.worktree &&
+          !original.worktree.removed &&
+          this.isDirectory(original.worktree.path)
+            ? original.worktree
+            : undefined;
+        meta = {
+          ...meta,
+          connector: original.connector,
+          owner: original.connector === this.connector.id ? this.owner : undefined,
+          managerId: original.connector === this.connector.id ? this.id : undefined,
+          cwd: reusable?.path ?? original.originalCwd ?? original.worktree?.root ?? original.cwd,
+          originalCwd: original.originalCwd ?? original.worktree?.root ?? original.cwd,
+          worktree: reusable,
+          mode: options.mode ?? original.mode,
+          model: this.selectModel(options.model ?? original.model, original.connector),
+          effort: options.effort ?? original.effort,
+          timeoutMin: options.timeoutMin ?? original.timeoutMin,
+          resumeSession: original.sessionId,
+          followUpOf,
+        };
+        this.store.create(meta, prompt);
+        // A follow-up supersedes a paused job's automatic retry, like requeue does.
+        if (original.state === 'paused') {
+          original.pauseCleared = true;
+          this.store.write(original);
+        }
+      } else this.store.create(meta, prompt);
+    };
+    if (followUpOf) await withLock(this.config.home, create);
+    else create();
     // Promotion is asynchronous; returning queued also covers spawn-in-progress.
     void this.pump().catch(error => this.logger.warn('Job queue error', error));
     return { jobId: id, state: meta.state, warning: worktree?.warning };
+  }
+
+  private isDirectory(path: string): boolean {
+    try {
+      return statSync(path).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  private assertSendable(job: JobMeta): void {
+    if (job.state === 'queued' || job.state === 'running' || job.reserved)
+      throw new Error(
+        `Job is still running or queued; use ${job.connector}_job_watch and send once it stops, or ${job.connector}_job_cancel first (wait for process cleanup if reserved)`
+      );
+    if (!job.sessionId) throw new Error('Job has no sessionId; cannot send a follow-up');
+  }
+
+  async send(
+    jobId: string,
+    message: string,
+    overrides: Pick<StartOptions, 'mode' | 'model' | 'effort' | 'timeoutMin'> = {}
+  ) {
+    await this.initialize();
+    const original = this.store.get(jobId);
+    this.assertSendable(original);
+    if (!message.trim()) throw new Error('Follow-up message must not be empty');
+    const result = await this.start({ ...overrides, prompt: message, cwd: original.cwd }, jobId);
+    return { jobId: result.jobId, state: result.state, followUpOf: jobId };
+  }
+
+  watch(jobId: string, maxWaitSec = 1800, options: WatchOptions = {}) {
+    return watchJob(this, jobId, maxWaitSec, options, this.watchShutdown.signal);
   }
 
   private pump(): Promise<void> {
@@ -756,6 +830,7 @@ export class JobManager {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.watchShutdown.abort();
     clearInterval(this.timer);
     await this.pumping;
     await Promise.all(

@@ -5,7 +5,7 @@ import { registerJobTools, type JobTool } from './tools.js';
 import { JobManager } from './manager.js';
 import { fixture, fakeConnector } from './test-helpers.js';
 
-test('portable registration exposes all eight prefixed tools with bounded schemas and explicit full mode', async () => {
+test('portable registration exposes all ten prefixed tools with bounded schemas and explicit full mode', async () => {
   const f = fixture();
   const manager = new JobManager(fakeConnector(f.script), f.config);
   try {
@@ -17,6 +17,8 @@ test('portable registration exposes all eight prefixed tools with bounded schema
         'codex_job_start',
         'codex_job_status',
         'codex_job_result',
+        'codex_job_watch',
+        'codex_job_send',
         'codex_job_cancel',
         'codex_job_list',
         'codex_job_read',
@@ -30,7 +32,11 @@ test('portable registration exposes all eight prefixed tools with bounded schema
     assert.equal(start.zodSchema.parse({ prompt: 'p', cwd: f.home }).mode, 'read');
     assert.equal(start.zodSchema.parse({ prompt: 'p', cwd: f.home, mode: 'full' }).mode, 'full');
     assert.throws(() => tools[2].zodSchema.parse({ jobId: 'a', waitSec: 11 }));
-    assert.throws(() => tools[5].zodSchema.parse({ jobId: 'a', name: 'stdout', limit: 20001 }));
+    const watch = tools.find(tool => tool.name === 'codex_job_watch')!;
+    assert.equal(watch.zodSchema.parse({ jobId: 'a' }).maxWaitSec, 1800);
+    assert.throws(() => watch.zodSchema.parse({ jobId: 'a', maxWaitSec: 7201 }));
+    const read = tools.find(tool => tool.name === 'codex_job_read')!;
+    assert.throws(() => read.zodSchema.parse({ jobId: 'a', name: 'stdout', limit: 20001 }));
     await assert.rejects(() => start.execute({ cwd: f.home }), /exactly one/);
     await assert.rejects(
       () => start.execute({ cwd: f.home, prompt: 'a', promptFile: 'b' }),
