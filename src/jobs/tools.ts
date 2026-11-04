@@ -94,6 +94,8 @@ export function registerJobTools(
           .string()
           .optional()
           .describe('Native CLI session ID to resume, from an earlier result.'),
+        idempotencyKey: z.string().min(1).optional(),
+        priority: z.enum(['normal', 'optional']).default('normal'),
         stallTimeoutMin: z.number().min(0).default(10),
         onStall: z.enum(['report', 'kill']).default('report'),
         verify: z.string().min(1).optional().describe('Shell command to run after successful completion.'),

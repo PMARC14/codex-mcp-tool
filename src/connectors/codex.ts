@@ -7,6 +7,7 @@ import {
 import { MODELS } from '../constants.js';
 import { getCodexVersion, checkMinimumCodexVersion } from '../utils/versionDetection.js';
 import { runCommand } from '../jobs/proc.js';
+import { readCodexUsage, readLiveCodexUsage } from '../utils/codexUsage.js';
 import { usageLimit } from '../jobs/usage-reset.js';
 
 export { usageReset } from '../jobs/usage-reset.js';
@@ -30,6 +31,13 @@ export class CodexConnector implements Connector {
     private resolve = () => resolveBinary('codex', CODEX_PATH_ENV),
     private now = () => Date.now()
   ) {}
+
+  async usagePercent(): Promise<number | undefined> {
+    const local = readCodexUsage();
+    const usage = local.available ? local : await readLiveCodexUsage(this.resolve().command);
+    const values = [usage?.fiveHour?.usedPercent, usage?.weekly?.usedPercent].filter((value): value is number => typeof value === 'number');
+    return values.length ? Math.max(...values) : undefined;
+  }
 
   private async checkLogin(command: string): Promise<{ available: boolean; reason?: string }> {
     if (

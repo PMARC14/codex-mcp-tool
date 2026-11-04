@@ -415,20 +415,24 @@ test('a final answer after an intermediate error completes the job (agy read mod
   const f = fixture();
   const base = fakeConnector(f.script);
   // The fake worker writes opts.stderr first, then the final answer on stdout.
+  let sawError = false;
+  const gate = join(f.home, 'release-answer');
   const connector = {
     ...base,
     parse(line: string, stream: 'stdout' | 'stderr') {
-      if (stream === 'stderr' && line.includes('empty turn')) return { error: 'agy produced no response' };
+      if (stream === 'stderr' && line.includes('empty turn')) { sawError = true; return { error: 'agy produced no response' }; }
       return base.parse(line, stream);
     },
   };
   const manager = new JobManager(connector, f.config);
   try {
     const { jobId } = await manager.start({
-      prompt: JSON.stringify({ stderr: 'empty turn\n', final: 'the review', waitMs: 50 }),
+      prompt: JSON.stringify({ stderr: 'empty turn\n', final: 'the review', gate }),
       cwd: f.home,
     });
-    await until(async () => !['queued', 'running'].includes((await manager.result(jobId)).state), 'job end');
+    await until(() => sawError, 'intermediate error', 60000);
+    writeFileSync(gate, '');
+    await until(() => manager.store.get(jobId).state === 'completed', 'job end', 60000);
     const result = await manager.result(jobId);
     assert.equal(result.state, 'completed');
     assert.equal(result.final, 'the review');

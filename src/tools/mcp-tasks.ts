@@ -23,7 +23,7 @@ export const TASK_EXTENSION = 'io.modelcontextprotocol/tasks';
 export const MODERN_PROTOCOL = '2026-07-28';
 const VERSION_META = 'io.modelcontextprotocol/protocolVersion';
 const CLIENT_META = 'io.modelcontextprotocol/clientCapabilities';
-const POLL_MS = 5000;
+const POLL_MS = 15000;
 export const taskCapabilities = { list: {}, cancel: {}, requests: { tools: { call: {} } } };
 const modern = (params: any) => params?._meta?.[VERSION_META] === MODERN_PROTOCOL;
 const supportsTask = (prefix: string, name: string) =>
@@ -208,7 +208,7 @@ export function registerMcpTasks(
       off = manager.onTransition(job => {
         if (job.id === id) check();
       });
-      timer = setInterval(check, POLL_MS);
+      timer = setInterval(check, 5000);
       extra.signal.addEventListener('abort', abort, { once: true });
       check();
     });

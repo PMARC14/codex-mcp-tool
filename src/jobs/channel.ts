@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { JobMeta, JobState, JobLogger } from './connector.js';
 
@@ -69,6 +69,8 @@ export function channelEvent(job: JobMeta, prefix: string) {
   if (label) meta.label = label;
   const reason = safe(job.reason, 40);
   if (reason) meta.reason = reason;
+  if (job.failureReason) meta.failureReason = job.failureReason;
+  if (job.partial) meta.partial = 'true';
   if (job.verify) meta.verify = job.verify.passed ? 'passed' : 'failed';
   if (job.supersededBy) meta.superseded_by = job.supersededBy;
   let content = `${prefix} job ${job.state}: call ${prefix}_job_result with this job_id`;
@@ -97,11 +99,13 @@ export function startChannelNotifier(
   const sent = new Set<string>();
   let stopped = false;
   const unsubscribe = manager.onTransition((job, previous) => {
+    if (job.state === 'queued' || job.state === 'running') { for (const key of sent) if (key.startsWith(`${job.id}:`)) sent.delete(key); }
     if (stopped || !NOTIFY_STATES.includes(job.state) || previous === job.state) return;
     if (!manager.isOwn(job)) return;
     const key = `${job.id}:${job.state}`;
     if (sent.has(key)) return;
     if (manager.store) {
+      if (existsSync(join(manager.store.dir(job.id), 'mcp-task.json'))) return;
       try { writeFileSync(join(manager.store.dir(job.id), 'woken'), '', { flag: 'wx' }); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') logger?.warn('Unable to create channel marker', error);

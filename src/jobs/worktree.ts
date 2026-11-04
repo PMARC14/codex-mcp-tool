@@ -14,7 +14,7 @@ async function gitGroup(cwd: string, home: string) {
     new Promise((resolveResult, reject) => {
       const child = safeSpawn('git', args, { cwd: dir, env: { ...process.env, GIT_LFS_SKIP_SMUDGE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
       const out: Buffer[] = [], err: Buffer[] = [];
-      const timer = setTimeout(() => { child.kill(); reject(new Error('git timed out')); }, 30000);
+      const timer = setTimeout(() => { child.kill(); reject(new Error('git timed out')); }, 600000);
       child.stdout?.on('data', (data: Buffer) => out.push(data));
       child.stderr?.on('data', (data: Buffer) => err.push(data));
       child.on('error', error => { clearTimeout(timer); reject(error); });
@@ -73,9 +73,16 @@ export async function createWorktree(
     path = join(commonDir, 'agent-jobs-worktrees', name);
     mkdirSync(dirname(path), { recursive: true });
   }
+  const branchExisted = !!(await group.text(root, 'rev-parse', '--verify', `refs/heads/${branch}`).catch(() => undefined));
+  const cleanup = async (target: string) => {
+    await group.text(root, 'worktree', 'remove', '--force', target).catch(() => undefined);
+    if (!branchExisted) await group.text(root, 'branch', '-D', branch).catch(() => undefined);
+    await group.text(root, 'worktree', 'prune').catch(() => undefined);
+  };
   try {
     await group.text(root, 'worktree', 'add', path, '-b', branch, baseSha);
   } catch (error) {
+    await cleanup(path);
     // Only filesystem/access failures should use the alternate location.
     if (
       !/permission|access.*denied|(?:cannot|could not|unable to).*(?:creat|mkdir)|read-only/i.test(
@@ -87,9 +94,11 @@ export async function createWorktree(
     mkdirSync(dirname(path), { recursive: true });
     const existing = await group.text(root, 'rev-parse', '--verify', `refs/heads/${branch}`).catch(() => undefined);
     if (existing && existing !== baseSha) throw error;
-    await group.text(root, ...(existing
-        ? ['worktree', 'add', path, branch]
-        : ['worktree', 'add', path, '-b', branch, baseSha]));
+    try {
+      await group.text(root, ...(existing
+          ? ['worktree', 'add', path, branch]
+          : ['worktree', 'add', path, '-b', branch, baseSha]));
+    } catch (fallbackError) { await cleanup(path); throw fallbackError; }
   }
   const gitDir = await group.text(path, 'rev-parse', '--absolute-git-dir');
   return {

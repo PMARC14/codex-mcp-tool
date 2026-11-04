@@ -29,13 +29,15 @@ process.stdin.on('end', () => {
       return;
     }
   }
-  setTimeout(() => {
+  const finish = () => {
+    if (opts.gate && !fs.existsSync(opts.gate)) { setTimeout(finish, 20); return; }
     const text = opts.final || 'pong';
     if (opts.file) fs.writeFileSync(process.argv[2], text);
     else console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text}}));
     if (opts.log) fs.appendFileSync(opts.log, 'end\\n');
     process.exitCode = opts.code || 0;
-  }, opts.waitMs || 10);
+  };
+  setTimeout(finish, opts.waitMs || 10);
 });
 `
   );

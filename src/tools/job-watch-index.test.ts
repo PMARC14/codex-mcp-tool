@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import spawn from 'cross-spawn';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
@@ -103,12 +103,13 @@ async function setup() {
     child,
     exited,
     cleanup,
+    gate: join(f.home, 'release-worker'),
     listeners: () => Number(readFileSync(listenersPath, 'utf8')),
-    async startJob(waitMs = 1200) {
+    async startJob(waitMs = 1200, gate?: string) {
       const response = await client.callTool({
         name: 'codex_job_start',
         arguments: {
-          prompt: JSON.stringify({ waitMs, final: 'survived' }),
+          prompt: JSON.stringify({ waitMs, gate, final: 'survived' }),
           cwd: f.home,
         },
       });
@@ -124,7 +125,7 @@ async function setup() {
 test('index dispatch sends watch state changes immediately and keeps other tools generic keepalives', async () => {
   const s = await setup();
   try {
-    const jobId = await s.startJob();
+    const jobId = await s.startJob(10, s.gate);
     const progress: { progress: number; message?: string }[] = [];
     const pending = s.client.callTool(
       { name: 'codex_job_watch', arguments: { jobId } },
@@ -135,6 +136,7 @@ test('index dispatch sends watch state changes immediately and keeps other tools
     );
     await until(() => progress.length > 0);
     assert.equal(s.store.get(jobId).state, 'running', 'progress arrives before the job stops');
+    writeFileSync(s.gate, '');
     const response = await pending;
     assert.equal(response.isError, false);
     assert.match(progress.at(-1)!.message!, /^codex [^|]+ \| completed \| /);

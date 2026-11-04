@@ -14,7 +14,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { JobMeta, JobState, Owner } from './connector.js';
+import type { FailureReason, JobMeta, JobState, Owner } from './connector.js';
 
 export type TransitionListener = (job: JobMeta, previous: JobState | undefined) => void;
 
@@ -65,6 +65,17 @@ export function atomicWrite(path: string, data: string | Buffer): void {
     rmSync(temp, { force: true });
   }
 }
+
+export function failureReason(job: JobMeta): FailureReason | undefined {
+  if (job.state === 'queued' || job.state === 'running') return undefined;
+  if (job.verify && !job.verify.passed && job.state === 'completed') return 'verify_failed';
+  if (job.state === 'completed') return undefined;
+  if (/sign.?in|log.?in|auth|unauthori[sz]ed|credentials|api.?key/i.test(job.error ?? '')) return 'auth';
+  const reasons: Record<string, FailureReason> = { usage_limit: 'quota_exhausted', timeout: 'timeout', cancelled: 'cancelled', stalled: 'stalled', 'kill-failed': 'kill_failed', owner_gone: 'lost', superseded: 'superseded' };
+  return reasons[job.reason ?? ''] ?? (job.state === 'lost' ? 'lost' : 'cli_error');
+}
+
+function fstatSize(path: string): number { const fd = openSync(path, 'r'); try { return fstatSync(fd).size; } finally { closeSync(fd); } }
 
 export class JobStore {
   private readonly listeners = new Set<TransitionListener>();
@@ -118,12 +129,22 @@ export class JobStore {
   // Recovery and claiming unowned records must be performed under the machine lock.
   write(meta: JobMeta): void {
     let previous: JobState | undefined;
-    if (this.listeners.size) {
+    {
       try {
         previous = this.get(meta.id).state;
       } catch {
         /* No readable previous record. */
       }
+    }
+    if ((meta.state === 'queued' || meta.state === 'running') && previous !== meta.state) {
+      for (const marker of ['woken', 'collected']) rmSync(join(this.dir(meta.id), marker), { force: true });
+    }
+    meta.failureReason = failureReason(meta);
+    if (meta.state === 'queued' || meta.state === 'running') meta.partial = undefined;
+    else {
+      const final = readFileSync(this.path(meta.id, 'final'), 'utf8').trim();
+      const output = ['stdout', 'stderr'].some(name => { try { return fstatSize(this.path(meta.id, name as 'stdout' | 'stderr')) > 0; } catch { return false; } });
+      meta.partial = ((!final && output) || meta.reason === 'timeout' || (meta.state === 'killed' && !!meta.startedAt && meta.reason !== 'superseded')) ? true : undefined;
     }
     meta.updatedAt = Date.now();
     atomicWrite(join(this.dir(meta.id), 'meta.json'), JSON.stringify(meta));

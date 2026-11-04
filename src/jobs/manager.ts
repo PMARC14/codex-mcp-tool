@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync, statSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, join, resolve, win32 } from 'node:path';
+import { existsSync } from 'node:fs';
 import type {
   Connector,
   JobEvent,
@@ -27,6 +28,7 @@ import {
   startProcess,
   type ProcessOutcome,
   type RunningProcess,
+  runCommand,
 } from './proc.js';
 import { createWorktree, collectWorktree } from './worktree.js';
 import { WakeHold } from './wakehold.js';
@@ -47,9 +49,30 @@ export interface StartOptions {
   onStall?: 'report' | 'kill';
   verify?: string;
   verifyTimeoutMin?: number;
+  idempotencyKey?: string;
+  priority?: 'normal' | 'optional';
 }
 
 const sleep = (ms: number) => new Promise(resolveResult => setTimeout(resolveResult, ms));
+let gitBash: Promise<string | undefined> | undefined;
+async function verifyShell(): Promise<string> {
+  if (process.platform !== 'win32') return 'bash';
+  const override = process.env.AGENT_JOBS_BASH || process.env.CLAUDE_CODE_GIT_BASH_PATH;
+  if (override) {
+    if (!win32.isAbsolute(override)) throw new Error('Git Bash override must be an absolute path');
+    if (/(?:^|[\\/])system32[\\/]bash(?:\.exe)?$/i.test(override)) throw new Error('System32 bash is not supported');
+    return override;
+  }
+  gitBash ??= runCommand('git', ['--exec-path'], undefined, 10000).then(path => {
+    const candidate = join(dirname(dirname(dirname(path.trim()))), 'bin', 'bash.exe');
+    return existsSync(candidate) ? candidate : undefined;
+  }).catch(() => undefined);
+  const found = await gitBash;
+  if (found) return found;
+  const fallback = join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe');
+  if (existsSync(fallback)) return fallback;
+  throw new Error('Git Bash not found; set AGENT_JOBS_BASH');
+}
 const quiet: JobLogger = { warn() {} };
 const DETECT_TTL_MS = 60_000;
 /** How often the pump checks whether other servers' job owners are still alive. */
@@ -75,20 +98,23 @@ export class JobManager {
   private initialized?: Promise<void>;
   private timer?: NodeJS.Timeout;
   private pumping?: Promise<void>;
-  private active = new Map<string, { process: RunningProcess; finished: Promise<void>; sample?: () => void }>();
+  private active = new Map<string, { process: RunningProcess; finished: Promise<void>; sample?: () => void; cancelled: boolean }>();
   private hold: WakeHold;
   private disposed = false;
   private readonly kill: typeof killTree;
+  private readonly resolveVerifyShell: typeof verifyShell;
   private cleanupTried = new Map<string, number>();
+  private usageCache?: { at: number; value: number | undefined };
   private readonly watchShutdown = new AbortController();
 
   constructor(
     readonly connector: Connector,
     config = readConfig(),
     private logger = quiet,
-    deps: { killTree?: typeof killTree } = {}
+    deps: { killTree?: typeof killTree; verifyShell?: typeof verifyShell } = {}
   ) {
     this.kill = deps.killTree ?? killTree;
+    this.resolveVerifyShell = deps.verifyShell ?? verifyShell;
     this.config = config;
     this.store = new JobStore(config.home);
     this.hold = new WakeHold(config.home, logger);
@@ -195,6 +221,11 @@ export class JobManager {
     await this.initialize();
     if (this.disposed) throw new Error('Job manager is shutting down');
     const connector = followUpOf ? this.store.get(followUpOf).connector : this.connector.id;
+    if (options.idempotencyKey && !followUpOf) {
+      const existing = await withLock(this.config.home, () => this.store.list().find(job =>
+        job.connector === connector && job.idempotencyKey === options.idempotencyKey && Date.now() - job.createdAt < 86400000));
+      if (existing) return { jobId: existing.id, state: existing.state, warning: undefined };
+    }
     if (connector === this.connector.id) await this.available();
     else if (this.config.connectors[connector]?.enabled === false)
       throw new Error(`${connector} is disabled in agent-jobs config`);
@@ -209,77 +240,93 @@ export class JobManager {
     if (options.verifyTimeoutMin !== undefined && (!Number.isFinite(options.verifyTimeoutMin) || options.verifyTimeoutMin <= 0))
       throw new Error('verifyTimeoutMin must be positive');
     if (!Number.isFinite(options.stallTimeoutMin ?? 10) || (options.stallTimeoutMin ?? 10) < 0) throw new Error('stallTimeoutMin must be non-negative');
-    const id = randomUUID();
-    const model = followUpOf ? undefined : this.selectModel(options.model);
-    const worktree = options.worktree
-      ? await createWorktree(options.cwd, options.label, id, this.connector.id, this.config.home)
-      : undefined;
-    if (worktree?.warning) this.logger.warn(worktree.warning);
-    let meta: JobMeta = {
-      id,
-      connector: this.connector.id,
-      cwd: worktree?.path ?? resolve(options.cwd),
-      mode: options.mode ?? 'read',
-      model,
-      effort: options.effort,
-      label: options.label,
-      resumeSession: options.resumeSession,
-      timeoutMin,
-      stallTimeoutMin: options.stallTimeoutMin ?? 10,
-      onStall: options.onStall ?? 'report',
-      verifyCommand: options.verify,
-      verifyTimeoutMin: options.verifyTimeoutMin ?? 10,
-      worktree,
-      originalCwd: resolve(options.cwd),
-      finalPath: this.store.path(id, 'final'),
-      state: 'queued',
-      owner: this.owner,
-      managerId: this.id,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-    const create = () => {
-      if (followUpOf) {
-        // Re-read under the queue lock: a paused source may have resumed during detect().
-        const original = this.store.get(followUpOf);
-        this.assertSendable(original);
-        const reusable =
-          original.worktree &&
-          !original.worktree.removed &&
-          this.isDirectory(original.worktree.path)
-            ? original.worktree
-            : undefined;
-        if ((options.mode ?? original.mode) === 'read' && original.verifyCommand)
-          throw new Error('verify requires a non-read mode');
-        meta = {
-          ...meta,
-          connector: original.connector,
-          owner: original.connector === this.connector.id ? this.owner : undefined,
-          managerId: original.connector === this.connector.id ? this.id : undefined,
-          cwd: reusable?.path ?? original.originalCwd ?? original.worktree?.root ?? original.cwd,
-          originalCwd: original.originalCwd ?? original.worktree?.root ?? original.cwd,
-          worktree: reusable,
-          mode: options.mode ?? original.mode,
-          model: this.selectModel(options.model ?? original.model, original.connector),
-          effort: options.effort ?? original.effort,
-          timeoutMin: options.timeoutMin ?? original.timeoutMin,
-          stallTimeoutMin: options.stallTimeoutMin ?? original.stallTimeoutMin ?? 10,
-          onStall: options.onStall ?? original.onStall ?? 'report',
-          verifyCommand: original.verifyCommand,
-          verifyTimeoutMin: original.verifyTimeoutMin,
-          resumeSession: original.sessionId,
-          followUpOf,
-        };
-        this.store.create(meta, prompt);
-        // A follow-up supersedes a paused job's automatic retry, like requeue does.
-        if (original.state === 'paused') this.supersede(original, id);
-      } else this.store.create(meta, prompt);
-    };
-    if (followUpOf) await withLock(this.config.home, create);
-    else create();
-    // Promotion is asynchronous; returning queued also covers spawn-in-progress.
-    void this.pump().catch(error => this.logger.warn('Job queue error', error));
-    return { jobId: id, state: meta.state, warning: worktree?.warning };
+    return withLock(this.config.home, async () => {
+      if (options.idempotencyKey && !followUpOf) {
+        const existing = this.store.list().find(job => job.connector === connector && job.idempotencyKey === options.idempotencyKey && Date.now() - job.createdAt < 86400000);
+        if (existing) return { jobId: existing.id, state: existing.state, warning: undefined };
+      }
+      if (options.priority === 'optional' && connector === this.connector.id) {
+        if (!this.usageCache || Date.now() - this.usageCache.at >= 300000) {
+          let value: number | undefined;
+          try { value = await this.connector.usagePercent?.(); } catch { /* fail open */ }
+          this.usageCache = { at: Date.now(), value };
+        }
+        if (this.usageCache.value !== undefined && this.usageCache.value >= (this.config.usageCeiling ?? 90))
+          throw new Error(`Optional job refused: 5-hour or weekly usage window is at ${this.usageCache.value}% (ceiling ${this.config.usageCeiling ?? 90}%)`);
+      }
+      const id = randomUUID();
+      const model = followUpOf ? undefined : this.selectModel(options.model);
+      const worktree = options.worktree
+        ? await createWorktree(options.cwd, options.label, id, this.connector.id, this.config.home)
+        : undefined;
+      if (worktree?.warning) this.logger.warn(worktree.warning);
+      let meta: JobMeta = {
+        id,
+        connector: this.connector.id,
+        cwd: worktree?.path ?? resolve(options.cwd),
+        mode: options.mode ?? 'read',
+        model,
+        effort: options.effort,
+        label: options.label,
+        resumeSession: options.resumeSession,
+        timeoutMin,
+        stallTimeoutMin: options.stallTimeoutMin ?? 10,
+        onStall: options.onStall ?? 'report',
+        idempotencyKey: options.idempotencyKey,
+        priority: options.priority ?? 'normal',
+        verifyCommand: options.verify,
+        verifyTimeoutMin: options.verifyTimeoutMin ?? 10,
+        worktree,
+        originalCwd: resolve(options.cwd),
+        finalPath: this.store.path(id, 'final'),
+        state: 'queued',
+        owner: this.owner,
+        managerId: this.id,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      const create = () => {
+        if (followUpOf) {
+          // Re-read under the queue lock: a paused source may have resumed during detect().
+          const original = this.store.get(followUpOf);
+          this.assertSendable(original);
+          const reusable =
+            original.worktree &&
+            !original.worktree.removed &&
+            this.isDirectory(original.worktree.path)
+              ? original.worktree
+              : undefined;
+          if ((options.mode ?? original.mode) === 'read' && original.verifyCommand)
+            throw new Error('verify requires a non-read mode');
+          meta = {
+            ...meta,
+            connector: original.connector,
+            owner: original.connector === this.connector.id ? this.owner : undefined,
+            managerId: original.connector === this.connector.id ? this.id : undefined,
+            cwd: reusable?.path ?? original.originalCwd ?? original.worktree?.root ?? original.cwd,
+            originalCwd: original.originalCwd ?? original.worktree?.root ?? original.cwd,
+            worktree: reusable,
+            mode: options.mode ?? original.mode,
+            model: this.selectModel(options.model ?? original.model, original.connector),
+            effort: options.effort ?? original.effort,
+            timeoutMin: options.timeoutMin ?? original.timeoutMin,
+            stallTimeoutMin: options.stallTimeoutMin ?? original.stallTimeoutMin ?? 10,
+            onStall: options.onStall ?? original.onStall ?? 'report',
+            verifyCommand: original.verifyCommand,
+            verifyTimeoutMin: original.verifyTimeoutMin,
+            resumeSession: original.sessionId,
+            followUpOf,
+          };
+          this.store.create(meta, prompt);
+          // A follow-up supersedes a paused job's automatic retry, like requeue does.
+          if (original.state === 'paused') this.supersede(original, id);
+        } else this.store.create(meta, prompt);
+      };
+      create();
+      // Promotion is asynchronous; returning queued also covers spawn-in-progress.
+      void this.pump().catch(error => this.logger.warn('Job queue error', error));
+      return { jobId: id, state: meta.state, warning: worktree?.warning };
+    });
   }
 
   private isDirectory(path: string): boolean {
@@ -574,10 +621,16 @@ export class JobManager {
           if (event.final && !(await this.store.page(job.id, 'final', 0, 20000)).text.trim())
             atomicWrite(job.finalPath, event.final);
           if (outcome.kind === 'exit' && outcome.code === 0 && !event.error && !event.usageLimit && job.verifyCommand) {
+            let shell: string;
+            try { shell = await this.resolveVerifyShell(); } catch (error) {
+              if (this.active.get(job.id)?.cancelled) { await this.settle(job, { kind: 'cancel', code: null }, event); return; }
+              throw error;
+            }
+            if (this.active.get(job.id)?.cancelled) { await this.settle(job, { kind: 'cancel', code: null }, event); return; }
             const started = Date.now();
             let output = '';
             const verifyProcess = startProcess({
-              exe: 'bash', args: ['-c', job.verifyCommand], cwd: job.cwd,
+              exe: shell, args: ['-c', job.verifyCommand], cwd: job.cwd,
               stdout: this.store.path(job.id, 'verify'), stderr: this.store.path(job.id, 'verify'),
               onSpawn: async identity => { job.process = identity; job.descendants = []; this.store.save(job, this.owner); },
               onSnapshot: identities => { job.descendants = identities; this.store.save(job, this.owner); },
@@ -620,7 +673,7 @@ export class JobManager {
           if (!this.active.size) this.hold.stop();
           void this.pump().catch(error => this.logger.warn('Job queue error', error));
         });
-      this.active.set(job.id, { process, finished, sample: () => {
+      this.active.set(job.id, { process, finished, cancelled: false, sample: () => {
         if (workerDone || job.state !== 'running' || !(job.stallTimeoutMin ?? 10) || stalledKill) return;
         const current = [statSync(this.store.path(job.id, 'stdout')).size, statSync(this.store.path(job.id, 'stderr')).size];
         const now = Date.now();
@@ -764,6 +817,8 @@ export class JobManager {
       state: job.state,
       verify: job.verify,
       reason: job.reason,
+      failureReason: job.failureReason,
+      partial: job.partial,
       supersededBy: job.supersededBy,
       error: job.error?.slice(0, 20000),
       sessionId: job.sessionId,
@@ -795,13 +850,13 @@ export class JobManager {
 
   async cancel(jobId: string) {
     await this.initialize();
-    let active: { process: RunningProcess; finished: Promise<void> } | undefined;
+    let active: { process: RunningProcess; finished: Promise<void>; cancelled: boolean } | undefined;
     let retry: JobMeta | undefined;
     await withLock(this.config.home, () => {
       const job = this.store.get(jobId);
       if (!this.owns(job)) throw new Error('Only the owning server can cancel this job');
       if (job.reason === 'kill-failed' && job.reserved) retry = job;
-      else active = this.active.get(jobId);
+      else { active = this.active.get(jobId); if (active) active.cancelled = true; }
       if (!active && !retry && !terminal(job)) {
         this.store.save(
           { ...job, state: 'killed', reserved: false, reason: 'cancelled', finishedAt: Date.now() },
@@ -850,7 +905,7 @@ export class JobManager {
     if (agent === this.connector.id) await this.available();
     const result = await withLock(this.config.home, () => {
       const original = this.store.get(jobId);
-      if (!['paused', 'lost', 'failed'].includes(original.state) && !(original.state === 'killed' && original.reason === 'stalled'))
+      if (!['paused', 'lost', 'failed'].includes(original.state) && !(original.state === 'killed' && original.reason === 'stalled') && !(original.state === 'completed' && original.verify?.passed === false))
         throw new Error('Only paused, lost, failed or stalled jobs can be requeued');
       if (original.reserved)
         throw new Error(
@@ -875,6 +930,9 @@ export class JobManager {
         reserved: false,
         sessionId: undefined,
         reason: undefined,
+        failureReason: undefined,
+        partial: undefined,
+        idempotencyKey: undefined,
         error: undefined,
         resetAt: undefined,
         pauseModel: undefined,
@@ -902,7 +960,7 @@ export class JobManager {
 
   // The whole collect runs under the shared lock. That is the reservation: promotion, requeue and
   // other collects cannot start a job in this worktree while it is saved and possibly removed.
-  // Trade-off: the git calls (30s timeout each) stall both forks' queues while they run.
+  // Trade-off: the git calls (10 minute timeout each) stall both forks' queues while they run.
   async collect(jobId: string, remove: 'none' | 'worktree' | 'worktree+branch' = 'none') {
     await this.initialize();
     return withLock(this.config.home, async () => {

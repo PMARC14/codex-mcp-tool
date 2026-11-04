@@ -164,7 +164,7 @@ test('legacy task start returns immediately, polls metadata, notifies, and retur
     assert.deepEqual(Object.keys(created), ['task']);
     const { taskId } = created.task;
     assert.equal(created.task.status, 'working');
-    assert.equal(created.task.pollInterval, 5000);
+    assert.equal(created.task.pollInterval, 15000);
     assert.equal(created.task.ttl, null);
     assert.ok(Date.parse(created.task.createdAt));
     assert.equal((await s.rpc('tasks/get', { taskId })).status, 'working');
@@ -336,7 +336,7 @@ test('modern discovery, extension opt-in, task get, and complete envelopes match
     const created = await s.start(); // Modern augmentation is requested by the envelope extension.
     assert.equal(created.resultType, 'task');
     assert.equal(created.status, 'working');
-    assert.equal(created.pollIntervalMs, 5000);
+    assert.equal(created.pollIntervalMs, 15000);
     assert.equal(created.task, undefined);
     const { taskId } = created;
     assert.equal((await s.rpc('tasks/get', { taskId })).resultType, 'task');

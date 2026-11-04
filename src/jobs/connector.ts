@@ -42,6 +42,8 @@ export interface JobSpec {
   worktree?: Worktree;
 }
 
+export type FailureReason = 'quota_exhausted' | 'timeout' | 'cancelled' | 'stalled' | 'auth' | 'cli_error' | 'kill_failed' | 'lost' | 'superseded' | 'verify_failed';
+
 export interface JobMeta extends Omit<JobSpec, 'prompt'> {
   verify?: { command: string; exitCode: number | null; passed: boolean; durationSec: number; timedOut: boolean };
   state: JobState;
@@ -58,6 +60,10 @@ export interface JobMeta extends Omit<JobSpec, 'prompt'> {
   descendants?: Owner[];
   sessionId?: string;
   reason?: string;
+  failureReason?: FailureReason;
+  partial?: boolean;
+  idempotencyKey?: string;
+  priority?: 'normal' | 'optional';
   error?: string;
   resetAt?: number;
   pauseModel?: string;
@@ -83,6 +89,7 @@ export interface Connector {
   id: string;
   detect(): Promise<{ available: boolean; reason?: string; version?: string; exe?: string }>;
   models(): Promise<string[]>;
+  usagePercent?(): Promise<number | undefined>;
   build(job: JobSpec): { exe: string; args: string[]; stdin: string; stdinPlan?: StdinPlan };
   parse(line: string, stream: 'stdout' | 'stderr'): JobEvent | null;
   sandboxDirs(job: JobSpec): string[];

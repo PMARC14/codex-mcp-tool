@@ -6,6 +6,7 @@ export interface JobsConfig {
   home: string;
   maxJobs: number;
   wakeHold: boolean;
+  usageCeiling?: number;
   connectors: Record<
     string,
     {
@@ -28,5 +29,5 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): JobsConfig {
   const maxJobs = Number(env.AGENT_JOBS_MAX ?? config.maxJobs ?? 8);
   if (!Number.isInteger(maxJobs) || maxJobs < 1)
     throw new Error('AGENT_JOBS_MAX / maxJobs must be a positive integer');
-  return { home, maxJobs, wakeHold: config.wakeHold ?? true, connectors: config.connectors ?? {} };
+  return { home, maxJobs, usageCeiling: config.usageCeiling ?? 90, wakeHold: config.wakeHold ?? true, connectors: config.connectors ?? {} };
 }
