@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readCodexUsage } from './codexUsage.js';
+import { fromAppServer, readCodexUsage } from './codexUsage.js';
 
 const NOW = Date.parse('2026-10-31T18:00:00Z');
 const snapshot = (timestamp: string, primary: number, secondary: number) =>
@@ -73,4 +73,29 @@ test('reports unavailable when no snapshot or no sessions directory exists', () 
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// A real `account/rateLimits/read` reply from `codex app-server` (0.166.0), trimmed.
+const LIVE = {
+  ordinaryUsageAllowed: true,
+  rateLimits: { limitId: 'codex', primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1793776003 }, secondary: { usedPercent: 70, windowDurationMins: 10080, resetsAt: 1793886362 }, planType: 'plus', rateLimitReachedType: null },
+  rateLimitsByLimitId: { codex: { limitId: 'codex', primary: { usedPercent: 2, windowDurationMins: 300, resetsAt: 1793776003 }, secondary: { usedPercent: 70, windowDurationMins: 10080, resetsAt: 1793886362 }, planType: 'plus', rateLimitReachedType: null } },
+  rateLimitResetCredits: { availableCount: 2, credits: [{ status: 'available' }, { status: 'available' }] },
+};
+
+test('live app-server rate limits map to the usage shape, preferring the codex bucket', () => {
+  const usage = fromAppServer(LIVE, Date.parse('2026-11-03T22:10:00Z'));
+  assert.ok(usage);
+  assert.equal(usage.available, true);
+  assert.equal(usage.source, 'live');
+  assert.equal(usage.plan, 'plus');
+  assert.equal(usage.fiveHour?.usedPercent, 2);
+  assert.equal(usage.weekly?.usedPercent, 70);
+  assert.equal(usage.weekly?.windowMinutes, 10080);
+  assert.equal(usage.resetCreditsAvailable, 2);
+  assert.match(usage.meter ?? '', /^codex 5h 2% · wk 70%/);
+});
+
+test('a live reply with no windows is treated as unavailable', () => {
+  assert.equal(fromAppServer({ rateLimits: { limitId: 'premium', primary: null, secondary: null } }, Date.now()), undefined);
 });

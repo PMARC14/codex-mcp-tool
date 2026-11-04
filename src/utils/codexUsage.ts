@@ -1,6 +1,7 @@
 import { closeSync, fstatSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import spawn from 'cross-spawn';
 
 export interface UsageWindow {
   usedPercent: number;
@@ -20,6 +21,10 @@ export interface CodexUsage {
   snapshotAt?: string;
   snapshotAgeSec?: number;
   meter?: string;
+  /** live: asked codex app-server just now; session-log: last snapshot a Codex session wrote. */
+  source?: 'live' | 'session-log';
+  /** Free full-reset credits on the account (never spent automatically). */
+  resetCreditsAvailable?: number;
 }
 
 const TAIL_BYTES = 4 * 1024 * 1024;
@@ -103,6 +108,98 @@ const bar = (percent: number) => {
   return '#'.repeat(filled) + '.'.repeat(20 - filled);
 };
 
+function usageFromLimits(limits: Record<string, any>, at: number, nowMs: number): CodexUsage {
+  const fiveHour = windowOf(limits.primary, nowMs);
+  const weekly = windowOf(limits.secondary, nowMs);
+  const line = (label: string, w: UsageWindow) =>
+    `${label.padEnd(7)} [${bar(w.usedPercent)}] ${String(w.usedPercent).padStart(5)}%  resets ${w.resetIn === 'reset' ? '(window has reset since)' : `${w.resetAtIso} (${w.resetIn})`}`;
+  return {
+    available: true,
+    plan: limits.plan_type ?? undefined,
+    fiveHour,
+    weekly,
+    rateLimitReached: limits.rate_limit_reached_type ?? null,
+    snapshotAt: new Date(at).toISOString(),
+    snapshotAgeSec: Math.max(0, Math.round((nowMs - at) / 1000)),
+    meter: `codex 5h ${fiveHour.usedPercent}% · wk ${weekly.usedPercent}%
+${line('5-hour', fiveHour)}
+${line('weekly', weekly)}`,
+  };
+}
+
+/** Maps a live `account/rateLimits/read` reply (camelCase) onto the usage shape; undefined if it has no windows. */
+export function fromAppServer(result: any, nowMs = Date.now()): CodexUsage | undefined {
+  const rl = result?.rateLimitsByLimitId?.codex ?? result?.rateLimits;
+  if (!rl?.primary || !rl?.secondary) return undefined;
+  const win = (w: any) => ({ used_percent: w.usedPercent, window_minutes: w.windowDurationMins, resets_at: w.resetsAt });
+  const usage = usageFromLimits(
+    { plan_type: rl.planType, primary: win(rl.primary), secondary: win(rl.secondary), rate_limit_reached_type: rl.rateLimitReachedType },
+    nowMs,
+    nowMs
+  );
+  const credits = result?.rateLimitResetCredits?.credits;
+  return {
+    ...usage,
+    source: 'live',
+    resetCreditsAvailable: Array.isArray(credits) ? credits.filter((c: any) => c?.status === 'available').length : undefined,
+  };
+}
+
+/**
+ * Asks a short-lived `codex app-server` for `account/rateLimits/read`: live, no
+ * model turn, no quota spent. Hidden window; resolves undefined on any failure.
+ */
+export function readLiveCodexUsage(exe = 'codex', timeoutMs = 20000): Promise<CodexUsage | undefined> {
+  return new Promise(resolveUsage => {
+    let done = false;
+    let child: ReturnType<typeof spawn> | undefined;
+    const finish = (usage?: CodexUsage) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        child?.kill();
+      } catch {
+        /* already gone */
+      }
+      resolveUsage(usage);
+    };
+    const timer = setTimeout(() => finish(), timeoutMs);
+    try {
+      child = spawn(exe, ['app-server'], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+    } catch {
+      return finish();
+    }
+    child.on('error', () => finish());
+    child.stdin?.on('error', () => undefined);
+    let buffer = '';
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        let msg: any;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.id === 1) {
+          child?.stdin?.write(JSON.stringify({ method: 'initialized' }) + '\n');
+          child?.stdin?.write(JSON.stringify({ method: 'account/rateLimits/read', id: 2 }) + '\n');
+        } else if (msg.id === 2) {
+          finish(msg.result ? fromAppServer(msg.result) : undefined);
+        }
+      }
+    });
+    child.stdin?.write(
+      JSON.stringify({ method: 'initialize', id: 1, params: { clientInfo: { name: 'codex-mcp-tool', title: 'codex-mcp-tool', version: '1' } } }) + '\n'
+    );
+  });
+}
+
 /** Reads the newest rate_limits snapshot from Codex session logs. Local files only. */
 export function readCodexUsage(
   env: NodeJS.ProcessEnv = process.env,
@@ -118,22 +215,7 @@ export function readCodexUsage(
       continue;
     }
     if (!snapshot) continue;
-    const { limits } = snapshot;
-    const fiveHour = windowOf(limits.primary, nowMs);
-    const weekly = windowOf(limits.secondary, nowMs);
-    const at = snapshot.timestamp ?? file.mtime;
-    const line = (label: string, w: UsageWindow) =>
-      `${label.padEnd(7)} [${bar(w.usedPercent)}] ${String(w.usedPercent).padStart(5)}%  resets ${w.resetIn === 'reset' ? '(window has reset since)' : `${w.resetAtIso} (${w.resetIn})`}`;
-    return {
-      available: true,
-      plan: limits.plan_type ?? undefined,
-      fiveHour,
-      weekly,
-      rateLimitReached: limits.rate_limit_reached_type ?? null,
-      snapshotAt: new Date(at).toISOString(),
-      snapshotAgeSec: Math.max(0, Math.round((nowMs - at) / 1000)),
-      meter: `codex 5h ${fiveHour.usedPercent}% · wk ${weekly.usedPercent}%\n${line('5-hour', fiveHour)}\n${line('weekly', weekly)}`,
-    };
+    return { ...usageFromLimits(snapshot.limits, snapshot.timestamp ?? file.mtime, nowMs), source: 'session-log' };
   }
   return { available: false, reason: `no Codex usage snapshot found under ${dir}` };
 }
