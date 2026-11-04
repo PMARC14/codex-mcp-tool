@@ -46,6 +46,9 @@ export interface StartOptions {
 
 const sleep = (ms: number) => new Promise(resolveResult => setTimeout(resolveResult, ms));
 const quiet: JobLogger = { warn() {} };
+const DETECT_TTL_MS = 60_000;
+/** How often the pump checks whether other servers' job owners are still alive. */
+export const FOREIGN_SWEEP_MS = 15_000;
 
 /** The last 30 lines of stderr then stdout, each cut to 300 characters, at most 4000 in total. */
 export function compactDiagnostics(stderr: string, stdout: string): string {
@@ -229,10 +232,21 @@ export class JobManager {
     }));
   }
 
+  // detect() can spawn the CLI (agy runs `agy --version`), and the pump ticks every 500 ms in
+  // every server instance, so the queue reuses the answer for DETECT_TTL_MS.
+  private detected?: { available: boolean; at: number };
+  private lastForeignSweep = 0;
+  private async pumpAvailable(): Promise<boolean> {
+    const now = Date.now();
+    if (!this.detected || now - this.detected.at >= DETECT_TTL_MS)
+      this.detected = { available: (await this.connector.detect()).available, at: now };
+    return this.detected.available;
+  }
+
   private async promote(): Promise<void> {
     if (
       this.config.connectors[this.connector.id]?.enabled === false ||
-      !(await this.connector.detect()).available
+      !(await this.pumpAvailable())
     )
       return;
     const ready: JobMeta[] = [];
@@ -265,8 +279,12 @@ export class JobManager {
             if (!this.active.size) this.hold.stop();
           }
         }
+        // Other servers' jobs only need an occasional liveness check; doing it every 500 ms in
+        // every server instance was the main CPU/battery cost on Windows.
+        const sweepForeign = now - this.lastForeignSweep >= FOREIGN_SWEEP_MS;
+        if (sweepForeign) this.lastForeignSweep = now;
         const liveOwners = new Map<string, boolean>();
-        for (const job of jobs) {
+        for (const job of sweepForeign ? jobs : []) {
           if (!job.owner || sameOwner(job.owner, this.owner) || (terminal(job) && !job.reserved))
             continue;
           const key = JSON.stringify(job.owner);

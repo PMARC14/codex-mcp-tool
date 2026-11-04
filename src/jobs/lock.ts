@@ -1,4 +1,4 @@
-import { linkSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Owner } from './connector.js';
@@ -74,7 +74,35 @@ function tryAcquire(path: string, content: string): boolean {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     return false;
   } finally {
-    unlinkSync(temp);
+    // On Windows Defender can briefly hold the just-written file; a failed delete must not
+    // replace the real outcome. withLock sweeps any temp file left behind.
+    try {
+      unlinkSync(temp);
+    } catch {
+      /* swept later */
+    }
+  }
+}
+
+const TEMP_FILE = /^lock\.[0-9a-f-]{36}\.tmp$/;
+const STALE_TEMP_MS = 10 * 60 * 1000;
+
+/** Deletes lock temp files older than STALE_TEMP_MS; a fresh one may still be in use. */
+function sweepStaleTemps(home: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(home);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!TEMP_FILE.test(name)) continue;
+    const file = join(home, name);
+    try {
+      if (Date.now() - statSync(file).mtimeMs > STALE_TEMP_MS) unlinkSync(file);
+    } catch {
+      /* in use or already gone */
+    }
   }
 }
 
@@ -84,6 +112,7 @@ export async function withLock<T>(home: string, action: () => T | Promise<T>): P
   const token = randomUUID();
   const content = JSON.stringify({ ...owner, token });
   const deadline = Date.now() + 60000;
+  sweepStaleTemps(home);
   while (true) {
     if (!tryAcquire(path, content)) {
       const judged = await staleContent(path);

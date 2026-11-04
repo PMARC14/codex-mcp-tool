@@ -197,10 +197,31 @@ export async function ownerAlive(owner: Owner): Promise<boolean> {
   try {
     process.kill(owner.pid, 0);
   } catch (error) {
+    startTimeCache.delete(owner.pid);
     return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
-  const startTime = await processStartTime(owner.pid);
+  const startTime = await cachedStartTime(owner.pid);
   return startTime === undefined || startTime === owner.startTime;
+}
+
+// The job pump asks about the same few owners every 500 ms, and on Windows each fresh lookup
+// starts a powershell.exe. ownerAlive is the conservative check, so a recently seen start time
+// is good enough there: a PID reused inside the TTL only delays orphan recovery until it expires.
+// isAlive (used before killing) never takes this shortcut.
+export const START_TIME_TTL_MS = 60_000;
+/** Test hook: how many owner start times are cached. */
+export const startTimeCacheSize = () => startTimeCache.size;
+const startTimeCache = new Map<number, { value: string | undefined; at: number }>();
+
+async function cachedStartTime(pid: number): Promise<string | undefined> {
+  const hit = startTimeCache.get(pid);
+  if (hit && Date.now() - hit.at < START_TIME_TTL_MS) return hit.value;
+  const value = await processStartTime(pid);
+  startTimeCache.set(pid, { value, at: Date.now() });
+  if (startTimeCache.size > 256)
+    for (const [key, entry] of startTimeCache)
+      if (Date.now() - entry.at >= START_TIME_TTL_MS) startTimeCache.delete(key);
+  return value;
 }
 
 export async function descendants(root: Owner, known: Owner[] = []): Promise<Owner[]> {

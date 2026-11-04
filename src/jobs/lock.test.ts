@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fixture } from './test-helpers.js';
 import { currentOwner } from './proc.js';
@@ -77,3 +78,20 @@ test(
     }
   }
 );
+
+test('withLock sweeps stale lock temp files left by an interrupted acquisition', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'lock-tmp-'));
+  try {
+    const stale = join(home, 'lock.00000000-0000-0000-0000-000000000000.tmp');
+    const fresh = join(home, 'lock.11111111-1111-1111-1111-111111111111.tmp');
+    writeFileSync(stale, '{}');
+    writeFileSync(fresh, '{}');
+    const old = (Date.now() - 20 * 60 * 1000) / 1000;
+    utimesSync(stale, old, old);
+    await withLock(home, () => undefined);
+    assert.equal(existsSync(stale), false, 'stale temp file was not removed');
+    assert.equal(existsSync(fresh), true, 'a fresh temp file (maybe in use) must stay');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
