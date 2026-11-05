@@ -316,3 +316,11 @@ test('Windows cancellation kills detached and orphaned Node descendants', { skip
   }
 });
 
+test('snapshot follows a dead known parent but rejects a reused parent PID', () => {
+  const root = { pid: 10, startTime: '1000' };
+  const known = [{ pid: 20, startTime: '1100' }];
+  const rows = [{ ProcessId: 30, ParentProcessId: 20, Start: '1200' }];
+  assert.deepEqual(snapshotDescendants(rows, root, known).map(p => p.pid), [20, 30]);
+  assert.deepEqual(snapshotDescendants([...rows, { ProcessId: 20, ParentProcessId: 1, Start: '1300' }], root, known).map(p => p.pid), [20]);
+  assert.deepEqual(snapshotDescendants([{ ...rows[0], Start: '900' }], root, known).map(p => p.pid), [20]);
+});

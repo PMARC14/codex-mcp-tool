@@ -197,7 +197,7 @@ export async function isAlive(owner: Owner): Promise<boolean> {
 // Liveness for lock/recovery decisions is conservative when inspection is denied.
 // Killing uses isAlive instead, which requires a verified start-time match.
 export async function ownerAlive(owner: Owner): Promise<boolean> {
-  if (owner.pid === process.pid && ownerPromise)
+  if (owner.startTime && owner.pid === process.pid && ownerPromise)
     return owner.startTime === (await ownerPromise).startTime;
   try {
     process.kill(owner.pid, 0);
@@ -205,6 +205,7 @@ export async function ownerAlive(owner: Owner): Promise<boolean> {
     startTimeCache.delete(owner.pid);
     return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
+  if (!owner.startTime) return true;
   const startTime = await cachedStartTime(owner.pid);
   return startTime === undefined || startTime === owner.startTime;
 }
@@ -251,8 +252,8 @@ export interface ProcessRow {
  */
 export function snapshotDescendants(rows: ProcessRow[], root: Owner, known: Owner[] = []): Owner[] {
   const byPid = new Map(rows.map(row => [row.ProcessId, row]));
-  const parents = new Set(
-    [root, ...known].filter(p => byPid.get(p.pid)?.Start === p.startTime).map(p => p.pid)
+  const parents = new Map(
+    [root, ...known].filter(p => p.startTime && (!byPid.has(p.pid) || byPid.get(p.pid)?.Start === p.startTime)).map(p => [p.pid, p.startTime])
   );
   const found = new Map(known.map(p => [p.pid, p]));
   let changed = true;
@@ -260,8 +261,8 @@ export function snapshotDescendants(rows: ProcessRow[], root: Owner, known: Owne
     changed = false;
     for (const row of rows) {
       if (!parents.has(row.ParentProcessId) || parents.has(row.ProcessId)) continue;
-      if (Number(row.Start) < Number(byPid.get(row.ParentProcessId)!.Start)) continue;
-      parents.add(row.ProcessId);
+      if (Number(row.Start) < Number(parents.get(row.ParentProcessId)!)) continue;
+      parents.set(row.ProcessId, row.Start);
       found.set(row.ProcessId, { pid: row.ProcessId, startTime: row.Start });
       changed = true;
     }
@@ -269,25 +270,31 @@ export function snapshotDescendants(rows: ProcessRow[], root: Owner, known: Owne
   return [...found.values()];
 }
 
-export async function killTree(root?: Owner, recorded: Owner[] = []): Promise<void> {
+export async function killTree(root?: Owner, recorded: Owner[] = [], child?: ChildProcess): Promise<void> {
   if (process.platform === 'win32') {
     let children = recorded;
     if (root) children = await descendants(root, recorded).catch(() => recorded);
     for (const identity of [...(root ? [root] : []), ...children]) {
-      if (await isAlive(identity))
-        await runCommand(systemBinary('taskkill.exe'), [
+      // Only a still-live child handle authorizes PID-based termination without a start time.
+      // Persisted empty identities alone must never authorize killing a possibly reused PID.
+      const heldChild = identity === root && !identity.startTime && child?.pid === identity.pid && child.exitCode === null && child.signalCode === null;
+      if (heldChild || await isAlive(identity)) {
+        const killing = runCommand(systemBinary('taskkill.exe'), [
           '/PID',
           String(identity.pid),
           '/T',
           '/F',
         ]).catch(() => {});
+        if (heldChild) child!.kill();
+        await killing;
+      }
     }
     const survivors = await Promise.all([...(root ? [root] : []), ...children].map(ownerAlive));
     if (survivors.some(Boolean))
       throw new Error('kill-failed: processes in the tree are still alive');
     return;
   }
-  if (!root?.startTime) return;
+  if (!root?.startTime) { child?.kill(); return; }
   await killProcessGroup(root);
 }
 
@@ -421,7 +428,7 @@ export function startProcess(options: {
             /* Continue killing if persistence fails. */
           }
         }
-        await killTree(root, children);
+        await killTree(root, children, child);
       })
       .catch(() => {
         if (outcome) outcome.killFailed = true;
@@ -475,7 +482,10 @@ export function startProcess(options: {
     });
     child.once('spawn', () => {
       spawnReady = (async () => {
-        root = { pid: child.pid!, startTime: (await processStartTime(child.pid!)) ?? '' };
+        let startTime = await processStartTime(child.pid!);
+        if (!startTime && child.exitCode === null && child.signalCode === null)
+          startTime = await processStartTime(child.pid!);
+        root = { pid: child.pid!, startTime: startTime ?? '' };
         await options.onSpawn(root);
         if (process.platform === 'win32' && !closed) {
           const takeSnapshot = async () => {
@@ -501,7 +511,7 @@ export function startProcess(options: {
       })().catch(async error => {
         setupError = String(error);
         claim({ kind: 'error', code: null, error: String(error) });
-        await killTree(root, children).catch(() => {
+        await killTree(root, children, child).catch(() => {
           if (outcome) outcome.killFailed = true;
         });
       });
@@ -565,10 +575,6 @@ export function startProcess(options: {
     async stop(reason = 'cancel') {
       if (closed) return done;
       claim({ kind: reason, code: null });
-      // Bound cancellation even if process inspection or taskkill hangs.
-      killTimer ??= setTimeout(() => {
-        finish({ ...outcome!, killFailed: true });
-      }, 10000);
       if (reason === 'cancel' && inputHandler?.onInterrupt) {
         try { const action = inputHandler.onInterrupt(); if (action) updateStdin(child.stdin, action); }
         catch { /* Continue with process-tree cleanup. */ }
@@ -576,7 +582,13 @@ export function startProcess(options: {
         await Promise.race([done, new Promise<void>(resolve => { interruptTimer = setTimeout(resolve, 3000); })]);
         clearTimeout(interruptTimer);
       }
-      beginTermination();
+      if (!closed) {
+        // Give tree cleanup its full budget after the cooperative interrupt grace.
+        killTimer ??= setTimeout(() => {
+          finish({ ...outcome!, killFailed: true });
+        }, 10000);
+        beginTermination();
+      }
       return done;
     },
   };

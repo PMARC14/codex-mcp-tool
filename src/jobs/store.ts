@@ -70,9 +70,11 @@ export function failureReason(job: JobMeta): FailureReason | undefined {
   if (job.state === 'queued' || job.state === 'running') return undefined;
   if (job.verify && !job.verify.passed && job.state === 'completed') return 'verify_failed';
   if (job.state === 'completed') return undefined;
-  if (/sign.?in|log.?in|auth|unauthori[sz]ed|credentials|api.?key/i.test(job.error ?? '')) return 'auth';
   const reasons: Record<string, FailureReason> = { usage_limit: 'quota_exhausted', timeout: 'timeout', cancelled: 'cancelled', stalled: 'stalled', 'kill-failed': 'kill_failed', owner_gone: 'lost', superseded: 'superseded' };
-  return reasons[job.reason ?? ''] ?? (job.state === 'lost' ? 'lost' : 'cli_error');
+  const known = reasons[job.reason ?? ''] ?? (job.state === 'lost' ? 'lost' : undefined);
+  if (known) return known;
+  if (/\b(?:sign[-_ ]?in|log[-_ ]?in|auth|auth(?:enticat|oriz)\w*|unauthori[sz]ed|credentials|api[-_ ]?key)\b/i.test(job.error ?? '')) return 'auth';
+  return 'cli_error';
 }
 
 function fstatSize(path: string): number { const fd = openSync(path, 'r'); try { return fstatSync(fd).size; } finally { closeSync(fd); } }

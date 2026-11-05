@@ -5,7 +5,9 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, meta, until } from '../jobs/test-helpers.js';
 import { JobStore } from '../jobs/store.js';
-import { MODERN_PROTOCOL, TASK_EXTENSION } from './mcp-tasks.js';
+import { MODERN_PROTOCOL, TASK_EXTENSION, registerMcpTasks } from './mcp-tasks.js';
+import { toolRegistry } from './registry.js';
+import { z } from 'zod';
 
 const modernMeta = (tasks = true) => ({
   'io.modelcontextprotocol/protocolVersion': MODERN_PROTOCOL,
@@ -378,4 +380,43 @@ test('failed and lost jobs map to failed, and pause without reset remains workin
     await s.cleanup();
     s.f.cleanup();
   }
+});
+test('task notifications follow derived approval status and suppress unchanged projections', async () => {
+  const f = fixture();
+  const store = new JobStore(f.home);
+  const notices: any[] = [];
+  const manager = { connector: { id: 'codex' }, store, onTransition: store.onWrite.bind(store) };
+  const server = { setRequestHandler() {}, async notification(value: any) { notices.push(value); } };
+  const before = toolRegistry.length;
+  toolRegistry.push({ name: 'codex_job_watch', zodSchema: z.object({ jobId: z.string() }) } as any);
+  const tasks = registerMcpTasks(server as any, 'codex', manager as any, { capabilities: {} });
+  try {
+    const job = meta(f.home, { state: 'running' });
+    store.create(job, 'fake');
+    await tasks.call('codex_job_watch', { jobId: job.id });
+    const approval = { id: 'a', kind: 'commandExecution', summary: 'fake', requestedAt: 1 };
+    store.write({ ...job, pendingApproval: approval });
+    store.write({ ...job, pendingApproval: approval });
+    store.write(job);
+    store.write({ ...job, state: 'paused' });
+    assert.deepEqual(notices.map(n => n.params.status), ['input_required', 'working']);
+  } finally { tasks.close(); toolRegistry.splice(before); f.cleanup(); }
+});
+
+test('modern cancel returns a task projection with modern timing fields', async () => {
+  const s = await setup(undefined, 'modern');
+  try {
+    const { taskId } = await s.start({ waitMs: 60000 });
+    await until(() => s.store.get(taskId).state === 'running' && !!s.store.get(taskId).sessionId);
+    const cancelled = await s.rpc('tasks/cancel', { taskId });
+    assert.equal(cancelled.resultType, 'task');
+    assert.equal(cancelled.taskId, taskId);
+    assert.equal(cancelled.status, 'cancelled');
+    assert.equal(cancelled.ttlMs, null);
+    assert.equal(cancelled.pollIntervalMs, 15000);
+    for (const key of ['ttl', 'pollInterval', 'cacheScope', 'content']) assert.equal(key in cancelled, false);
+    const result = await s.rpc('tasks/get', { taskId });
+    assert.equal(result.resultType, 'complete');
+    assert.equal(JSON.parse(result.content[0].text).state, 'killed');
+  } finally { await s.cleanup(); s.f.cleanup(); }
 });

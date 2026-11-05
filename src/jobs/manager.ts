@@ -165,6 +165,7 @@ export class JobManager {
     });
     this.store.write({
       ...job,
+      ...(job.connector === this.connector.id ? { owner: this.owner, managerId: this.id } : {}),
       state: 'lost',
       reserved: !confirmed,
       reason: 'owner_gone',
@@ -459,6 +460,7 @@ export class JobManager {
             this.store.save(job, this.owner);
           }
           if (!this.owns(job) || !terminal(job) || !job.reserved) continue;
+          if (job.state === 'lost') { await this.recoverOrphan(job, now); continue; }
           const identities = [...(job.process ? [job.process] : []), ...(job.descendants ?? [])];
           if (!(await Promise.all(identities.map(ownerAlive))).some(Boolean)) {
             job.reserved = false;
@@ -602,9 +604,23 @@ export class JobManager {
         if (parsed.final && !parsed.error) event.error = undefined;
         let changed = false;
         if (parsed.sessionId) { job.sessionId = parsed.sessionId; changed = true; }
-        if ('pendingApproval' in parsed) { job.pendingApproval = parsed.pendingApproval ?? undefined; changed = true; }
+        if ('pendingApproval' in parsed) { job.pendingApproval = parsed.pendingApproval ?? undefined; lastGrowth = Date.now(); changed = true; }
         if (parsed.approvalReason) { job.approvalReason = parsed.approvalReason; job.reason = parsed.approvalReason; changed = true; }
         if (changed) this.store.save(job, this.owner);
+      };
+      const onClosed = () => {
+        void (async () => {
+          // done resolves before onClosed runs; settlement and verification may still be
+          // awaiting persistence. Release only after their final reserved write.
+          await finished;
+          if (!job.reserved) return;
+          const identities = [...(job.process ? [job.process] : []), ...(job.descendants ?? [])];
+          if ((await Promise.all(identities.map(ownerAlive))).some(Boolean)) return;
+          job.reserved = false;
+          this.store.save(job, this.owner);
+          this.active.delete(job.id);
+          if (!this.active.size) this.hold.stop();
+        })().catch(error => this.logger.warn('Failed checking process cleanup', error));
       };
       const process = startProcess({
         ...command,
@@ -627,30 +643,7 @@ export class JobManager {
             this.store.save(job, this.owner);
           }
         },
-        onClosed: () => {
-          void (async () => {
-            if (killFailed) {
-              if (
-                (
-                  await Promise.all(
-                    [...(job.process ? [job.process] : []), ...(job.descendants ?? [])].map(
-                      ownerAlive
-                    )
-                  )
-                ).some(Boolean)
-              )
-                return;
-              job.reserved = false;
-              try {
-                this.store.save(job, this.owner);
-              } catch (error) {
-                this.logger.warn('Failed releasing ended job slot', error);
-              }
-              this.active.delete(job.id);
-              if (!this.active.size) this.hold.stop();
-            }
-          })().catch(error => this.logger.warn('Failed checking process cleanup', error));
-        },
+        onClosed,
         onEvent: receive,
         onLine: (line, stream) => receive(this.connector.parse(line, stream)),
       });
@@ -676,18 +669,20 @@ export class JobManager {
               stdout: this.store.path(job.id, 'verify'), stderr: this.store.path(job.id, 'verify'),
               onSpawn: async identity => { job.process = identity; job.descendants = []; this.store.save(job, this.owner); },
               onSnapshot: identities => { job.descendants = identities; this.store.save(job, this.owner); },
+              onClosed,
               onLine: () => {}, onData: data => { output = (output + data).slice(-65536); },
             });
             const active = this.active.get(job.id);
             if (active) active.process = verifyProcess;
             const verifyTimer = setTimeout(() => void verifyProcess.stop('timeout'), (job.verifyTimeoutMin ?? 10) * 60000);
             const checked = await verifyProcess.done;
+            killFailed = checked.killFailed ?? false;
             clearTimeout(verifyTimer);
             // Keep a bounded output tail in the public verification file.
             atomicWrite(this.store.path(job.id, 'verify'), output + (checked.error ? `\n${checked.error}` : ''));
             job.verify = { command: job.verifyCommand, exitCode: checked.code, passed: checked.kind === 'exit' && checked.code === 0, durationSec: (Date.now() - started) / 1000, timedOut: checked.kind === 'timeout' };
             if (checked.kind === 'cancel') { await this.settle(job, checked, event); return; }
-            if (checked.killFailed) { killFailed = true; await this.settle(job, checked, event); return; }
+            if (checked.killFailed) { await this.settle(job, checked, event); return; }
           }
           await this.settle(job, outcome, event, stalledKill);
         })
@@ -695,17 +690,14 @@ export class JobManager {
           this.logger.warn(`Failed saving job ${job.id}`, error);
           // Retain a failed record when a transient store error permits it.
           try {
-            this.store.save(
-              {
-                ...job,
-                state: 'failed',
-                reserved: killFailed,
-                reason: 'store_error',
-                error: String(error),
-                finishedAt: Date.now(),
-              },
-              this.owner
-            );
+            Object.assign(job, {
+              state: 'failed',
+              reserved: killFailed,
+              reason: 'store_error',
+              error: String(error),
+              finishedAt: Date.now(),
+            });
+            this.store.save(job, this.owner);
           } catch (saveError) {
             this.logger.warn('Unable to persist failed job', saveError);
           }
@@ -716,7 +708,8 @@ export class JobManager {
           void this.pump().catch(error => this.logger.warn('Job queue error', error));
         });
       this.active.set(job.id, { job, process, finished, cancelled: false, sample: () => {
-        if (workerDone || job.pendingApproval || job.state !== 'running' || !(job.stallTimeoutMin ?? 10) || stalledKill) return;
+        if (job.pendingApproval) { lastGrowth = Date.now(); return; }
+        if (workerDone || job.state !== 'running' || !(job.stallTimeoutMin ?? 10) || stalledKill) return;
         const current = [statSync(this.store.path(job.id, 'stdout')).size, statSync(this.store.path(job.id, 'stderr')).size];
         const now = Date.now();
         if (current[0] > sizes[0] || current[1] > sizes[1]) {
@@ -898,7 +891,7 @@ export class JobManager {
     await withLock(this.config.home, () => {
       const job = this.store.get(jobId);
       if (!this.owns(job)) throw new Error('Only the owning server can cancel this job');
-      if (job.reason === 'kill-failed' && job.reserved) retry = job;
+      if ((job.reason === 'kill-failed' || job.state === 'lost') && job.reserved) retry = job;
       else { active = this.active.get(jobId); if (active) active.cancelled = true; }
       if (!active && !retry && !terminal(job)) {
         this.store.save(
@@ -911,7 +904,7 @@ export class JobManager {
       let deadline: NodeJS.Timeout | undefined;
       try {
         await Promise.race([
-          killTree(retry.process, retry.descendants),
+          this.kill(retry.process, retry.descendants),
           new Promise<never>((_, reject) => {
             deadline = setTimeout(
               () =>

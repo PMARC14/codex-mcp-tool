@@ -275,3 +275,40 @@ test('app-server settings match sandbox modes and trusted/full never approve', (
   assert.ok(parseAppServer(JSON.stringify({ method: 'error', params: { error: { message: 'You have hit your usage limit' }, willRetry: false } }), 'stdout')?.usageLimit);
   assert.equal(parseAppServer(JSON.stringify({ method: 'error', params: { error: { message: 'retry' }, willRetry: true } }), 'stdout'), null);
 });
+test('late completion cannot close a replacement turn and failed replacement closes the idle peer', async () => {
+  for (const fail of [false, true]) {
+    const writes: any[] = [];
+    let closes = 0;
+    const command = buildAppServer({ id: 'fake', connector: 'codex', prompt: 'hi', cwd: '/fake', mode: 'read', timeoutMin: 1, finalPath: '/fake/final' }, '/fake');
+    const handler = command.stdinPlan({ apply(action) { if (action.close) closes++; if (action.write) writes.push(JSON.parse(action.write)); }, emit() {} });
+    const feed = (value: any) => handler(JSON.stringify(value), 'stdout');
+    const flush = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
+    const complete = (id: string) => feed({ method: 'turn/completed', params: { threadId: 'thread', turn: { id } } });
+    try {
+      feed({ id: 1, result: {} });
+      feed({ id: writes.at(-1).id, result: { thread: { id: 'thread' } } });
+      await flush();
+      feed({ id: writes.at(-1).id, result: { turn: { id: 'one' } } });
+      await flush();
+      const steering = Promise.resolve(handler.onSteer!('next'));
+      feed({ id: writes.at(-1).id, error: { message: 'No active turn' } });
+      await flush();
+      assert.equal(writes.at(-1).method, 'turn/start');
+      complete('one');
+      if (fail) {
+        feed({ id: writes.at(-1).id, error: { message: 'usage limit' } });
+        await assert.rejects(steering, /usage limit/);
+        await flush();
+        assert.equal(closes, 1, 'failed replacement leaves no running turn');
+      } else {
+        feed({ id: writes.at(-1).id, result: { turn: { id: 'two' } } });
+        await steering;
+        await flush();
+        assert.equal(closes, 0, 'old completion must not close the new turn');
+        complete('two');
+        await flush();
+        assert.equal(closes, 1);
+      }
+    } finally { handler.dispose!(); }
+  }
+});

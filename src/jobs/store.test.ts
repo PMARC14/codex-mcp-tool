@@ -133,3 +133,14 @@ test('exclusive lock serializes contenders and reclaims a dead or reused PID', a
     f.cleanup();
   }
 });
+test('explicit failure reasons outrank auth text and auth fallback matches whole words', async () => {
+  const { failureReason } = await import('./store.js');
+  const cases = { usage_limit: 'quota_exhausted', timeout: 'timeout', cancelled: 'cancelled', stalled: 'stalled', 'kill-failed': 'kill_failed', owner_gone: 'lost', superseded: 'superseded' };
+  for (const [reason, expected] of Object.entries(cases))
+    assert.equal(failureReason(meta('unused', { state: 'failed', reason, error: 'API key usage limit; logging author designing' })), expected);
+  assert.equal(failureReason(meta('unused', { state: 'lost', error: 'auth error' })), 'lost');
+  for (const error of ['logging', 'author', 'designing', 'assigning'])
+    assert.equal(failureReason(meta('unused', { state: 'failed', error })), 'cli_error');
+  for (const error of ['Please sign in', 'login failed', 'authentication failed', 'unauthorized', 'API key missing', 'auth failed'])
+    assert.equal(failureReason(meta('unused', { state: 'failed', error })), 'auth');
+});

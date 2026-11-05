@@ -77,7 +77,7 @@ let warned = false;
 export function jobWrapper(options: { compiler?: string; cacheDir?: string; warn?: (message: string) => void } = {}): string | undefined {
   if (process.platform !== 'win32' || process.env.AGENT_JOBS_NO_JOBOBJECT === '1') return undefined;
   const custom = options.compiler !== undefined || options.cacheDir !== undefined;
-  if (!custom && cached !== undefined) return cached ?? undefined;
+  if (!custom && cached !== undefined && (cached === null || existsSync(cached))) return cached ?? undefined;
   const hash = createHash('sha256').update(JOB_WRAPPER_SOURCE).digest('hex').slice(0, 8);
   const dir = options.cacheDir ?? join(homedir(), '.agent-jobs', 'bin');
   const target = join(dir, `jobwrap-${hash}.exe`);

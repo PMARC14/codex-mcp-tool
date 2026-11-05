@@ -168,6 +168,8 @@ Worktrees start from the recorded `HEAD` SHA, under `<root>.worktrees/<label>-<i
 
 After the job stops, collect with `remove: "none"`, `"worktree"`, or `"worktree+branch"`. Collection stages all files and diffs against the recorded base with `--binary`, capturing new files, binary files, and worker commits. It saves `patch.diff` before removal, returns a capped patch and full path, and reports removal failures. Applying the patch or merging the branch remains the caller's responsibility.
 
+Before removal, collection walks ordinary directories and unlinks junctions and symlinks, including nested and dangling links. It removes only each link, leaving its target untouched. A failed Git removal is retried with `core.longpaths=true`. Before the first removal attempt, `patch.diff.removal-attempted` saves the patch's stat summary. Later collections reuse the saved patch and summary, even after a restart, because a failed removal may have already deleted tracked files. Missing saved artifacts cause an error instead of collecting from a partially removed worktree.
+
 ## Claude Code channel notifications (opt-in)
 
 Claude Code Channels let an MCP server push events into a running session. To enable it, set `AGENT_JOBS_CHANNEL=1` in the server's environment and launch Claude Code with `claude-agents` (which runs `claude --dangerously-load-development-channels server:codex server:agy`).
@@ -195,7 +197,11 @@ Run `npm test` for the fake-worker suite; it starts no real Codex jobs. Real CLI
 
 `codex_job_start` accepts `verify`, a shell command run through Git Bash in the job directory after the CLI succeeds, and `verifyTimeoutMin` (default 10 minutes). Verification is rejected in read mode. Its command, exit code, pass status, duration and timeout status appear as `verify` in job metadata, result and watch; the output tail is available through `job_read` as `verify`. A failed verification leaves the job `completed` so its patch remains collectable. Follow-ups and requeues inherit the command and timeout.
 
-Worktree creation and collection disable Git hooks and configured clean, smudge and process filters and skip LFS smudging for their Git commands.
+Worktree creation and collection disable Git hooks, fsmonitor, configured clean, smudge and process filters, and skip LFS smudging for every Git command, including configuration discovery. Both patch and stat diffs disable external diff and textconv drivers. Filter names containing `=` cannot be safely overridden with Git's `-c` syntax, so creation and collection refuse such configurations with an explicit error before checkout or staging; remove or rename that filter configuration first.
+
+Windows child start-time inspection retries once if the child handle is still alive. If both attempts fail, cancellation uses the live child handle and PID-based `taskkill /T`; a persisted PID without a verified start time alone does not authorize termination. Empty-start owners whose PIDs remain alive retain their slots. Cached Job Object launchers are checked for existence before reuse and rebuilt or replaced by process-tree cleanup when missing. Without Job Object containment, snapshots follow recorded parents even after they exit, while rejecting observed PID reuse. Descendants whose entire intermediate parent lifetime falls between snapshots and was never recorded remain a limitation of this fallback.
+
+Cooperative cancellation gets a three-second interrupt grace followed by a separate ten-second process-tree cleanup budget. A process that closes during the grace needs no further termination. Worker and verification close callbacks wait for settlement before releasing a failed-cleanup reservation. A server recovering its connector's orphan becomes the recorder of the `lost` state and can retry cleanup with `job_cancel`. Lost notifications recovered before transport connection are replayed on notifier startup; the shared exclusive `woken` marker prevents duplicate announcements.
 
 
 ### Reasoning, stalls, and notification markers
@@ -203,6 +209,8 @@ Worktree creation and collection disable Git hooks and configured clean, smudge 
 Codex reasoning is saved in the `reasoning` job file, retaining the most recent 256 KiB. It is omitted from results by default: set `includeReasoning` on `job_result` for its last 4,000 characters, or `showReasoning` on `job_watch` to use the latest sentence for progress. `job_read` can page through the file.
 
 `job_start` accepts `stallTimeoutMin` (default 10, zero disables detection) and `onStall` (`report`, the default, or `kill`). A stall means neither output file grew within the interval. Status and results expose `stalled` and `stalledSince`; output clears the flag. The kill option stops the worker with reason `stalled`, allowing requeue. Follow-ups and requeues inherit these settings.
+
+Waiting for approval resets the stall clock on every sample, and an approval response starts a fresh interval. MCP task status notifications track the derived status, including `working` to `input_required` and back. Modern (`2026-07-28`) cancellation returns a task projection with `ttlMs` and `pollIntervalMs`; a terminal `tasks/get` returns the completed result payload. Explicit failure reasons and `lost` take precedence over authentication text, whose fallback matching uses whole words.
 
 A channel notification creates `jobs/<id>/woken` atomically before sending; an existing marker suppresses subsequent notifications. Returning a stopped job from `job_result` or `job_watch` creates `jobs/<id>/collected`. Hooks can use these markers to avoid duplicate wakeups and delivery.
 

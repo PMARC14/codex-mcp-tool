@@ -74,7 +74,7 @@ export class TaskStdioTransport extends StdioServerTransport {
       if (request?.modern && 'result' in message) {
         let result: any = message.result;
         if (result.task) result = modernTask(result.task);
-        else {
+        else if (result.resultType !== 'task') {
           result = { resultType: 'complete', ttlMs: 0, cacheScope: 'private', ...result };
           if (request.method === 'tools/list') {
             result.tools = result.tools.map(({ execution: _execution, ...tool }: any) => tool);
@@ -98,6 +98,7 @@ export function registerMcpTasks(
     if (supportsTask(prefix, tool.name)) tool.execution = { taskSupport: 'optional' };
   }
   const subscribed = new Set<string>();
+  const statuses = new Map<string, Task['status']>();
   let unsubscribe: (() => void) | undefined;
   const marker = (id: string) => join(manager.store.dir(id), 'mcp-task.json');
   const jobFor = (id: string) => {
@@ -220,7 +221,8 @@ export function registerMcpTasks(
     const job = jobFor(request.params.taskId);
     if (terminal(job)) throw new McpError(ErrorCode.InvalidParams, 'Cannot cancel a terminal task');
     await manager.cancel(job.id);
-    return taskFor(jobFor(job.id));
+    const task = taskFor(jobFor(job.id));
+    return modern(request.params) ? modernTask(task) : task;
   });
   server.setRequestHandler(ListTasksRequestSchema, async request => {
     if (request.params?.cursor)
@@ -252,11 +254,15 @@ export function registerMcpTasks(
       const job = jobFor(id);
       if (!existsSync(marker(id))) atomicWrite(marker(id), '{}');
       subscribed.add(id);
+      statuses.set(id, taskFor(job).status);
       // Lazily subscribe so clients making only ordinary calls acquire no listeners.
-      unsubscribe ??= manager.onTransition((job, previous) => {
-        if (!subscribed.has(job.id) || job.state === previous) return;
+      unsubscribe ??= manager.onTransition(job => {
+        if (!subscribed.has(job.id)) return;
+        const task = taskFor(job);
+        if (statuses.get(job.id) === task.status) return;
+        statuses.set(job.id, task.status);
         void server
-          .notification({ method: 'notifications/tasks/status', params: taskFor(job) })
+          .notification({ method: 'notifications/tasks/status', params: task })
           .catch(() => {});
       });
       return { task: taskFor(job) };
@@ -265,6 +271,7 @@ export function registerMcpTasks(
       unsubscribe?.();
       unsubscribe = undefined;
       subscribed.clear();
+      statuses.clear();
     },
   };
 }

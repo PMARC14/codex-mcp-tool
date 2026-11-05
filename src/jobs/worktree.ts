@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { safeSpawn } from './proc.js';
 import { readConfig } from './config.js';
@@ -9,7 +9,7 @@ import type { Worktree } from './connector.js';
 async function gitGroup(cwd: string, home: string) {
   const hooks = join(home, 'empty-hooks');
   mkdirSync(hooks, { recursive: true });
-  const base = ['-c', `core.hooksPath=${hooks}`];
+  const base = ['-c', `core.hooksPath=${hooks}`, '-c', 'core.fsmonitor=false'];
   const run = (dir: string, args: string[], allowMissing = false): Promise<Buffer> =>
     new Promise((resolveResult, reject) => {
       const child = safeSpawn('git', args, { cwd: dir, env: { ...process.env, GIT_LFS_SKIP_SMUDGE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -29,7 +29,10 @@ async function gitGroup(cwd: string, home: string) {
   for (const entry of config.split('\0')) {
     const key = entry.split('\n', 1)[0];
     const match = /^filter\.(.+)\.[^.]+$/i.exec(key);
-    if (match) names.add(match[1]);
+    if (match) {
+      if (match[1].includes('=')) throw new Error(`Unsafe Git filter name containing '=': ${match[1]}; remove this filter configuration before worktree operations`);
+      names.add(match[1]);
+    }
   }
   const overrides = [...base];
   for (const name of names) for (const [key, value] of [['smudge', ''], ['clean', ''], ['process', ''], ['required', 'false']])
@@ -38,6 +41,30 @@ async function gitGroup(cwd: string, home: string) {
     buffer: (dir: string, ...args: string[]) => run(dir, [...overrides, ...args]),
     text: async (dir: string, ...args: string[]) => (await run(dir, [...overrides, ...args])).toString('utf8').trimEnd(),
   };
+}
+
+// Walk only ordinary directories. A junction/symlink is unlinked as a single entry;
+// never recurse through it or delete its target (which may be outside the worktree).
+function unlinkWorktreeLinks(path: string): void {
+  let entry;
+  try { entry = lstatSync(path); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (entry.isSymbolicLink()) {
+    rmSync(path, { recursive: false, force: true });
+  } else if (entry.isDirectory()) {
+    for (const name of readdirSync(path)) unlinkWorktreeLinks(join(path, name));
+  }
+}
+
+async function removeWorktree(group: Awaited<ReturnType<typeof gitGroup>>, root: string, path: string) {
+  unlinkWorktreeLinks(path);
+  try {
+    await group.text(root, 'worktree', 'remove', '--force', path);
+  } catch {
+    await group.text(root, '-c', 'core.longpaths=true', 'worktree', 'remove', '--force', path);
+  }
 }
 
 export function sanitizeLabel(label = 'job'): string {
@@ -75,7 +102,7 @@ export async function createWorktree(
   }
   const branchExisted = !!(await group.text(root, 'rev-parse', '--verify', `refs/heads/${branch}`).catch(() => undefined));
   const cleanup = async (target: string) => {
-    await group.text(root, 'worktree', 'remove', '--force', target).catch(() => undefined);
+    await removeWorktree(group, root, target).catch(() => undefined);
     if (!branchExisted) await group.text(root, 'branch', '-D', branch).catch(() => undefined);
     await group.text(root, 'worktree', 'prune').catch(() => undefined);
   };
@@ -120,18 +147,30 @@ export async function collectWorktree(
   home = readConfig().home
 ) {
   if (worktree.removed) throw new Error(`Worktree already removed; saved patch: ${patchPath}`);
-  const group = await gitGroup(worktree.path, home);
-  await group.text(worktree.path, 'add', '-A');
-  // The patch is saved as git's raw bytes: no trimming and no text round trip, because the
-  // worktree may be removed right after.
-  const raw = await group.buffer(worktree.path, 'diff', '--binary', '--cached', worktree.baseSha);
-  atomicWrite(patchPath, raw);
+  const removalMarker = `${patchPath}.removal-attempted`;
+  const previousRemoval = existsSync(removalMarker);
+  let group: Awaited<ReturnType<typeof gitGroup>> | undefined;
+  let raw: Buffer;
+  let stat: string;
+  if (previousRemoval) {
+    // A failed Git removal may already have deleted tracked files, or even .git.
+    // The durable marker also protects retries after a server restart.
+    raw = readFileSync(patchPath);
+    stat = JSON.parse(readFileSync(removalMarker, 'utf8')).stat;
+  } else {
+    group = await gitGroup(worktree.path, home);
+    await group.text(worktree.path, 'add', '-A');
+    raw = await group.buffer(worktree.path, 'diff', '--no-ext-diff', '--no-textconv', '--binary', '--cached', worktree.baseSha);
+    atomicWrite(patchPath, raw);
+    stat = await group.text(worktree.path, 'diff', '--no-ext-diff', '--no-textconv', '--stat', '--cached', worktree.baseSha);
+  }
   const patch = raw.toString('utf8').trimEnd();
-  const stat = await group.text(worktree.path, 'diff', '--stat', '--cached', worktree.baseSha);
   let removalError: string | undefined;
   if (remove !== 'none') {
     try {
-      await group.text(worktree.root, 'worktree', 'remove', '--force', worktree.path);
+      if (!previousRemoval) atomicWrite(removalMarker, JSON.stringify({ stat }));
+      group ??= await gitGroup(worktree.root, home);
+      await removeWorktree(group, worktree.root, worktree.path);
       worktree.removed = true;
       if (remove === 'worktree+branch')
         await group.text(worktree.root, 'branch', '-D', worktree.branch);

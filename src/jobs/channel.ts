@@ -22,7 +22,7 @@ export interface ChannelServer {
 }
 
 export interface ChannelManager {
-  store?: { dir(id: string): string };
+  store?: { dir(id: string): string; list?(): JobMeta[] };
   onTransition(listener: (job: JobMeta, previous: JobState | undefined) => void): () => void;
   isOwn(job: JobMeta): boolean;
 }
@@ -101,7 +101,7 @@ export function startChannelNotifier(
   if (!channelEnabled(env)) return () => {};
   const sent = new Set<string>();
   let stopped = false;
-  const unsubscribe = manager.onTransition((job, previous) => {
+  const notify = (job: JobMeta, previous: JobState | undefined) => {
     const awaiting = job.state === 'running' && !!job.pendingApproval;
     if (!awaiting && (job.state === 'queued' || job.state === 'running')) { for (const key of sent) if (key.startsWith(`${job.id}:`) && !key.includes(':input_required:')) sent.delete(key); }
     if (stopped || (!awaiting && (!NOTIFY_STATES.includes(job.state) || previous === job.state))) return;
@@ -125,7 +125,13 @@ export function startChannelNotifier(
     } catch (error) {
       logger?.warn('Channel notification failed', error);
     }
-  });
+  };
+  const unsubscribe = manager.onTransition(notify);
+  // Recovery runs before the MCP transport connects. Replay its lost records once;
+  // the exclusive marker also deduplicates multiple notifier instances.
+  for (const job of manager.store?.list?.() ?? []) {
+    if (job.state === 'lost') notify(job, undefined);
+  }
   return () => {
     stopped = true;
     unsubscribe();

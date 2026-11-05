@@ -15,6 +15,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
     let sequence = 1;
     let threadId: string | undefined;
     let turnId: string | undefined;
+    const retiredTurns = new Set<string>();
     let completed = false;
     let disposed = false;
     let stopping = false;
@@ -71,10 +72,17 @@ export function buildAppServer(job: JobSpec, exe: string) {
       });
     };
     const startTurn = async (text: string) => {
+      if (turnId) retiredTurns.add(turnId);
+      turnId = undefined;
       completed = false;
       clearImmediate(closeSoon);
-      const result = await request('turn/start', { threadId, input: input(text), effort: job.effort });
-      if (!completed) turnId = result.turn.id;
+      try {
+        const result = await request('turn/start', { threadId, input: input(text), effort: job.effort });
+        if (!completed) turnId = result.turn.id;
+      } catch (error) {
+        completed = !turnId;
+        throw error;
+      }
     };
     const settings = {
       cwd: job.cwd, model: job.model,
@@ -138,6 +146,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
           publishApproval();
         }
       } else if (message.method === 'turn/completed' && message.params.threadId === threadId) {
+        if (retiredTurns.has(message.params.turn.id)) return;
         if (turnId && message.params.turn.id !== turnId) return;
         turnId = undefined;
         completed = true;
