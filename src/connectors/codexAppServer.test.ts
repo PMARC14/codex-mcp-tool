@@ -208,7 +208,7 @@ test('approvals persist, project input_required, notify once, and accept with th
   for (const kind of ['commandExecution', 'fileChange', 'permissions']) {
     const f = setup();
     const events: any[] = [];
-    const off = startChannelNotifier(f.manager, { async notification(event) { events.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1' });
+    const off = startChannelNotifier(f.manager, { async notification(event) { events.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
     try {
       const { jobId } = await f.manager.start({ prompt: JSON.stringify({ approval: kind }), cwd: f.home, transport: 'app-server', mode: 'write' });
       await until(() => !!f.manager.store.get(jobId).pendingApproval && f.manager.store.get(jobId).state === 'running');

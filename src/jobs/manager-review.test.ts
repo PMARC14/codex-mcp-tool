@@ -93,7 +93,7 @@ test('orphan recorder owns lost jobs, notifies once, and can retry cleanup', asy
   let kills = 0;
   const manager = new JobManager(fakeConnector(f.script), f.config, undefined, { async killTree() { kills++; if (fail) throw new Error('fake kill failure'); } });
   const notices: any[] = [];
-  const off = startChannelNotifier(manager, { async notification(event) { notices.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1' });
+  const off = startChannelNotifier(manager, { async notification(event) { notices.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
   try {
     manager.store.create(meta(f.home, { id: 'orphan', state: 'running', reserved: true, owner: { ...(await currentOwner()), startTime: 'dead owner' }, process: { pid: 424252, startTime: 'fake' } }), 'fake');
     await manager.initialize();
@@ -200,7 +200,7 @@ test('startup lost notifications replay once across notifier instances', async (
   try {
     manager.store.create(meta(f.home, { id: 'startup-orphan', state: 'running', owner: { ...(await currentOwner()), startTime: 'dead owner' } }), 'fake');
     await manager.initialize();
-    for (let i = 0; i < 2; i++) stops.push(startChannelNotifier(manager, { async notification(event) { notices.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1' }));
+    for (let i = 0; i < 2; i++) stops.push(startChannelNotifier(manager, { async notification(event) { notices.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' }));
     assert.equal(notices.length, 1);
     assert.equal(notices[0].params.meta.state, 'lost');
   } finally { stops.forEach(stop => stop()); await manager.dispose(); f.cleanup(); }

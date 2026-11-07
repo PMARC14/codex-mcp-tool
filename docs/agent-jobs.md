@@ -174,7 +174,7 @@ Connectors have an optional `bridgeConfig(job)` hook returning argv and/or `{ pa
 
 Hooks should watch `meta.json.awaitingInput` (`qid`, bounded `question`, `options`, `askedAt`) and `meta.json.pendingApproval` (`id`, `kind`, `summary`, `requestedAt`), independently of the job's `running` state. A pending question needs `codex_job_respond { answer }`; a pending approval needs `{ decision }`. Cleared fields mean the response was delivered or the request ended. This repository does not modify `multi-agent/scripts/hook-wait.sh`.
 
-With `AGENT_JOBS_CHANNEL=1`, each question emits one deduplicated metadata-only event with `state=input_required`, `kind=question`, and `job_id`. Neither question text, options, note text nor worker output enters channel payloads. Question events do not consume terminal notification markers.
+With `CLAUDE_AGENTS=1`, each non-task job question emits one deduplicated metadata-only event with `state=input_required`, `kind=question`, and `job_id`. Neither question text, options, note text nor worker output enters channel payloads. Question events do not consume terminal notification markers.
 
 ## Shared store and ownership
 
@@ -206,11 +206,15 @@ Before removal, collection walks ordinary directories and unlinks junctions and 
 
 ## Claude Code channel notifications (opt-in)
 
-Claude Code Channels let an MCP server push events into a running session. To enable it, set `AGENT_JOBS_CHANNEL=1` in the server's environment and launch Claude Code with `claude-agents` (which runs `claude --dangerously-load-development-channels server:codex server:agy`).
+Claude Code Channels let an MCP server push events into a running session. Launch with `claude-agents`, which exports `CLAUDE_AGENTS=1` and loads `server:codex` and `server:agy` as development channels. The launcher flag must equal `1`; otherwise the server declares no channel capability, adds no channel instructions, and sends no events or markers.
 
-When the variable is unset, the server declares no extra capability and sends nothing, so other MCP clients see no change. When it is set, the server declares `experimental: { 'claude/channel': {} }`, adds one line to its instructions, and sends one notification per job when this server's own job reaches `completed`, `failed`, `killed`, `paused`, or `lost`. Jobs owned by other servers are never announced, and a job is not announced twice for the same state. If the session did not load the server as a channel, Claude Code drops the events silently.
+| Session or job | Wake path |
+| --- | --- |
+| Plain `claude` | MCP task when used; otherwise the PostToolUse `asyncRewake` hook. |
+| `claude-agents` | MCP task when used; otherwise channel events. The hook stands down in launcher sessions. |
+| MCP-task jobs | Task only; channel and hook skip these jobs. |
 
-Python `mmap` inspection of Claude Code 2.1.319 (`claude/channel` and `development-channels`) found that listener registration depends on the server capability, local session flags, provider and policy checks. The client capability builders used by `initialize` and per-request `_meta` do not advertise whether channels were loaded. Modern protocol connections explicitly skip unsolicited channel registration. Transport success therefore cannot be treated as a confirmed wake. The hook keeps its independent `woken` marker even in `claude-agents` sessions: a possible channel-plus-hook double wake is preferred to a missed wake.
+The launcher and hook must implement this convention together. `AGENT_JOBS_CHANNEL` is retained in existing configurations but is no longer required or consulted. A plain session does not receive channel events, even if `AGENT_JOBS_CHANNEL=1` is configured. The server declares `experimental: { 'claude/channel': {} }` and sends notifications for its own jobs reaching `completed`, `failed`, `killed`, `paused`, or `lost` only when the launcher flag is set. Other owners and MCP-task jobs are skipped. Claude Code can silently drop events when channels were not loaded, so the launcher must load them as well as export the flag. Claude Code's MCP environment allowlist mode does not inherit this flag; in that mode the launcher must also pass `CLAUDE_AGENTS=1` through the server configuration `env` or a launcher-specific server wrapper.
 
 The payload is metadata only. The content is `codex job <state>: call codex_job_result with this job_id` (with the reset time added for `paused`). The attributes are `job_id`, `state`, `agent`, and `verify` (`passed` or `failed` when verification ran), plus `label` (sanitized to `[A-Za-z0-9_-]`, 40 characters at most), `reason`, and `reset_at` when known. Superseding a paused job sends one `killed` transition with `reason: "superseded"` and `superseded_by` identifying its replacement. Worker output (final text, stdout, stderr, patch) is never included, because it would be a prompt-injection vector; call `codex_job_result` to read it. A failed push is logged and never affects the job.
 
@@ -252,7 +256,7 @@ Codex reasoning is saved in the `reasoning` job file, retaining the most recent 
 
 Waiting for approval resets the stall clock on every sample, and an approval response starts a fresh interval. MCP task status notifications track the derived status, including `working` to `input_required` and back. Modern (`2026-07-28`) cancellation returns a task projection with `ttlMs` and `pollIntervalMs`; a terminal `tasks/get` returns the completed result payload. Explicit failure reasons and `lost` take precedence over authentication text, whose fallback matching uses whole words.
 
-A channel notification exclusively creates its own `jobs/<id>/channel-sent` marker to deduplicate channel attempts. Question and approval events use `channel-sent-<hash>`. Channels never create `woken`: that marker belongs to the PostToolUse wake hook. Returning a stopped job from `job_result` or `job_watch` creates `jobs/<id>/collected`, which lets the hook skip results already collected. A channel attempt cannot suppress the fallback hook wake; a session with both paths may wake twice.
+A channel notification exclusively creates its own `jobs/<id>/channel-sent` marker to deduplicate channel attempts. Question and approval events use `channel-sent-<hash>`. Channels never create `woken`: that marker belongs to the PostToolUse wake hook. Returning a stopped job from `job_result` or `job_watch` creates `jobs/<id>/collected`, which lets the hook skip results already collected. The launcher hook stands down in channel sessions, so the separate markers do not cause a second wake.
 
 
 Jobs started or adopted as MCP tasks do not send channel notifications: the task provides its own wake. Returning to queued or running clears the per-attempt `woken`, `channel-sent`, and `collected` markers.

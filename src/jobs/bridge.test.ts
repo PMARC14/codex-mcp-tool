@@ -99,7 +99,7 @@ test('fake worker calls bridge: question -> input_required -> elicitation tasks/
   const s = setup();
   const w = await wire(s);
   const channels: any[] = [];
-  const stop = startChannelNotifier(s.manager, { async notification(notice) { channels.push(notice); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1' });
+  const stop = startChannelNotifier(s.manager, { async notification(notice) { channels.push(notice); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
   try {
     const created = await w.rpc('tools/call', { name: 'codex_job_start', arguments: {
       cwd: s.home, prompt: JSON.stringify({ question: 'Sensitive question ' + 'x'.repeat(700), note: 'Milestone ' + 'x'.repeat(100) }),
@@ -121,13 +121,10 @@ test('fake worker calls bridge: question -> input_required -> elicitation tasks/
     assert.equal(poll.inputRequests[qid].method, 'elicitation/create');
     assert.deepEqual(poll.inputRequests[qid].params.requestedSchema.properties.answer.enum, ['A', 'B']);
     clientTaskList.parse(await w.rpc('tasks/list'));
-    await until(() => channels.length > 0);
-    assert.equal(channels.length, 1);
-    assert.equal(channels[0].params.meta.kind, 'question');
-    assert.doesNotMatch(JSON.stringify(channels), /Sensitive question|Milestone/);
+    assert.equal(channels.length, 0);
     // Let multiple samples run while pending: no duplicate event or stall killing.
     await new Promise(resolve => setTimeout(resolve, 1100));
-    assert.equal(channels.length, 1);
+    assert.equal(channels.length, 0);
     assert.equal(s.manager.store.get(taskId).state, 'running');
     await assert.rejects(w.rpc('tasks/update', { taskId, inputResponses: { stale: { action: 'accept', content: { answer: 'wrong' } } } }), /pending question/);
     assert.equal(s.manager.store.get(taskId).awaitingInput!.qid, qid);

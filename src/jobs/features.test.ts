@@ -59,9 +59,9 @@ test('channel marker deduplicates across notifier instances', async () => {
     // Synthetic transition source keeps ownership independent from process scheduling.
     let emit!: (item: JobMeta, previous: JobState | undefined) => void;
     const source = { store: manager.store, isOwn: () => true, onTransition(listener: typeof emit) { emit = listener; return () => {}; } };
-    startChannelNotifier(source, server, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1' });
+    startChannelNotifier(source, server, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
     emit({ ...job, state: 'completed' }, 'running');
-    startChannelNotifier(source, server, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1' });
+    startChannelNotifier(source, server, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
     emit({ ...job, state: 'completed' }, 'running');
     assert.equal(calls, 1); assert.ok(existsSync(join(manager.store.dir(job.id), 'channel-sent')));
     assert.equal(existsSync(join(manager.store.dir(job.id), 'woken')), false);
@@ -105,7 +105,7 @@ test('task markers suppress channels and retry clears delivery markers', async (
     await manager.initialize();
     const job = meta(f.home); manager.store.create(job, 'p');
     let calls = 0;
-    startChannelNotifier({ store: manager.store, isOwn: () => true, onTransition: manager.onTransition.bind(manager) }, { async notification() { calls++; } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1' });
+    startChannelNotifier({ store: manager.store, isOwn: () => true, onTransition: manager.onTransition.bind(manager) }, { async notification() { calls++; } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
     const dir = manager.store.dir(job.id);
     writeFileSync(join(dir, 'mcp-task.json'), '{}');
     manager.store.write({ ...job, state: 'paused', reason: 'usage_limit' });

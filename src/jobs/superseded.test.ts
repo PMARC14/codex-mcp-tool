@@ -31,7 +31,7 @@ for (const action of ['requeue', 'send'] as const) {
         },
         'codex',
         undefined,
-        { AGENT_JOBS_CHANNEL: '1' }
+        { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' }
       );
       const before = Date.now();
       const replacement =

@@ -14,7 +14,7 @@ import {
 } from './channel.js';
 import type { JobMeta, JobState } from './connector.js';
 
-const ON = { AGENT_JOBS_CHANNEL: '1' };
+const ON = { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' };
 const SECRET = 'SECRET-FINAL-TEXT-ignore-previous-instructions';
 
 test('channel delivery never claims the hook wake marker and retry resets both independent markers', () => {
@@ -179,21 +179,36 @@ test('a failing notification is logged and never thrown', async () => {
 });
 
 test('nothing is declared or sent when the env var is off', () => {
-  for (const env of [{}, { AGENT_JOBS_CHANNEL: '0' }, { AGENT_JOBS_CHANNEL: 'true' }]) {
+  for (const env of [{}, { AGENT_JOBS_CHANNEL: '1' }, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '0' }]) {
     const caps = { tools: {}, logging: {} };
     assert.equal(withChannelCapabilities(caps, env), caps);
     assert.equal(withChannelInstructions('base', 'codex', env), 'base');
     assert.equal(withChannelInstructions(undefined, 'codex', env), undefined);
+    const f = fixture();
+    const store = new JobStore(f.home);
+    const job = meta(f.home, { state: 'queued' });
+    store.create(job, 'fake');
     const manager = fakeManager();
     const { calls, server } = fakeServer();
-    startChannelNotifier(manager, server, 'codex', undefined, env)();
+    startChannelNotifier({ ...manager, store }, server, 'codex', undefined, env)();
     assert.equal(manager.count(), 0);
-    manager.emit(meta('/x', { state: 'completed' }), 'running');
+    manager.emit({ ...job, state: 'completed' }, 'running');
     assert.equal(calls.length, 0);
+    assert.equal(existsSync(join(store.dir(job.id), 'channel-sent')), false);
+    f.cleanup();
   }
 });
 
 test('capabilities and instructions merge when enabled', () => {
+  for (const env of [{ CLAUDE_AGENTS: '1' }, { CLAUDE_AGENTS: '1', AGENT_JOBS_CHANNEL: '0' }, ON]) {
+    assert.match(withChannelInstructions(undefined, 'codex', env)!, /<channel/);
+    assert.ok('experimental' in withChannelCapabilities({ tools: {} }, env));
+    const manager = fakeManager();
+    const { calls, server } = fakeServer();
+    startChannelNotifier(manager, server, 'codex', undefined, env);
+    manager.emit(meta('/x', { state: 'completed' }), 'running');
+    assert.equal(calls.length, 1);
+  }
   const caps = withChannelCapabilities(
     { tools: {}, experimental: { other: { a: 1 } } as Record<string, object> },
     ON

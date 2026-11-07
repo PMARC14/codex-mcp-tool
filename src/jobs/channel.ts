@@ -6,7 +6,7 @@ import type { JobMeta, JobState, JobLogger } from './connector.js';
 /**
  * Opt-in Claude Code Channels push notifications for background job transitions.
  *
- * Enabled only by AGENT_JOBS_CHANNEL=1. The payload is metadata only: it never contains a worker's
+ * Enabled only by CLAUDE_AGENTS=1. The payload is metadata only: it never contains a worker's
  * final text, stdout, stderr or patch, because channel events are injected into the model's
  * context and job output would be a prompt-injection vector.
  */
@@ -29,7 +29,7 @@ export interface ChannelManager {
 
 type Env = Record<string, string | undefined>;
 
-export const channelEnabled = (env: Env = process.env): boolean => env.AGENT_JOBS_CHANNEL === '1';
+export const channelEnabled = (env: Env = process.env): boolean => env.CLAUDE_AGENTS === '1';
 
 /** Adds the claude/channel capability, keeping every existing capability. No-op when disabled. */
 export function withChannelCapabilities<T extends object>(
@@ -90,7 +90,7 @@ export function channelEvent(job: JobMeta, prefix: string) {
 
 /**
  * Starts pushing channel events for this manager's own jobs. Returns a stop function. Does nothing
- * (and returns a no-op) unless AGENT_JOBS_CHANNEL=1. Call after the server has connected.
+ * (and returns a no-op) unless CLAUDE_AGENTS=1. Call after the server has connected.
  */
 export function startChannelNotifier(
   manager: ChannelManager,
@@ -110,7 +110,7 @@ export function startChannelNotifier(
     const key = awaiting ? `${job.id}:input_required:${job.awaitingInput ? `question:${job.awaitingInput.qid}` : `${job.pendingApproval!.id}:${job.pendingApproval!.requestedAt}`}` : `${job.id}:${job.state}`;
     if (sent.has(key)) return;
     if (manager.store) {
-      if (!awaiting && existsSync(join(manager.store.dir(job.id), 'mcp-task.json'))) return;
+      if (existsSync(join(manager.store.dir(job.id), 'mcp-task.json'))) return;
       // Transport success cannot prove the client registered a channel listener.
       // Only the PostToolUse hook owns `woken`; channel attempts never suppress it.
       const marker = awaiting ? `channel-sent-${createHash('sha256').update(key).digest('hex')}` : 'channel-sent';
