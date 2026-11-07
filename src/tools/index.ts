@@ -1,4 +1,5 @@
 // Tool Registry Index - Registers all tools
+import { selftestTool, debugLogTool } from './debug-tools.js';
 import { toolRegistry } from './registry.js';
 import { askCodexTool } from './ask-codex.tool.js';
 import { batchCodexTool } from './batch-codex.tool.js';
@@ -36,7 +37,9 @@ toolRegistry.push(
   listSkillsTool,
   doActTool,
   imageGenTool,
-  codexUsageTool
+  codexUsageTool,
+  selftestTool,
+  debugLogTool
 );
 
 export * from './registry.js';

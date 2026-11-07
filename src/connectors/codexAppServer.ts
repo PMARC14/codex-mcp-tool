@@ -1,3 +1,8 @@
+import { readFileSync, statSync, unlinkSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { atomicWrite } from '../jobs/store.js';
+import { codexBridge } from './codexBridge.js';
 import type { JobEvent, JobSpec } from '../jobs/connector.js';
 import type { ApprovalDecision, StdinHandler, StdinPlan } from '../jobs/stdin.js';
 import { usageLimit } from '../jobs/usage-reset.js';
@@ -10,7 +15,7 @@ const errorEvent = (message: string, code?: string): JobEvent => ({
 });
 
 /** Protocol discovered with codex-cli 0.166.0 generate-json-schema / generate-ts. */
-export function buildAppServer(job: JobSpec, exe: string) {
+export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(job)) {
   const stdinPlan: StdinPlan = context => {
     let sequence = 1;
     let threadId: string | undefined;
@@ -21,6 +26,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
     let stopping = false;
     let controls = 0;
     let closeSoon: NodeJS.Immediate | undefined;
+    const nativeQuestions = new Map<string | number, { qid: string; questions: any[]; timer: NodeJS.Timeout; deadline: NodeJS.Timeout }>();
     const requests = new Map<number, { resolve(value: any): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
     const approvals = new Map<string | number, { kind: string; params: any; requestedAt: number; timer: NodeJS.Timeout }>();
     const initializeTimer = setTimeout(() => {
@@ -37,6 +43,53 @@ export function buildAppServer(job: JobSpec, exe: string) {
         requests.set(id, { resolve, reject, timer });
         context.apply({ write: wire({ id, method, params }) });
       });
+    };
+    const questionPath = join(dirname(job.finalPath), 'question.json');
+    const clearQuestion = (id: string | number) => {
+      const question = nativeQuestions.get(id);
+      if (!question) return;
+      clearInterval(question.timer); clearTimeout(question.deadline);
+      nativeQuestions.delete(id);
+      try { if (JSON.parse(readFileSync(questionPath, 'utf8')).id === question.qid) unlinkSync(questionPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') context.emit(errorEvent(`native question cleanup: ${String(error)}`)); }
+    };
+    const askQuestion = (message: any) => {
+      if (nativeQuestions.has(message.id)) return;
+      // Serialize questions so one on-disk mailbox always corresponds to one request.
+      try {
+        statSync(questionPath);
+        context.apply({ write: wire({ id: message.id, error: { code: -32600, message: 'Another orchestrator question is pending; retry after it is answered' } }) });
+        return;
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      const questions = message.params?.questions;
+      if (!Array.isArray(questions) || !questions.length || questions.some(q => typeof q.id !== 'string' || typeof q.question !== 'string')) {
+        context.apply({ write: wire({ id: message.id, error: { code: -32602, message: 'questions requires id and question' } }) });
+        return;
+      }
+      const qid = randomUUID();
+      atomicWrite(questionPath, JSON.stringify({ id: qid,
+        question: questions.map(q => `${q.id}: ${q.question}`).join('\n'),
+        options: questions.length === 1 ? questions[0].options?.map((o: any) => o.label) : undefined,
+        askedAt: Date.now() }));
+      const reply = (answer: string) => {
+        let keyed: Record<string, unknown> = {};
+        if (questions.length > 1) { try { keyed = JSON.parse(answer); } catch { /* A prose response applies to each question. */ } }
+        const answers = Object.fromEntries(questions.map(q => [q.id, {
+          answers: typeof keyed[q.id] === 'string' ? [keyed[q.id]] : [answer],
+        }]));
+        context.apply({ write: wire({ id: message.id, result: { answers } }) });
+        clearQuestion(message.id);
+      };
+      const timer = setInterval(() => {
+        const path = join(dirname(job.finalPath), `answer-${qid}.json`);
+        try {
+          if (statSync(path).isFile()) reply(JSON.parse(readFileSync(path, 'utf8')).answer);
+        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          context.emit(errorEvent(`native question answer: ${String(error)}`)); clearQuestion(message.id);
+        } }
+      }, 2000);
+      const deadline = setTimeout(() => reply('no answer within 1800 s; continue with your best judgement'), 1800000);
+      nativeQuestions.set(message.id, { qid, questions, timer, deadline });
     };
     const publishApproval = () => {
       const first = approvals.entries().next().value;
@@ -89,6 +142,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
       sandbox: { read: 'read-only', write: 'workspace-write', trusted: 'danger-full-access', full: 'danger-full-access' }[job.mode],
       approvalPolicy: job.mode === 'trusted' || job.mode === 'full' ? 'never' : 'on-request',
       config: {
+        ...bridge.config,
         ...(job.effort ? { model_reasoning_effort: job.effort } : {}),
         ...(job.worktree && job.mode === 'write' ? { 'sandbox_workspace_write.writable_roots': [job.worktree.gitDir] } : {}),
       },
@@ -100,7 +154,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
       });
       threadId = result.thread.id;
       context.emit({ sessionId: threadId });
-      await startTurn(job.prompt);
+      await startTurn(bridge.prompt);
     };
     const handler: StdinHandler = (line, stream) => {
       if (disposed || stream !== 'stdout') return;
@@ -122,6 +176,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
           else pending.resolve(message.result);
         }
       } else if (message.id !== undefined && message.method) {
+        if (message.method === 'item/tool/requestUserInput') { askQuestion(message); return; }
         const kind = ({
           'item/commandExecution/requestApproval': 'commandExecution',
           'item/fileChange/requestApproval': 'fileChange',
@@ -139,6 +194,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
         turnId = message.params.turn.id;
         completed = false;
       } else if (message.method === 'serverRequest/resolved' && message.params.threadId === threadId) {
+        clearQuestion(message.params.requestId);
         const approval = approvals.get(message.params.requestId);
         if (approval) {
           clearTimeout(approval.timer);
@@ -150,6 +206,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
         if (turnId && message.params.turn.id !== turnId) return;
         turnId = undefined;
         completed = true;
+        for (const id of nativeQuestions.keys()) clearQuestion(id);
         for (const approval of approvals.values()) clearTimeout(approval.timer);
         approvals.clear();
         context.emit({ pendingApproval: null });
@@ -191,6 +248,7 @@ export function buildAppServer(job: JobSpec, exe: string) {
       disposed = true;
       clearTimeout(initializeTimer);
       clearImmediate(closeSoon);
+      for (const id of nativeQuestions.keys()) clearQuestion(id);
       for (const pending of requests.values()) { clearTimeout(pending.timer); pending.reject(new Error('app-server exited')); }
       requests.clear();
       for (const approval of approvals.values()) clearTimeout(approval.timer);

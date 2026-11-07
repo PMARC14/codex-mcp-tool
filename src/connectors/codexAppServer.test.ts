@@ -50,10 +50,13 @@ readline.createInterface({input: process.stdin}).on('line', line => {
     assert.equal(m.params.input[0].type, 'text');
     assert.deepEqual(m.params.input[0].text_elements, []);
     turnId = 'turn-' + ++count;
-    try { options = JSON.parse(m.params.input[0].text); } catch { options = {}; }
+    try { options = JSON.parse(m.params.input[0].text.replace(/^If you need a decision[^\n]*\n\n/, '')); } catch { options = {}; }
     reply(m.id, {turn: turn()});
     notify('turn/started', {threadId, turn: turn()});
-    if (options.approval) {
+    if (options.question) {
+      send({id:'native-question',method:'item/tool/requestUserInput',params:{threadId,turnId,itemId:'native-item',isBlocking:true,
+        questions:[{id:'choice',header:'Choice',question:'Native question?',options:[{label:'A',description:'first'},{label:'B',description:'second'}]}]}});
+    } else if (options.approval) {
       const kind = options.approval;
       send({id: 'approval-1', method: 'item/' + kind + '/requestApproval', params: {
         threadId, turnId, itemId: 'item', kind: 'command', startedAtMs: Date.now(),
@@ -80,6 +83,9 @@ readline.createInterface({input: process.stdin}).on('line', line => {
     assert.equal(m.params.turnId, turnId);
     reply(m.id, {});
     if (!options.ignoreInterrupt) notify('turn/completed', {threadId, turn: turn('interrupted')});
+  } else if (m.id === 'native-question' && !m.method) {
+    assert.deepEqual(Object.keys(m.result.answers), ['choice']);
+    complete(m.result.answers.choice.answers[0]);
   } else if (m.id === 'approval-1' && !m.method) {
     complete('approval answered');
   } else throw new Error('Unexpected method ' + m.method);
@@ -311,4 +317,21 @@ test('late completion cannot close a replacement turn and failed replacement clo
       }
     } finally { handler.dispose!(); }
   }
+});
+
+
+test('native app-server requestUserInput uses the same question mailbox and response flow', async () => {
+  const f = setup();
+  try {
+    const { jobId } = await f.manager.start({ cwd: f.home, prompt: JSON.stringify({ question: true }), transport: 'app-server' });
+    await until(() => !!f.manager.store.get(jobId).awaitingInput, 'native question');
+    const job = f.manager.store.get(jobId);
+    assert.match(job.awaitingInput!.question, /Native question/);
+    assert.deepEqual(job.awaitingInput!.options, ['A', 'B']);
+    assert.match(progressMessage(f.manager, job), /awaiting answer/);
+    await f.manager.respond(jobId, { answer: 'B' });
+    await until(() => f.manager.store.get(jobId).state === 'completed');
+    assert.equal((await f.manager.result(jobId)).final, 'B');
+    assert.deepEqual(f.messages().find(m => m.id === 'native-question' && m.result).result, { answers: { choice: { answers: ['B'] } } });
+  } finally { await f.cleanup(); }
 });

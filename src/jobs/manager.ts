@@ -1,5 +1,6 @@
+import { bridgeSampler, answerBridge } from './bridge.js';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve, win32 } from 'node:path';
 import { existsSync } from 'node:fs';
 import type {
@@ -275,7 +276,7 @@ export class JobManager {
         effort: options.effort,
         label: options.label,
         resumeSession: options.resumeSession,
-        transport: options.transport ?? 'exec',
+        transport: options.transport ?? this.config.connectors[this.connector.id]?.defaultTransport ?? 'exec',
         approvalTimeoutMin: options.approvalTimeoutMin ?? 30,
         steers: 0,
         timeoutMin,
@@ -379,6 +380,7 @@ export class JobManager {
     if (!this.owns(job)) throw new Error('Only the owning server can steer this job');
     if (job.state !== 'running') throw new Error('Only a running job can be steered');
     if (!message.trim()) throw new Error('Steer message must not be blank');
+    if (job.awaitingInput) { await this.respond(jobId, { answer: message }); return { delivered: 'answer' as const }; }
     const active = this.active.get(jobId);
     if (!active?.process.steer) throw new Error(`this job can't take mid-turn messages; use ${this.connector.id}_job_send after it stops, or start it with transport: app-server`);
     if (active.cancelled) throw new Error('Job is stopping');
@@ -389,10 +391,20 @@ export class JobManager {
     return { delivered };
   }
 
-  async respond(jobId: string, decision: ApprovalDecision) {
+  async respond(jobId: string, decision: ApprovalDecision | { answer: string; qid?: string }) {
     await this.initialize();
     const job = this.store.get(jobId);
     if (!this.owns(job)) throw new Error('Only the owning server can respond to this job');
+    if (typeof decision === 'object') {
+      const active = this.active.get(jobId);
+      if (job.state !== 'running' || !active || active.cancelled) throw new Error('No pending question for this running job');
+      answerBridge(this.store, job, decision.answer, decision.qid);
+      active.job.awaitingInput = undefined;
+      active.job.stalled = false;
+      active.job.stalledSince = undefined;
+      this.store.save(active.job, this.owner);
+      return { responded: true };
+    }
     if (!['accept', 'acceptForSession', 'decline', 'cancel'].includes(decision)) throw new Error('Invalid approval decision');
     const active = this.active.get(jobId);
     if (job.state !== 'running' || !job.pendingApproval || !active?.process.respond || active.cancelled)
@@ -578,10 +590,14 @@ export class JobManager {
     let lastGrowth = Date.now();
     try {
       const prompt = this.store.read(job.id, 'prompt');
+      try { unlinkSync(join(this.store.dir(job.id), 'question.json')); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       atomicWrite(job.finalPath, '');
       job.finishedAt = undefined;
       job.error = undefined;
       job.pendingApproval = undefined;
+      job.awaitingInput = undefined;
+      job.progressNote = undefined;
       job.approvalReason = undefined;
       job.exitCode = undefined;
       const command = this.connector.build({
@@ -651,6 +667,7 @@ export class JobManager {
         .then(async outcome => {
           workerDone = true;
           job.pendingApproval = undefined;
+          job.awaitingInput = undefined;
           killFailed = outcome.killFailed ?? false;
           clearTimeout(timer);
           if (event.final && !(await this.store.page(job.id, 'final', 0, 20000)).text.trim())
@@ -707,8 +724,13 @@ export class JobManager {
           if (!this.active.size) this.hold.stop();
           void this.pump().catch(error => this.logger.warn('Job queue error', error));
         });
+      const sampleBridge = bridgeSampler(this.store, job);
       this.active.set(job.id, { job, process, finished, cancelled: false, sample: () => {
-        if (job.pendingApproval) { lastGrowth = Date.now(); return; }
+        if (!workerDone && job.state === 'running') {
+          try { if (sampleBridge()) this.store.save(job, this.owner); }
+          catch (error) { this.logger.warn(`Job ${job.id} bridge sample failed`, error); }
+        }
+        if (job.pendingApproval || job.awaitingInput) { lastGrowth = Date.now(); return; }
         if (workerDone || job.state !== 'running' || !(job.stallTimeoutMin ?? 10) || stalledKill) return;
         const current = [statSync(this.store.path(job.id, 'stdout')).size, statSync(this.store.path(job.id, 'stderr')).size];
         const now = Date.now();
@@ -966,6 +988,8 @@ export class JobManager {
         reserved: false,
         sessionId: undefined,
         pendingApproval: undefined,
+        awaitingInput: undefined,
+        progressNote: undefined,
         approvalReason: undefined,
         steers: 0,
         reason: undefined,

@@ -110,11 +110,13 @@ test('watch timeout leaves the job running and emits nothing when no progress ca
   }
 });
 
-test('cancelling a watch removes transition/abort listeners and both timers without stopping the job', async () => {
+test('cancelling a watch removes transition/abort listeners and both timers without stopping the job', async t => {
   const s = setup(10);
   const controller = new AbortController();
   try {
     await s.manager.initialize();
+    // Freeze only timers created by the watch; manager initialization is already complete.
+    (t.mock as any).timers.enable({ apis: ['setTimeout', 'setInterval'] });
     const job = meta(s.f.home, { state: 'running' });
     s.manager.store.create(job, 'p');
     let listeners = 0;
@@ -138,12 +140,14 @@ test('cancelling a watch removes transition/abort listeners and both timers with
       return get(id);
     };
     const messages: string[] = [];
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
     const pending = s.watch.execute(
       { jobId: job.id, maxWaitSec: 0.08 },
-      text => messages.push(text),
+      text => { messages.push(text); started(); },
       controller.signal
     );
-    await until(() => messages.length > 0);
+    await ready;
     assert.equal(listeners, 1);
     assert.equal(getEventListeners(controller.signal, 'abort').length, 1);
     controller.abort();
@@ -153,7 +157,7 @@ test('cancelling a watch removes transition/abort listeners and both timers with
     assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
     const readsAtCancel = reads;
     const messagesAtCancel = messages.length;
-    await delay(120); // Beyond both the injected heartbeat and the deadline.
+    (t.mock as any).timers.tick(1000); // Deterministically pass both cleared timers.
     assert.equal(reads, readsAtCancel, 'neither timer reads the store after cancellation');
     assert.equal(messages.length, messagesAtCancel);
     assert.equal(get(job.id).state, 'running');
@@ -161,6 +165,7 @@ test('cancelling a watch removes transition/abort listeners and both timers with
     assert.equal(messages.length, messagesAtCancel);
   } finally {
     controller.abort();
+    (t.mock as any).timers.reset();
     await s.cleanup();
   }
 });

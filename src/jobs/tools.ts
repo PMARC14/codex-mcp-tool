@@ -43,7 +43,7 @@ export function registerJobTools(
   };
   add(
     'job_start',
-    'Start a background CLI job and return its ID immediately. Default mode is read; full mode bypasses approvals and sandboxing and must be explicitly requested. Use status/result to check completion.',
+    'Start a background CLI job and return its ID immediately. Default mode is read; full mode bypasses approvals and sandboxing and must be explicitly requested. Use status/result to check completion. use transport app-server if you may need to message the job mid-work (`codex_job_steer`); exec jobs can\'t be steered.',
     z
       .object({
         prompt: z
@@ -95,7 +95,7 @@ export function registerJobTools(
           .optional()
           .describe('Native CLI session ID to resume, from an earlier result.'),
         ...(prefix === 'codex' ? {
-          transport: z.enum(['exec', 'app-server']).default('exec').describe('Opt in to app-server for steering and interactive approvals.'),
+          transport: z.enum(['exec', 'app-server']).optional().describe('Use app-server for steering and interactive approvals; omitted uses the configured default (exec).'),
           approvalTimeoutMin: z.number().positive().default(30),
         } : {}),
         idempotencyKey: z.string().min(1).optional(),
@@ -176,15 +176,16 @@ export function registerJobTools(
   );
   add(
     'job_steer',
-    'Message a running job owned by this server. Requires a connector with interactive stdin (Codex: transport app-server). Returns mid-turn or queued delivery.',
+    'Message a running job owned by this server. Answers a pending bridge question first (including exec jobs); otherwise requires a connector with interactive stdin (Codex: transport app-server). Returns mid-turn or queued delivery.',
     z.object({ jobId, message: z.string().min(1).refine(message => !!message.trim(), 'Message must not be blank') }),
     args => manager.steer(args.jobId, args.message)
   );
   if (prefix === 'codex') add(
     'job_respond',
-    'Answer a running app-server job approval. Inspect pendingApproval in job_status first.',
-    z.object({ jobId, decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']) }),
-    args => manager.respond(args.jobId, args.decision)
+    'Answer a running job question with answer, or an app-server approval with decision. Inspect awaitingInput/pendingApproval in job_status first.',
+    z.object({ jobId, decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']).optional(), answer: z.string().trim().min(1).max(20000).optional() })
+      .refine(args => (args.decision === undefined) !== (args.answer === undefined), { message: 'Provide exactly one of answer or decision' }),
+    args => manager.respond(args.jobId, args.answer !== undefined ? { answer: args.answer } : args.decision)
   );
   add(
     'job_cancel',
@@ -212,7 +213,7 @@ export function registerJobTools(
     z.object({
       jobId,
       name: z
-        .enum(['final', 'stdout', 'stderr', 'patch', 'prompt', 'verify', 'reasoning'])
+        .enum(['final', 'stdout', 'stderr', 'patch', 'prompt', 'verify', 'reasoning', 'notes'])
         .describe('Saved output or full original prompt to read.'),
       offset: z.number().int().min(0).default(0).describe('Zero-based character offset.'),
       limit: z

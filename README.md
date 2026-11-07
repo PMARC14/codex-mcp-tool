@@ -282,3 +282,8 @@ MIT License. Not affiliated with OpenAI.
 ---
 
 [Documentation](https://x51xxx.github.io/codex-mcp-tool/) | [Issues](https://github.com/x51xxx/codex-mcp-tool/issues) | Inspired by [jamubc/gemini-mcp-tool](https://github.com/jamubc/gemini-mcp-tool)
+
+
+Background-task compatibility is tested against Claude Code 2.1.319's status-discriminated schemas. Agents have named status lines and immediate task notes. Use `codex_selftest` after reconnecting to validate the live server without starting a CLI/model, and `codex_debug_log` for redacted, rotating traffic logs. Set `connectors.codex.defaultTransport` in `~/.agent-jobs/config.json` or `AGENT_JOBS_CODEX_TRANSPORT` to `exec` (default) or `app-server`; choose `app-server` when you may need `codex_job_steer`. See [agent jobs](docs/agent-jobs.md).
+
+Workers can now call the per-job `ask_orchestrator` and `report_progress` bridge tools. Pending questions appear as `awaiting answer`; respond with `codex_job_respond { jobId, answer }` or `codex_job_steer`, or use the task's elicitation form. Native app-server questions use the same flow. Read milestone notes with `codex_job_read { jobId, name: "notes" }`. Bridge settings are injected per run and leave global CLI configuration unchanged.

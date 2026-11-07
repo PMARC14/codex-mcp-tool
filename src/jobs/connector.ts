@@ -48,6 +48,8 @@ export type FailureReason = 'quota_exhausted' | 'timeout' | 'cancelled' | 'stall
 
 export interface JobMeta extends Omit<JobSpec, 'prompt'> {
   steers?: number;
+  awaitingInput?: { qid: string; question: string; options?: string[]; askedAt: number };
+  progressNote?: string;
   pendingApproval?: { id: string | number; kind: string; summary: string; requestedAt: number };
   approvalReason?: 'approval_timeout';
   verify?: { command: string; exitCode: number | null; passed: boolean; durationSec: number; timedOut: boolean };
@@ -100,4 +102,7 @@ export interface Connector {
   build(job: JobSpec): { exe: string; args: string[]; stdin: string; stdinPlan?: StdinPlan };
   parse(line: string, stream: 'stdout' | 'stderr'): JobEvent | null;
   sandboxDirs(job: JobSpec): string[];
+  /** Future connectors may return temporary project config files for their bridge. */
+  bridgeConfig?(job: JobSpec): { args?: string[]; files?: { path: string; content: string; cleanup: boolean }[] };
+
 }

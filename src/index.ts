@@ -20,6 +20,7 @@ import {
   CallToolResult,
   CreateTaskResult,
 } from '@modelcontextprotocol/sdk/types.js';
+import { installRequestErrorReporting, trafficLog } from './tools/traffic-log.js';
 import { Logger } from './utils/logger.js';
 import { PROTOCOL, ToolArguments } from './constants.js';
 
@@ -58,6 +59,7 @@ const server = new Server(
     ...(CHANNEL_INSTRUCTIONS ? { instructions: CHANNEL_INSTRUCTIONS } : {}),
   }
 );
+installRequestErrorReporting(server);
 const mcpTasks = registerMcpTasks(server, 'codex', codexJobManager, {
   capabilities, instructions: CHANNEL_INSTRUCTIONS,
 });
@@ -224,6 +226,7 @@ server.setRequestHandler(
         if (progressData) stopProgressUpdates(progressData, false);
 
         Logger.error(`Error in tool '${toolName}':`, error);
+        trafficLog.error(`tools/call ${toolName}`, error);
 
         const errorMessage = error instanceof Error ? error.message : String(error);
 
@@ -235,6 +238,7 @@ server.setRequestHandler(
             },
           ],
           isError: true,
+          structuredContent: { error: { code: -32603, message: `tools/call ${toolName}: ${errorMessage}`, step: toolName } },
         };
       }
     } else {

@@ -1,7 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CodexConnector, usageReset } from './codex.js';
+import { CodexConnector as RealCodexConnector, usageReset } from './codex.js';
 import type { JobSpec } from '../jobs/connector.js';
+
+// Keep version discovery fake too; injecting only login probes previously leaked --version.
+class CodexConnector extends RealCodexConnector {
+  protected async versionCheck() {
+    const version = { major: 0, minor: 166, patch: 0, raw: 'fake-0.166.0', isValid: true };
+    return { version, minimum: { ok: true, version } };
+  }
+}
 
 const binary = () => ({
   resolved: true,
@@ -50,7 +58,8 @@ for (const [mode, expected] of [
           baseSha: 'abc',
         },
       });
-      assert.equal(command.stdin, spec.prompt);
+      assert.ok(command.stdin.endsWith(spec.prompt));
+      assert.ok(command.stdin.startsWith('If you need a decision or information'));
       assert.equal('stdinPlan' in command, false, 'Codex still writes the prompt and closes stdin');
       assert.equal(command.args.includes(spec.prompt), false);
       assert.ok(command.args.includes(expected));

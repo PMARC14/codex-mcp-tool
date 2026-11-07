@@ -1,3 +1,4 @@
+import { codexBridge } from './codexBridge.js';
 import type { Connector, JobEvent, JobSpec } from '../jobs/connector.js';
 import {
   resolveBinary,
@@ -72,6 +73,10 @@ export class CodexConnector implements Connector {
     return this.loginStatusPromise;
   }
 
+  protected async versionCheck() {
+    return { version: await getCodexVersion(), minimum: await checkMinimumCodexVersion() };
+  }
+
   async detect() {
     const resolution = this.resolve();
     if (!resolution.resolved)
@@ -79,8 +84,7 @@ export class CodexConnector implements Connector {
         available: false,
         reason: describeUnresolvedBinary('codex', resolution, CODEX_PATH_ENV),
       };
-    const version = await getCodexVersion();
-    const minimum = await checkMinimumCodexVersion();
+    const { version, minimum } = await this.versionCheck();
     if (!version.isValid || !minimum.ok)
       return {
         available: false,
@@ -135,9 +139,12 @@ export class CodexConnector implements Connector {
     return job.worktree ? [job.worktree.gitDir] : [];
   }
 
+  bridgeConfig(job: JobSpec) { return codexBridge(job); }
+
   build(job: JobSpec) {
-    if (job.transport === 'app-server') return buildAppServer(job, this.resolve().command);
-    const args: string[] = [];
+    if (job.transport === 'app-server') return buildAppServer(job, this.resolve().command, this.bridgeConfig(job));
+    const bridge = this.bridgeConfig(job);
+    const args: string[] = [...bridge.args];
     // Sandbox flags are global; exec resume accepts only a subset of exec flags.
     if (job.mode === 'full') args.push('--dangerously-bypass-approvals-and-sandbox');
     else args.push('-s', { read: 'read-only', write: 'workspace-write', trusted: 'danger-full-access' }[job.mode]);
@@ -148,7 +155,7 @@ export class CodexConnector implements Connector {
     if (job.resumeSession) args.push('resume', job.resumeSession);
     // Advice and debate jobs run outside any repo; Codex refuses those without this.
     args.push('--skip-git-repo-check', '--json', '-o', job.finalPath, '-');
-    return { exe: this.resolve().command, args, stdin: job.prompt };
+    return { exe: this.resolve().command, args, stdin: bridge.prompt };
   }
 
   parse(line: string, _stream: 'stdout' | 'stderr'): JobEvent | null {

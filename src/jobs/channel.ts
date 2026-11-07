@@ -65,8 +65,9 @@ const safe = (value: string | undefined, max: number): string | undefined => {
 
 /** Builds the metadata-only event for a job; never reads job output. */
 export function channelEvent(job: JobMeta, prefix: string) {
-  const awaiting = job.state === 'running' && !!job.pendingApproval;
+  const awaiting = job.state === 'running' && !!(job.pendingApproval || job.awaitingInput);
   const meta: Record<string, string> = { job_id: job.id, state: awaiting ? 'input_required' : job.state, agent: prefix };
+  if (job.awaitingInput && awaiting) meta.kind = 'question';
   const label = safe(job.label, 40);
   if (label) meta.label = label;
   const reason = safe(job.reason, 40);
@@ -102,15 +103,15 @@ export function startChannelNotifier(
   const sent = new Set<string>();
   let stopped = false;
   const notify = (job: JobMeta, previous: JobState | undefined) => {
-    const awaiting = job.state === 'running' && !!job.pendingApproval;
+    const awaiting = job.state === 'running' && !!(job.pendingApproval || job.awaitingInput);
     if (!awaiting && (job.state === 'queued' || job.state === 'running')) { for (const key of sent) if (key.startsWith(`${job.id}:`) && !key.includes(':input_required:')) sent.delete(key); }
     if (stopped || (!awaiting && (!NOTIFY_STATES.includes(job.state) || previous === job.state))) return;
     if (!manager.isOwn(job)) return;
-    const key = awaiting ? `${job.id}:input_required:${job.pendingApproval!.id}:${job.pendingApproval!.requestedAt}` : `${job.id}:${job.state}`;
+    const key = awaiting ? `${job.id}:input_required:${job.awaitingInput ? `question:${job.awaitingInput.qid}` : `${job.pendingApproval!.id}:${job.pendingApproval!.requestedAt}`}` : `${job.id}:${job.state}`;
     if (sent.has(key)) return;
     if (manager.store) {
       if (!awaiting && existsSync(join(manager.store.dir(job.id), 'mcp-task.json'))) return;
-      const marker = awaiting ? `approval-woken-${createHash('sha256').update(key).digest('hex')}` : 'woken';
+      const marker = awaiting ? `${job.awaitingInput ? 'question' : 'approval'}-woken-${createHash('sha256').update(key).digest('hex')}` : 'woken';
       try { writeFileSync(join(manager.store.dir(job.id), marker), '', { flag: 'wx' }); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') logger?.warn('Unable to create channel marker', error);

@@ -10,10 +10,10 @@ The existing synchronous tools remain available. The `codex_*` job tools provide
 | `codex_job_watch`        | Wait for a job to stop or pause, returning the result plus `watchedSec` and `timedOut`. `maxWaitSec` defaults to 1,800 and is capped at 7,200. |
 | `codex_job_send`         | Send `message` to a stopped job's session as a new resumed job. Optional `mode`, `model`, `effort`, and `timeoutMin` override inherited settings. Returns `{ jobId, state, followUpOf }`. |
 | `codex_job_steer`        | Send `{ jobId, message }` to an owned running job with interactive stdin. Returns `{ delivered: "mid-turn" \| "queued" }`. Codex requires `transport: "app-server"`. |
-| `codex_job_respond`      | Answer an owned app-server job's pending approval: `{ jobId, decision: "accept" \| "acceptForSession" \| "decline" \| "cancel" }`. |
+| `codex_job_respond`      | Answer an owned job question with `{ jobId, answer }`, or an app-server pending approval: `{ jobId, decision: "accept" \| "acceptForSession" \| "decline" \| "cancel" }`. |
 | `codex_job_cancel`       | Stop an owned job's process tree and wait for termination, up to 10 seconds.                                                                                             |
 | `codex_job_list`         | Recent jobs from the shared store, newest first.                                                                                                                         |
-| `codex_job_read`         | Read `prompt`, `stdout`, `stderr`, `final`, `patch`, or `verify` by character offset, at most 20,000 characters per page.                                                          |
+| `codex_job_read`         | Read `prompt`, `stdout`, `stderr`, `final`, `patch`, `verify`, or `notes` by character offset, at most 20,000 characters per page.                                                          |
 | `codex_job_requeue`      | Create a new queued job from a paused, lost, or failed job's saved prompt. Optional `model` overrides the model; optional `agent: "agy"` hands it to the sibling server. |
 | `codex_worktree_collect` | Save a binary patch and diff stat, then optionally remove the worktree or worktree and branch.                                                                           |
 | `codex_usage`            | Read live Codex quota, with a marked session-log fallback. |
@@ -43,7 +43,7 @@ The default mode is `read` (`read-only`) for inspection. `write` allows edits in
 
 ## Steering and the opt-in Codex app-server transport
 
-`codex_job_start` accepts `transport: "exec" | "app-server"`, defaulting to `exec`. The default retains its existing CLI arguments and prompt write-and-close behavior. `app-server` instead launches `codex app-server` through the same process runner, Windows Job Object, hidden-window handling, log files and process-tree cleanup. Transport and `approvalTimeoutMin` are saved in metadata and inherited by send and requeue.
+`codex_job_start` accepts `transport: "exec" | "app-server"`. Omission uses `AGENT_JOBS_CODEX_TRANSPORT`, then `config.json` `connectors.codex.defaultTransport`, then `exec`. The default retains its existing CLI arguments and prompt write-and-close behavior. `app-server` instead launches `codex app-server` through the same process runner, Windows Job Object, hidden-window handling, log files and process-tree cleanup. Transport and `approvalTimeoutMin` are saved in metadata and inherited by send and requeue.
 
 ```json
 {
@@ -101,6 +101,7 @@ Task IDs equal job IDs. State and results come from the shared job store; a smal
 | --- | --- | --- |
 | queued, running | `working` | The same bounded progress line as ordinary watch |
 | running with pendingApproval | `input_required` | awaiting approval |
+| running with awaitingInput | `input_required` | awaiting answer |
 | paused | `working` | Paused until the ISO reset time, or reset time unknown |
 | completed | `completed` | Watch progress line |
 | failed, lost | `failed` | Watch progress line |
@@ -109,38 +110,71 @@ Task IDs equal job IDs. State and results come from the shared job store; a smal
 
 Polling is suggested every 15,000 ms. Status reads use saved metadata and a bounded stdout tail; they never spawn a process or probe process liveness. The server sends `notifications/tasks/status` on local state transitions only for tasks started or adopted through the current connection. Closing the connection removes its subscription and leaves workers running. Foreign writes are visible on polling. `tasks/result` waits for a terminal state using transitions plus a 5-second metadata check, and returns exactly the same JSON text and MCP content wrapper as `codex_job_result`. Cancelling that pending request only stops the wait; `tasks/cancel` stops the job. Requested TTLs do not shorten job retention: `ttl` / `ttlMs` is `null`, with no separate task expiry timer; the existing cleanup of terminal jobs older than seven days still applies.
 
-### Negotiation and wire shapes
+### Negotiation and wire shapes (Claude Code 2.1.319)
 
-The installed SDK inspected during implementation is `@modelcontextprotocol/sdk` **1.32.2**. It supports the **2025-11-25** task schemas, tool execution metadata, experimental task helpers, and raw request handlers. It does not implement 2026-07-28 discovery or result envelopes. No dependency change is needed: `src/tools/mcp-tasks.ts` provides the task handlers and a stdio envelope adapter for the newer era.
+Claude Code 2.1.319 discovers `2026-07-28` using `server/discover` and the `io.modelcontextprotocol/tasks` extension. Task permission is per call: `_meta["io.modelcontextprotocol/protocolVersion"]` is `"2026-07-28"`, and `_meta["io.modelcontextprotocol/clientCapabilities"].extensions["io.modelcontextprotocol/tasks"]` is `{}`. Without that extension, start/watch retain ordinary behavior. No channel flag is required; client feature gates still control backgrounding and wake delivery.
 
-The 2025 initialize handshake advertises `tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } }`. `tools/list` includes `execution: { taskSupport: "optional" }` on just the two tools. A legacy task request is:
+Create returns `{ resultType: "task", taskId, status, statusMessage, createdAt, lastUpdatedAt, ttlMs: null, pollIntervalMs: 15000, _meta }`. Modern get/cancel and each list entry/status notification use the status-discriminated task shape, without a `resultType` envelope:
 
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex_job_start","arguments":{"prompt":"Inspect this repository","cwd":"C:/repo"},"task":{}}}
+- `working` for queued/running/paused jobs;
+- `input_required` with `inputRequests: {}` for approvals answered via `codex_job_respond`, or a keyed `elicitation/create` form for bridge/native questions;
+- `completed` with `result: { content, isError }`, identical to `codex_job_result`;
+- `failed` for failed/lost jobs, with `error.message` containing failureReason and a short reason; `result` remains available for diagnostics;
+- `cancelled` for killed jobs.
+
+`tasks/result` still returns the tool content wrapper. The previous terminal `{ resultType: "complete", content, ... }` get reply lacked `status` and failed the client's union parser. Vendored Zod schemas in `src/tools/client-schemas.ts` mirror the binary's `_`, `re`, `X_a`, `se` and input-request schemas; raw stdio contract tests validate modern replies against them.
+
+The isolated 2025 SDK adapter and its tests remain for clients using the installed MCP SDK's task helpers and `initialize` negotiation. They use `{ task: ... }`, `ttl`, and `pollInterval`. Claude Code 2.1.319 explicitly no longer restores that era's tasks and uses only the modern path. Keeping this compatibility adapter requires no legacy dependency or separate scheduler.
+
+Task-start `_meta["com.anthropic/agent-task"]` contains `kind: "codex-agent"`, `taskId`, an existing valid native `sessionId` when available, and a one-line `modelImmediateResponse` naming the agent and supported controls. Binary inspection (Python mmap, no execution) found that kind/sessionId are validated and forwarded through `sdkAgentTaskMeta`; there is no use of those fields to rename the terminal `/tasks` row. Names therefore come from statusMessage: `<connector> <model> · <label> | <state> | <elapsed> | <step>`.
+
+The binary's `boundMcpStatusMessage` replaces Unicode Cc/Cf/Cs/Zl/Zp and variation selectors with spaces, collapses spaces, trims, and truncates at 10,000 characters plus `… [truncated]`. Our one-line messages remain capped at 120 characters. Task/session IDs and input methods are at most 128 printable non-space ASCII characters (`/^[\x21-\x7e]+$/`); kind has the same regex and a 64-character cap. The immediate-response schema cap is 20,000 (the client also sanitizes and bounds its displayed note).
+
+### Live diagnostics
+
+`codex_selftest` exercises the real stdio transport and task handlers in-process with an isolated fake manager, through start, get/list/result, terminal states, cancellation and notifications. It validates replies against the vendored client schemas and returns per-step pass/fail plus `logPath`. It never starts a CLI or model. `codex_debug_log { lines: 50 }` returns the last 1-200 lines of this server's traffic log.
+
+Every incoming/outgoing JSON-RPC message is summarized in `~/.agent-jobs/logs/codex-<pid>.ndjson` (`AGENT_JOBS_HOME` changes the root). Entries include timestamp, direction, method/id, original byte size, and a summary capped at 2 KB. Tool arguments have a combined 200-character preview; prompts, messages, text, reasoning and worker content are redacted. Rotation occurs at 5 MB, keeping the active file and two backups. `AGENT_JOBS_DEBUG=full` raises the summary cap to 16 KB while retaining redaction. Handler exceptions log their stack and return an MCP error naming the failing method/field; ordinary tool failures include structured error details.
+
+## Worker-to-orchestrator bridge
+
+Codex jobs automatically inject the built `dist/bridge/agent-bridge.js` stdio MCP server when that file exists, using per-run overrides. They add this preamble only while the bridge is active: "If you need a decision or information from the orchestrator, call `ask_orchestrator`; use `report_progress` for milestone notes." Missing bridge builds preserve the original prompt and do not inject configuration. No global Codex configuration is modified.
+
+`ask_orchestrator { question, options?, timeoutSec? }` atomically writes `jobs/<id>/question.json` as `{ id, question, options, askedAt }`. It checks for `answer-<qid>.json` with a timer and `statSync` every two seconds, reading only when the file exists. It returns the answer text, or `no answer within N s; continue with your best judgement`. The default wait is 1,800 seconds; the maximum is 86,400. Questions are serialized per job, and cancellation/timeout clears the mailbox. Job wall-clock timeouts still apply. `report_progress { note }` appends `{ ts, note }` to `notes.ndjson` and returns immediately. The latest note supplies the progress step (at most 80 characters); `codex_job_read { jobId, name: "notes" }` reads saved notes.
+
+The manager's existing 500 ms sampler stats the question and notes files; it reads only changed files. Pending metadata is `awaitingInput: { qid, question, options, askedAt }`, with the question capped at 500 characters. While pending, progress/task status says `awaiting answer` and stall detection waits. Answer with `codex_job_respond { jobId, answer }`. `codex_job_steer { jobId, message }` also answers a pending question (including exec jobs) and returns `delivered: "answer"`; when no question is pending, the existing app-server steering requirement applies. Answers are saved atomically and clear `awaitingInput`.
+
+Modern tasks publish `status: "input_required"` and `inputRequests[qid] = { method: "elicitation/create", params: { mode: "form", message, requestedSchema } }`. The schema has one required string property `answer`, using `enum` when options are supplied. Claude Code 2.1.319's task driver sends `{ taskId, inputResponses: { [qid]: { action: "accept", content: { answer } } } }` to `tasks/update`. The server writes the answer and resumes polling; decline/cancel supplies a best-judgement response to the worker. Duplicate acknowledged updates are idempotent; stale keys cannot answer newer questions. This path round-trips through `TaskStdioTransport` in fake-worker tests. It does not require `requestState`: that belongs to the client's separate multi-round ordinary-call envelope, whereas the task driver keys answers by task ID and question ID. Elicitation asks the **user** when the client can show a form; the orchestrator may instead answer through respond/steer. Client sessions that cannot show elicitation can cancel such tasks, according to their own policy.
+
+Native app-server `item/tool/requestUserInput` requests use the same question mailbox. Responses use the generated schema's `{ answers: { [nativeQuestionId]: { answers: [text] } } }`. For multiple native questions, supply a JSON object mapping native question IDs to answer strings, or a prose answer applied to each. Completion, server-side resolution and disposal clear native-question timers. The bridge is the question path for headless exec; native `request_user_input` is not enabled there.
+
+### Exact injection and discovery
+
+Discovery used only local `codex --help`, `codex mcp --help`, `codex mcp add --help`, `codex app-server generate-json-schema --experimental`, and `codex ... mcp get agent_bridge --json` to validate TOML config parsing. These commands do not start a model turn. The generated `ThreadStartParams`/`ThreadResumeParams` accept object-valued `config`; `ToolRequestUserInputParams`/`Response` supply the native question contract.
+
+Exec receives these argv pairs (each override is one argv element, without shell quotes around it; JSON string encoding supplies valid TOML escaping for Windows paths):
+
+```text
+-c mcp_servers.agent_bridge.command="<absolute node executable>"
+-c mcp_servers.agent_bridge.args=["<absolute path>/dist/bridge/agent-bridge.js"]
+-c mcp_servers.agent_bridge.env.AGENT_JOBS_HOME="<absolute jobs home>"
+-c mcp_servers.agent_bridge.env.AGENT_JOB_ID="<job id>"
+-c mcp_servers.agent_bridge.enabled=true
+-c mcp_servers.agent_bridge.enabled_tools=["ask_orchestrator","report_progress"]
+-c mcp_servers.agent_bridge.tool_timeout_sec=86500
+-c mcp_servers.agent_bridge.tools.ask_orchestrator.approval_mode="approve"
+-c mcp_servers.agent_bridge.tools.report_progress.approval_mode="approve"
 ```
 
-It returns `{ "task": { "taskId": "<jobId>", "status": "working", "ttl": null, "createdAt": "<ISO>", "lastUpdatedAt": "<ISO>", "pollInterval": 15000, "statusMessage": "queued | 0s" } }`. The optional `task.ttl` request field is accepted. `tasks/get`, `tasks/result`, and `tasks/cancel` take `{ "taskId": "<jobId>" }`; get/cancel return the task fields directly, result returns the tool content. `tasks/list` takes no parameters (or `{}`) and returns `{ "tasks": [...] }`, with no pagination. Status notifications put the task fields directly in `params`.
+The timeout covers the maximum bridge wait plus a margin, rather than the CLI's short default. Per-tool approval overrides let these two tools run in all job modes while retaining other approval policies. App-server receives the equivalent nested object in `thread/start` or `thread/resume`: `config.mcp_servers.agent_bridge = { command, args, env, enabled, enabled_tools, tool_timeout_sec, tools: { ask_orchestrator: { approval_mode: "approve" }, report_progress: { approval_mode: "approve" } } }`.
 
-Claude Code **2.1.318** binary inspection found that its default **v2** runtime probes `server/discover` for modern protocol support. This server offers `supportedVersions: ["2026-07-28"]` and `capabilities.extensions: { "io.modelcontextprotocol/tasks": {} }`. Claude's modern tool-call path accepts tasks only when the negotiated era is modern and its own task gates permit them (`allowTask: true`). The client declares task permission per request in its metadata envelope:
+Connectors have an optional `bridgeConfig(job)` hook returning argv and/or `{ path, content, cleanup }` file descriptions. Codex implements it with in-memory per-run config. A future agy implementation can use the file descriptions for temporary project configuration; no agy configuration files or lifecycle changes are implemented in this phase.
 
-```json
-{
-  "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-  "params": {
-    "name": "codex_job_watch", "arguments": { "jobId": "<jobId>" },
-    "_meta": {
-      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-      "io.modelcontextprotocol/clientCapabilities": { "extensions": { "io.modelcontextprotocol/tasks": {} } }
-    }
-  }
-}
-```
+### Hooks and channels
 
-There is no separate `task` parameter in that path. The response is `{ "resultType": "task", "taskId": "<jobId>", "status": "working", "ttlMs": null, "pollIntervalMs": 15000, ... }`. Modern `tasks/get` uses the same task ID params and metadata envelope: it returns a task handle while working, then `{ "resultType": "complete", "content": [...], "isError": false, ... }` containing the job result when terminal. Other modern replies include `resultType: "complete"`; list/discovery replies also carry `ttlMs: 0` and `cacheScope: "private"`. Without the client tasks extension on a modern call, start/watch keep ordinary behavior.
+Hooks should watch `meta.json.awaitingInput` (`qid`, bounded `question`, `options`, `askedAt`) and `meta.json.pendingApproval` (`id`, `kind`, `summary`, `requestedAt`), independently of the job's `running` state. A pending question needs `codex_job_respond { answer }`; a pending approval needs `{ decision }`. Cleared fields mean the response was delivered or the request ended. This repository does not modify `multi-agent/scripts/hook-wait.sh`.
 
-The binary's `execution` / capabilities `tasks` stripping function belongs to the **modern server result encoder**, called by that era's `encodeResult`. It is not a legacy client filter. The adapter follows that projection: modern tool lists omit `execution`, and modern discovery advertises the extension instead of the old capability. In the embedded legacy SDK, `cacheToolMetadata` records optional/required tool support, `isToolTask` additionally checks `tasks.requests.tools.call`, and `experimental.tasks.callToolStream` then supplies `task: {}`. These embedded helpers alone do not make Claude's current v2 tool-call path use legacy tasks.
-
-No channel environment variable or development-channel launch flag is required for tasks. Claude's own feature gates still apply: the inspected binary checks `CLAUDE_CODE_DISABLE_MCP_TASKS`, its task rollout/server policy, background-session restrictions, and a separate worker-wake gate. The server can provide immediate handles, notifications, and terminal results; it cannot override a client setting that disables `/tasks` or model wake delivery. The stdio tests use fake workers and raw JSON-RPC for both eras; they do not run Claude Code or authenticate a real Codex CLI.
+With `AGENT_JOBS_CHANNEL=1`, each question emits one deduplicated metadata-only event with `state=input_required`, `kind=question`, and `job_id`. Neither question text, options, note text nor worker output enters channel payloads. Question events do not consume terminal notification markers.
 
 ## Shared store and ownership
 
@@ -153,7 +187,7 @@ The machine-wide limit defaults to eight running jobs and is enforced with a loc
   "maxJobs": 8,
   "wakeHold": true,
   "connectors": {
-    "codex": { "enabled": true, "defaultModel": null, "reviewModel": "gpt-6-astra" }
+    "codex": { "enabled": true, "defaultModel": null, "reviewModel": "gpt-6-astra", "defaultTransport": "exec" }
   }
 }
 ```

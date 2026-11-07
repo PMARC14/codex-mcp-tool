@@ -7,6 +7,7 @@ import { fixture, meta, until } from '../jobs/test-helpers.js';
 import { JobStore } from '../jobs/store.js';
 import { MODERN_PROTOCOL, TASK_EXTENSION, registerMcpTasks } from './mcp-tasks.js';
 import { toolRegistry } from './registry.js';
+import { clientTaskGet, clientCreateTask, clientAgentTaskMeta, clientTaskList, clientTaskNotification } from './client-schemas.js';
 import { z } from 'zod';
 
 const modernMeta = (tasks = true) => ({
@@ -66,7 +67,10 @@ async function setup(f = fixture(), era: 'legacy' | 'modern' = 'legacy') {
       output = output.slice(end + 1);
       if (!line.trim()) continue;
       const message = JSON.parse(line);
-      if (message.id === undefined) notifications.push(message);
+      if (message.id === undefined) {
+        if (message.method === 'notifications/tasks/status') clientTaskNotification.parse(message);
+        notifications.push(message);
+      }
       else {
         const entry = pending.get(message.id);
         if (!entry) continue;
@@ -99,6 +103,14 @@ async function setup(f = fixture(), era: 'legacy' | 'modern' = 'legacy') {
       era === 'modern' ? { ...params, _meta: modernMeta() } : params
     );
     assert.equal(response.error, undefined, JSON.stringify(response.error));
+    if (era === 'modern') {
+      if (method === 'tasks/get' || method === 'tasks/cancel') clientTaskGet.parse(response.result);
+      if (method === 'tasks/list') clientTaskList.parse(response.result);
+      if (response.result.resultType === 'task') {
+        clientCreateTask.parse(response.result);
+        clientAgentTaskMeta.parse(response.result._meta['com.anthropic/agent-task']);
+      }
+    }
     return response.result;
   };
   const call = (name: string, args: any, task?: object) =>
@@ -163,7 +175,7 @@ test('legacy task start returns immediately, polls metadata, notifies, and retur
     assert.equal(s.initialized.protocolVersion, '2025-11-25');
     assert.deepEqual(s.initialized.capabilities.tasks.requests, { tools: { call: {} } });
     const created = await s.start({}, { ttl: 60000 });
-    assert.deepEqual(Object.keys(created), ['task']);
+    assert.deepEqual(Object.keys(created).sort(), ['_meta', 'task']);
     const { taskId } = created.task;
     assert.equal(created.task.status, 'working');
     assert.equal(created.task.pollInterval, 15000);
@@ -232,7 +244,7 @@ test('paused tasks stay working until reset, and superseded jobs name their repl
     await until(() => s.store.get(taskId).state === 'paused');
     const paused = await s.rpc('tasks/get', { taskId });
     assert.equal(paused.status, 'working');
-    assert.match(paused.statusMessage, /^Paused until /);
+    assert.match(paused.statusMessage, /Paused until /);
     assert.ok(paused.statusMessage.includes(new Date(s.store.get(taskId).resetAt!).toISOString()));
     const replacement = await s.call('codex_job_requeue', { jobId: taskId });
     const supersededBy = JSON.parse(replacement.content[0].text).jobId;
@@ -341,12 +353,13 @@ test('modern discovery, extension opt-in, task get, and complete envelopes match
     assert.equal(created.pollIntervalMs, 15000);
     assert.equal(created.task, undefined);
     const { taskId } = created;
-    assert.equal((await s.rpc('tasks/get', { taskId })).resultType, 'task');
+    clientTaskGet.parse(await s.rpc('tasks/get', { taskId }));
     await until(() => s.store.get(taskId).state === 'completed');
     const result = await s.rpc('tasks/get', { taskId });
-    assert.equal(result.resultType, 'complete');
+    assert.equal(result.status, 'completed');
+    assert.equal(result.resultType, undefined);
     assert.equal(
-      result.content[0].text,
+      result.result.content[0].text,
       (await s.call('codex_job_result', { jobId: taskId })).content[0].text
     );
     const ordinary = await s.raw('tools/call', {
@@ -399,7 +412,9 @@ test('task notifications follow derived approval status and suppress unchanged p
     store.write({ ...job, pendingApproval: approval });
     store.write(job);
     store.write({ ...job, state: 'paused' });
+    await new Promise<void>(resolve => setImmediate(resolve));
     assert.deepEqual(notices.map(n => n.params.status), ['input_required', 'working']);
+    notices.forEach(notice => clientTaskNotification.parse(notice));
   } finally { tasks.close(); toolRegistry.splice(before); f.cleanup(); }
 });
 
@@ -409,14 +424,14 @@ test('modern cancel returns a task projection with modern timing fields', async 
     const { taskId } = await s.start({ waitMs: 60000 });
     await until(() => s.store.get(taskId).state === 'running' && !!s.store.get(taskId).sessionId);
     const cancelled = await s.rpc('tasks/cancel', { taskId });
-    assert.equal(cancelled.resultType, 'task');
+    assert.equal(cancelled.resultType, undefined);
     assert.equal(cancelled.taskId, taskId);
     assert.equal(cancelled.status, 'cancelled');
     assert.equal(cancelled.ttlMs, null);
     assert.equal(cancelled.pollIntervalMs, 15000);
     for (const key of ['ttl', 'pollInterval', 'cacheScope', 'content']) assert.equal(key in cancelled, false);
     const result = await s.rpc('tasks/get', { taskId });
-    assert.equal(result.resultType, 'complete');
-    assert.equal(JSON.parse(result.content[0].text).state, 'killed');
+    assert.equal(result.status, 'cancelled');
+    assert.equal(result.resultType, undefined);
   } finally { await s.cleanup(); s.f.cleanup(); }
 });
