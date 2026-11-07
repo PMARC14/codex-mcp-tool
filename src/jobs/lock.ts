@@ -1,10 +1,203 @@
-import { linkSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import net from 'node:net';
 import type { Owner } from './connector.js';
 import { currentOwner, ownerAlive } from './proc.js';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+export interface MutexHandle {
+  address: string;
+  release: () => Promise<void>;
+}
+
+/** Test seams for forcing the interleavings of two processes inside one. Never set in production. */
+export const lockTestHooks: {
+  beforeReread?: () => void;
+  afterReread?: () => void;
+  afterTombstone?: () => void;
+  beforeRelease?: () => void;
+} = {};
+
+/**
+ * Returns the OS-managed mutex address for a given key or lock path.
+ * - Windows: named pipe `\\.\pipe\agent-jobs-<sha8>`
+ * - Linux: abstract namespace Unix domain socket `\0agent-jobs-<sha8>`
+ * - macOS: socket file under the jobs home
+ */
+export function mutexAddress(key: string, home?: string): string {
+  const sha8 = createHash('sha256').update(key).digest('hex').slice(0, 8);
+  if (process.platform === 'win32') {
+    return `\\\\.\\pipe\\agent-jobs-${sha8}`;
+  }
+  if (process.platform === 'linux') {
+    return `\0agent-jobs-${sha8}`;
+  }
+  const baseDir = home ?? (key.includes('/') || key.includes('\\') ? dirname(key) : join(homedir(), '.agent-jobs'));
+  return join(baseDir, `.agent-jobs-${sha8}.sock`);
+}
+
+async function checkSocketLiveness(sockPath: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = net.createConnection(sockPath);
+    socket.once('connect', () => {
+      socket.end();
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('error', (error: NodeJS.ErrnoException) => {
+      socket.destroy();
+      if (error.code === 'ECONNREFUSED' || error.code === 'ENOENT') {
+        resolve(false);
+      } else {
+        resolve(true);
+      }
+    });
+  });
+}
+
+/**
+ * Attempts to acquire an OS-managed mutex immediately.
+ * Returns a MutexHandle if acquired, or null if already held.
+ */
+export async function tryAcquireMutex(key: string, home?: string): Promise<MutexHandle | null> {
+  const address = mutexAddress(key, home);
+  const isFileSocket = process.platform !== 'win32' && !address.startsWith('\0');
+
+  if (isFileSocket) {
+    try {
+      mkdirSync(dirname(address), { recursive: true });
+    } catch {}
+  }
+
+  return new Promise(resolve => {
+    const server = net.createServer(socket => {
+      socket.end();
+      socket.destroy();
+    });
+    server.unref();
+
+    let settled = false;
+    const cleanup = () => {
+      server.removeAllListeners();
+    };
+
+    server.once('error', async (error: NodeJS.ErrnoException) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        server.close();
+      } catch {}
+
+      if (error.code === 'EADDRINUSE' && isFileSocket) {
+        // macOS: connection refused means stale holder, unlink and retry
+        const alive = await checkSocketLiveness(address);
+        if (!alive) {
+          try {
+            unlinkSync(address);
+          } catch {}
+        }
+      }
+      resolve(null);
+    });
+
+    server.listen(address, () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+
+      let released = false;
+      const release = async (): Promise<void> => {
+        if (released) return;
+        released = true;
+        await new Promise<void>(r => {
+          server.close(() => {
+            if (isFileSocket) {
+              try {
+                unlinkSync(address);
+              } catch {}
+            }
+            r();
+          });
+        });
+      };
+
+      resolve({ address, release });
+    });
+  });
+}
+
+/**
+ * Synchronous attempt to acquire an OS-managed mutex for callers that cannot await.
+ */
+export function tryAcquireMutexSync(key: string, home?: string): MutexHandle | null {
+  const address = mutexAddress(key, home);
+  const isFileSocket = process.platform !== 'win32' && !address.startsWith('\0');
+
+  if (isFileSocket) {
+    try {
+      mkdirSync(dirname(address), { recursive: true });
+    } catch {}
+  }
+
+  const server = net.createServer(socket => {
+    socket.end();
+    socket.destroy();
+  });
+  server.unref();
+  server.on('error', () => {});
+  server.listen(address);
+
+  if (server.listening) {
+    let released = false;
+    return {
+      address,
+      release: async () => {
+        if (released) return;
+        released = true;
+        await new Promise<void>(r => {
+          server.close(() => {
+            if (isFileSocket) {
+              try {
+                unlinkSync(address);
+              } catch {}
+            }
+            r();
+          });
+        });
+      },
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Acquires the OS-managed mutex, retrying with backoff up to timeoutMs.
+ */
+export async function acquireMutex(
+  key: string,
+  options: { timeoutMs?: number; home?: string } = {}
+): Promise<MutexHandle> {
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const deadline = Date.now() + timeoutMs;
+  let delay = 5;
+
+  while (true) {
+    const handle = await tryAcquireMutex(key, options.home);
+    if (handle) return handle;
+
+    if (Date.now() >= deadline) {
+      throw new Error('Timed out waiting for the agent-jobs lock');
+    }
+
+    await sleep(Math.min(delay, 50));
+    delay = Math.min(delay * 2, 50);
+  }
+}
 
 /** The raw content of the lock when its owner is dead (or it is abandoned garbage), else undefined. */
 async function staleContent(path: string): Promise<string | undefined> {
@@ -29,30 +222,8 @@ async function staleContent(path: string): Promise<string | undefined> {
   }
 }
 
-/** Test seams for forcing the interleavings of two processes inside one. Never set in production. */
-export const lockTestHooks: { beforeReread?: () => void; afterTombstone?: () => void; beforeRelease?: () => void } = {};
-
 const REAPER_STALE_MS = 10_000;
 
-/**
- * Removes the lock at `path` only if it still holds `judged`, the content that was found stale.
- *
- * Node has no OS-managed lock (flock/LockFileEx) and no compare-and-delete. Three layers keep
- * exactly one owner anyway:
- *  1. Reclaimers are serialized by a short-lived `<path>.reaper` file created with `wx`, so two
- *     waiters that judged the same stale content cannot both act on it (one would otherwise
- *     rename away the fresh lock the other just acquired).
- *  2. Under the reaper the lock is re-read; if it no longer holds `judged`, someone else already
- *     replaced it and nothing is touched.
- *  3. The lock is then renamed to a unique tombstone (atomic) and the tombstone's content is
- *     checked against `judged`. A live lock taken by mistake is put back with linkSync, which
- *     never overwrites. Acquirers never remove locks, so the only remaining window is the few
- *     microseconds between the re-read and the rename, and only if the judged lock's owner
- *     released it and another process acquired a new one in exactly that gap.
- *
- * Returns 'reclaimed' (the stale lock is gone), 'changed' (it had already been replaced or
- * removed) or 'busy' (another reclaimer is working; treat the lock as held and retry later).
- */
 export function reclaimStale(path: string, judged: string): 'reclaimed' | 'changed' | 'busy' {
   const reaper = `${path}.reaper`;
   try {
@@ -60,10 +231,8 @@ export function reclaimStale(path: string, judged: string): 'reclaimed' | 'chang
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     try {
-      if (Date.now() - statSync(reaper).mtimeMs > REAPER_STALE_MS) unlinkSync(reaper); // crashed reaper
-    } catch {
-      /* gone already */
-    }
+      if (Date.now() - statSync(reaper).mtimeMs > REAPER_STALE_MS) unlinkSync(reaper);
+    } catch {}
     return 'busy';
   }
   try {
@@ -76,6 +245,7 @@ export function reclaimStale(path: string, judged: string): 'reclaimed' | 'chang
       throw error;
     }
     if (current !== judged) return 'changed';
+    lockTestHooks.afterReread?.();
     const tombstone = `${path}.stale.${randomUUID()}`;
     try {
       renameSync(path, tombstone);
@@ -91,34 +261,22 @@ export function reclaimStale(path: string, judged: string): 'reclaimed' | 'chang
         try {
           linkSync(tombstone, path);
         } catch (error) {
-          // EEXIST: a newer lock already took the name, so the wrongly taken one stays gone.
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         }
       }
     } finally {
       try {
         unlinkSync(tombstone);
-      } catch {
-        /* swept with the other temp files */
-      }
+      } catch {}
     }
     return result;
   } finally {
     try {
       unlinkSync(reaper);
-    } catch {
-      /* already reclaimed as stale */
-    }
+    } catch {}
   }
 }
 
-/**
- * Removes the lock at `path` only if `isMine(content)` holds. The lock is first renamed to a
- * unique name, so what is checked is exactly what is removed: a lock that someone else
- * acquired in the meantime is put back untouched instead of being unlinked by a stale read.
- * Returns true when our lock was removed. EBUSY/EPERM (Windows sharing violations) propagate
- * so the caller can retry.
- */
 export function releaseOwned(path: string, isMine: (content: string) => boolean): boolean {
   lockTestHooks.beforeRelease?.();
   const mine = `${path}.rel.${randomUUID()}`;
@@ -131,9 +289,7 @@ export function releaseOwned(path: string, isMine: (content: string) => boolean)
   let content = '';
   try {
     content = readFileSync(mine, 'utf8');
-  } catch {
-    /* unreadable counts as not ours */
-  }
+  } catch {}
   let ours = false;
   try {
     ours = isMine(content);
@@ -149,13 +305,10 @@ export function releaseOwned(path: string, isMine: (content: string) => boolean)
   }
   try {
     unlinkSync(mine);
-  } catch {
-    /* left for the sweep */
-  }
+  } catch {}
   return ours;
 }
 
-/** Creates the lock with its complete content or not at all, so it is never visible empty. */
 export function tryAcquire(path: string, content: string): boolean {
   const temp = `${path}.${randomUUID()}.tmp`;
   writeFileSync(temp, content, { flag: 'wx' });
@@ -166,20 +319,15 @@ export function tryAcquire(path: string, content: string): boolean {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     return false;
   } finally {
-    // On Windows Defender can briefly hold the just-written file; a failed delete must not
-    // replace the real outcome. withLock sweeps any temp file left behind.
     try {
       unlinkSync(temp);
-    } catch {
-      /* swept later */
-    }
+    } catch {}
   }
 }
 
 const TEMP_FILE = /^lock\.[0-9a-f-]{36}\.tmp$/;
 const STALE_TEMP_MS = 10 * 60 * 1000;
 
-/** Deletes lock temp files older than STALE_TEMP_MS; a fresh one may still be in use. */
 function sweepStaleTemps(home: string): void {
   let names: string[];
   try {
@@ -192,38 +340,37 @@ function sweepStaleTemps(home: string): void {
     const file = join(home, name);
     try {
       if (Date.now() - statSync(file).mtimeMs > STALE_TEMP_MS) unlinkSync(file);
-    } catch {
-      /* in use or already gone */
-    }
+    } catch {}
   }
 }
 
-export async function withLock<T>(home: string, action: () => T | Promise<T>): Promise<T> {
+export async function withLock<T>(
+  home: string,
+  action: () => T | Promise<T>,
+  timeoutMs = 60000
+): Promise<T> {
   const path = join(home, 'lock');
-  const owner = await currentOwner();
-  const token = randomUUID();
-  const content = JSON.stringify({ ...owner, token });
-  const deadline = Date.now() + 60000;
   sweepStaleTemps(home);
-  while (true) {
-    if (!tryAcquire(path, content)) {
-      const judged = await staleContent(path);
-      if (judged !== undefined) {
-        if (reclaimStale(path, judged) === 'busy') await sleep(30);
-      } else {
-        if (Date.now() >= deadline) throw new Error('Timed out waiting for the agent-jobs lock');
-        await sleep(30);
-      }
-      continue;
-    }
+  const mutex = await acquireMutex(path, { timeoutMs, home });
+  const token = randomUUID();
+  const content = JSON.stringify({ pid: process.pid, token, time: Date.now() });
+  try {
+    writeFileSync(path, content);
+  } catch {}
+  try {
+    return await action();
+  } finally {
     try {
-      return await action();
-    } finally {
-      try {
-        releaseOwned(path, raw => JSON.parse(raw).token === token);
-      } catch {
-        /* Never mask the action's result; a missing or foreign lock is not ours to remove. */
+      if (existsSync(path)) {
+        try {
+          if (JSON.parse(readFileSync(path, 'utf8')).token === token) unlinkSync(path);
+        } catch {
+          unlinkSync(path);
+        }
       }
+    } catch {}
+    finally {
+      await mutex.release();
     }
   }
 }

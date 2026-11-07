@@ -1,9 +1,9 @@
-import { mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWrite } from './store.js';
-import { reclaimStale, releaseOwned, tryAcquire } from './lock.js';
+import { tryAcquireMutex, type MutexHandle } from './lock.js';
 import { runCommand, systemBinary } from './proc.js';
 import { usageIntervals } from './config.js';
 
@@ -103,21 +103,20 @@ export async function getUsage<T>(
   };
   if (snapshotFresh(saved)) return saved;
   const token = randomUUID();
-  let acquired = false;
+  let mutex: MutexHandle | null = null;
   try {
     mkdirSync(dir, { recursive: true });
-    for (let attempt = 0; attempt < 2 && !acquired; attempt++) {
-      // Complete content or no lock at all: a reader never sees a half-written claim.
-      if (tryAcquire(lock, JSON.stringify({ token, ts: now() }))) { acquired = true; break; }
-      try {
-        const raw = readFileSync(lock, 'utf8');
-        let ts = statSync(lock).mtimeMs;
-        try { const record = JSON.parse(raw); if (Number.isFinite(record.ts)) ts = record.ts; } catch { /* partial claim */ }
-        if (now() - ts < (opts.staleLockMs ?? 120000)) return readSnapshot<T>(path) ?? saved;
-        if (reclaimStale(lock, raw) === 'busy') return readSnapshot<T>(path) ?? saved;
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    }
-    if (!acquired) return readSnapshot<T>(path) ?? saved;
+    try {
+      const raw = readFileSync(lock, 'utf8');
+      let ts = statSync(lock).mtimeMs;
+      try { const record = JSON.parse(raw); if (Number.isFinite(record.ts)) ts = record.ts; } catch { /* partial claim */ }
+      if (now() - ts < (opts.staleLockMs ?? 120000)) return readSnapshot<T>(path) ?? saved;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+
+    mutex = await tryAcquireMutex(lock, home);
+    if (!mutex) return readSnapshot<T>(path) ?? saved;
+    try { writeFileSync(lock, JSON.stringify({ token, ts: now() })); } catch {}
+
     saved = readSnapshot<T>(path) ?? saved;
     if (snapshotFresh(saved)) return saved;
     if (!opts.force && saved?.ok && fresh(saved, batteryTtl)) {
@@ -131,9 +130,15 @@ export async function getUsage<T>(
     return snapshot;
   } catch { return saved; } // Cache/lock unavailable: fail open without an uncoordinated probe.
   finally {
-    if (acquired) {
-      try { releaseOwned(lock, raw => JSON.parse(raw).token === token); }
-      catch { /* A stale lock can be recovered by the next reader. */ }
+    if (mutex) {
+      try {
+        if (existsSync(lock)) {
+          try {
+            if (JSON.parse(readFileSync(lock, 'utf8')).token === token) unlinkSync(lock);
+          } catch { unlinkSync(lock); }
+        }
+      } catch {}
+      await mutex.release();
     }
   }
 }

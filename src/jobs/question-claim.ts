@@ -1,55 +1,71 @@
-import { linkSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
-import { reclaimStale, releaseOwned } from './lock.js';
+import { type MutexHandle, tryAcquireMutexSync } from './lock.js';
 
 interface Claim { owner: string; id: string; ts: number; timeoutMs: number }
+
+const activeClaims = new Map<string, { id: string; mutex: MutexHandle }>();
 
 /** Publish a complete claim atomically; an unexpired claim always wins over another asker. */
 export function claimQuestion(dir: string, claim: Claim): boolean {
   const path = join(dir, 'question.lock');
-  const temp = join(dir, `question-lock-${randomUUID()}.tmp`);
-  writeFileSync(temp, JSON.stringify(claim), { flag: 'wx' });
   try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try { linkSync(temp, path); return true; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-      try {
-        const raw = readFileSync(path, 'utf8');
-        let expired: boolean;
-        const old = (() => { try { return JSON.parse(raw) as Partial<Claim> | null; } catch { return null; } })();
-        // Structurally invalid claims (garbage, `{}`, wrong types) fall back to the file's age.
-        if (old && typeof old === 'object' && Number.isFinite(old.ts) && Number.isFinite(old.timeoutMs))
-          expired = Date.now() >= old.ts! + old.timeoutMs!;
-        else expired = Date.now() - statSync(path).mtimeMs >= 30 * 60 * 1000;
-        if (!expired) return false;
-        // 'busy' means another reclaimer is working: the claim stays held for this asker.
-        if (reclaimStale(path, raw) === 'busy') return false;
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (existsSync(path)) {
+      const raw = readFileSync(path, 'utf8');
+      let expired: boolean;
+      const old = (() => { try { return JSON.parse(raw) as Partial<Claim> | null; } catch { return null; } })();
+      if (old && typeof old === 'object' && Number.isFinite(old.ts) && Number.isFinite(old.timeoutMs))
+        expired = Date.now() >= old.ts! + old.timeoutMs!;
+      else expired = Date.now() - statSync(path).mtimeMs >= 30 * 60 * 1000;
+      if (!expired) return false;
+      const active = activeClaims.get(dir);
+      if (active) {
+        void active.mutex.release();
+        activeClaims.delete(dir);
+      }
     }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      try {
+        if (Date.now() - statSync(path).mtimeMs < 30 * 60 * 1000) return false;
+      } catch {}
+    }
+  }
+
+  const mutex = tryAcquireMutexSync(path, dir);
+  if (!mutex) return false;
+
+  try {
+    writeFileSync(path, JSON.stringify(claim));
+    activeClaims.set(dir, { id: claim.id, mutex });
+    return true;
+  } catch {
+    void mutex.release();
     return false;
-  } finally { try { unlinkSync(temp); } catch { /* A temp file does not hold the claim. */ } }
+  }
 }
 
-const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-
 /**
- * Releases the claim only if it is still ours (checked after an atomic rename, never from a
- * stale read). Transient Windows sharing violations are retried briefly and then swallowed: a
- * claim that cannot be removed expires on its own deadline and must never turn a delivered
- * answer into an error. Returns whether our claim was removed.
+ * Releases the claim only if it is still ours. Returns whether our claim was removed.
  */
 export function releaseQuestion(dir: string, id: string): boolean {
   const path = join(dir, 'question.lock');
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try { return releaseOwned(path, raw => JSON.parse(raw).id === id); }
-    catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (!['EBUSY', 'EPERM', 'EACCES'].includes(code ?? '')) return false;
-      pause(20 * (attempt + 1));
-    }
+  let ours = false;
+  try {
+    const raw = readFileSync(path, 'utf8');
+    ours = JSON.parse(raw).id === id;
+  } catch {
+    ours = false;
   }
-  return false;
+  if (!ours) return false;
+
+  try { unlinkSync(path); } catch {}
+  const active = activeClaims.get(dir);
+  if (active && active.id === id) {
+    void active.mutex.release();
+    activeClaims.delete(dir);
+  }
+  return true;
 }
 
 /** Errors worth retrying on the next poll tick (Windows scanners/indexers briefly hold files). */

@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fixture } from './test-helpers.js';
+import { spawn } from 'node:child_process';
+import { fixture, until } from './test-helpers.js';
 import { currentOwner } from './proc.js';
-import { reclaimStale, withLock } from './lock.js';
+import { lockTestHooks, reclaimStale, withLock } from './lock.js';
 
 const deadLock = JSON.stringify({ pid: 999999, startTime: 'gone', token: 'dead' });
 
@@ -93,5 +94,109 @@ test('withLock sweeps stale lock temp files left by an interrupted acquisition',
     assert.equal(existsSync(fresh), true, 'a fresh temp file (maybe in use) must stay');
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('multi-process contention keeps mutual exclusion with zero overlap', { timeout: 30000 }, async () => {
+  const f = fixture();
+  const logFile = join(f.home, 'contention.log');
+  const lockModule = new URL('./lock.js', import.meta.url).href;
+  const workerCode = `
+    import { withLock } from ${JSON.stringify(lockModule)};
+    import { appendFileSync } from 'node:fs';
+    const [home, logFile] = process.argv.slice(1);
+    for (let i = 0; i < 4; i++) {
+      await withLock(home, async () => {
+        const enter = Date.now();
+        await new Promise(r => setTimeout(r, 15));
+        const exit = Date.now();
+        appendFileSync(logFile, JSON.stringify({ pid: process.pid, enter, exit }) + '\\n');
+      });
+      await new Promise(r => setTimeout(r, 5));
+    }
+  `;
+  try {
+    const children = Array.from({ length: 4 }, () => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', workerCode, f.home, logFile], {
+        stdio: 'inherit',
+        windowsHide: true,
+      });
+      return new Promise<void>((resolve, reject) => {
+        child.on('close', code => {
+          if (code === 0) resolve();
+          else reject(new Error(`Worker exited with code ${code}`));
+        });
+      });
+    });
+    await Promise.all(children);
+
+    const lines = readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean);
+    assert.equal(lines.length, 16, 'all 16 critical sections must be recorded');
+    const records = lines.map(l => JSON.parse(l) as { pid: number; enter: number; exit: number });
+    records.sort((a, b) => a.enter - b.enter);
+    for (let i = 1; i < records.length; i++) {
+      assert.ok(
+        records[i].enter >= records[i - 1].exit,
+        `Lock overlap: PID ${records[i - 1].pid} exited at ${records[i - 1].exit}, but PID ${records[i].pid} entered at ${records[i].enter}`
+      );
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('when a lock holder is killed mid-critical-section, the next waiter gets the lock promptly', { timeout: 15000 }, async () => {
+  const f = fixture();
+  const lockModule = new URL('./lock.js', import.meta.url).href;
+  const holderEntered = join(f.home, 'holder.entered');
+  const waiterAcquired = join(f.home, 'waiter.acquired');
+
+  const holderCode = `
+    import { withLock } from ${JSON.stringify(lockModule)};
+    import { writeFileSync } from 'node:fs';
+    const [home, signal] = process.argv.slice(1);
+    await withLock(home, async () => {
+      writeFileSync(signal, 'entered');
+      await new Promise(r => setTimeout(r, 60000));
+    });
+  `;
+
+  const waiterCode = `
+    import { withLock } from ${JSON.stringify(lockModule)};
+    import { writeFileSync } from 'node:fs';
+    const [home, signal] = process.argv.slice(1);
+    await withLock(home, async () => {
+      writeFileSync(signal, String(Date.now()));
+    });
+  `;
+
+  try {
+    const holder = spawn(process.execPath, ['--input-type=module', '-e', holderCode, f.home, holderEntered], {
+      stdio: 'inherit',
+      windowsHide: true,
+    });
+    await until(() => existsSync(holderEntered), 'holder entered critical section', 5000);
+
+    const waiter = spawn(process.execPath, ['--input-type=module', '-e', waiterCode, f.home, waiterAcquired], {
+      stdio: 'inherit',
+      windowsHide: true,
+    });
+    const waiterDone = new Promise<void>((resolve, reject) => {
+      waiter.on('close', code => (code === 0 ? resolve() : reject(new Error(`Waiter exited ${code}`))));
+    });
+
+    await new Promise(r => setTimeout(r, 50));
+    const killTime = Date.now();
+    holder.kill();
+
+    await until(() => existsSync(waiterAcquired), 'waiter acquired after holder killed', 5000);
+    const acquiredTime = Number(readFileSync(waiterAcquired, 'utf8'));
+    const waitDuration = acquiredTime - killTime;
+
+    assert.ok(waitDuration < 100, `Waiter took too long to acquire: ${waitDuration}ms`);
+
+    await waiterDone;
+  } finally {
+    f.cleanup();
   }
 });

@@ -56,7 +56,7 @@ export function finalSpawnOptions(options: SpawnOptions, platform = process.plat
   return result;
 }
 
-export function safeSpawn(exe: string, args: string[], options: SpawnOptions, wrapJob = false): ChildProcess {
+export function safeSpawn(exe: string, args: string[], options: SpawnOptions, wrapJob = true): ChildProcess {
   if (process.platform === 'win32') {
     if (!isAbsolute(exe) && !/[\\/]/.test(exe)) {
       const env = options.env ?? process.env;

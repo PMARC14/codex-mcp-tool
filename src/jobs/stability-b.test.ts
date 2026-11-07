@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { fixture, fakeConnector, meta, until } from './test-helpers.js';
 import { JobManager } from './manager.js';
 import { spawnStats } from './spawn-stats.js';
-import { finalSpawnOptions, spawnOptions } from './proc.js';
+import { finalSpawnOptions, safeSpawn, spawnOptions } from './proc.js';
 import { COMPILER_SPAWN_OPTIONS, CREATE_NO_WINDOW, CREATE_SUSPENDED, JOB_WRAPPER_SOURCE, LAUNCHER_CREATE_FLAGS } from './jobobject.js';
 import { getUsage, POWER_TTL_MS } from './usage-cache.js';
 import { TrafficLog, describeError, redactPaths } from '../tools/traffic-log.js';
@@ -96,6 +96,16 @@ test('every child process in src goes through hidden-window spawn paths', () => 
   }
   assert.match(readFileSync(join(root, 'jobs', 'proc.ts'), 'utf8'), /windowsHide: true/);
   assert.match(readFileSync(join(root, 'jobs', 'jobobject.ts'), 'utf8'), /windowsHide: true/);
+  assert.match(readFileSync(join(root, 'jobs', 'proc.ts'), 'utf8'), /safeSpawn\([^)]*wrapJob\s*=\s*true/);
+  const before = spawnStats.viaLauncher;
+  const child = safeSpawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' });
+  try {
+    if (process.platform === 'win32') {
+      assert.equal(spawnStats.viaLauncher, before + 1, 'bare safeSpawn without wrapper argument must default to launcher on Windows');
+    }
+  } finally {
+    child.kill();
+  }
 });
 
 test('the Job Object launcher creates processes suspended with no console window', () => {

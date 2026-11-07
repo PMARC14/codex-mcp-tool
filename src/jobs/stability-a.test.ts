@@ -158,6 +158,45 @@ test('an answered orphan stays supervised until its process exits', async () => 
   } finally { child.kill(); for (const m of managers) await m.dispose(); f.cleanup(); }
 });
 
+test('an orphan answered before recovery stays supervised until its process exits', async () => {
+  const f = fixture();
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore', windowsHide: true });
+  const managers: JobManager[] = [];
+  try {
+    await new Promise(resolve => child.once('spawn', resolve));
+    const jobId = 'orphan-pre-answered', qid = 'q-pre';
+    const store = new JobManager(fakeConnector(f.script), f.config).store;
+    const identity = { pid: child.pid!, startTime: (await processStartTime(child.pid!))! };
+    store.create(meta(f.home, {
+      id: jobId,
+      state: 'running',
+      owner: { pid: 2147483647, startTime: 'dead' },
+      process: identity,
+      awaitingInput: { qid, question: 'q?', askedAt: Date.now() },
+    }), 'fake');
+    const dir = store.dir(jobId);
+    writeFileSync(join(dir, 'question.json'), JSON.stringify({ id: qid, question: 'q?', askedAt: Date.now() }));
+    // A replacement server publishes the answer before recovery ever sees or preserves the orphan
+    publishAnswer(dir, qid, 'delivered answer');
+    const replacement = new JobManager(fakeConnector(f.script), f.config);
+    managers.push(replacement);
+    await replacement.initialize();
+    const after = replacement.store.get(jobId);
+    assert.equal(after.state, 'running', 'orphan must not be marked lost just because the answer exists');
+    assert.equal(child.exitCode, null, 'orphan process must not be killed just because the answer exists');
+    child.kill();
+    await until(() => child.exitCode !== null || child.signalCode !== null);
+    const third = new JobManager(fakeConnector(f.script), f.config);
+    managers.push(third);
+    await third.initialize();
+    assert.equal(third.store.get(jobId).state, 'lost');
+  } finally {
+    child.kill();
+    for (const m of managers) await m.dispose();
+    f.cleanup();
+  }
+});
+
 // ---- Astra #4: first writer wins ----
 test('concurrent answers: the first wins, an identical retry succeeds, a conflicting one fails', () => {
   const dir = scratch();

@@ -166,15 +166,20 @@ export class JobManager {
       let preserve = !!job.orphanPreserved;
       if (!preserve && job.awaitingInput) {
         const { qid, askedAt } = job.awaitingInput;
-        try {
-          const question = JSON.parse(readFileSync(join(dir, 'question.json'), 'utf8'));
-          let deadline = askedAt + 1800000;
+        const answerFile = join(dir, `answer-${qid}.json`);
+        if (existsSync(answerFile)) {
+          preserve = true;
+        } else {
           try {
-            const claim = JSON.parse(readFileSync(join(dir, 'question.lock'), 'utf8'));
-            if (claim.id === qid && Number.isFinite(claim.ts) && Number.isFinite(claim.timeoutMs)) deadline = claim.ts + claim.timeoutMs;
-          } catch { /* Old mailbox without a claim uses the default timeout. */ }
-          preserve = question.id === qid && now < deadline && !existsSync(join(dir, `answer-${qid}.json`));
-        } catch { /* Missing or malformed mailbox permits normal orphan cleanup. */ }
+            const question = JSON.parse(readFileSync(join(dir, 'question.json'), 'utf8'));
+            let deadline = askedAt + 1800000;
+            try {
+              const claim = JSON.parse(readFileSync(join(dir, 'question.lock'), 'utf8'));
+              if (claim.id === qid && Number.isFinite(claim.ts) && Number.isFinite(claim.timeoutMs)) deadline = claim.ts + claim.timeoutMs;
+            } catch { /* Old mailbox without a claim uses the default timeout. */ }
+            preserve = question.id === qid && now < deadline;
+          } catch { /* Missing or malformed mailbox permits normal orphan cleanup. */ }
+        }
       }
       const timedOut = now > (job.startedAt ?? job.createdAt) + job.timeoutMin * 60000;
       if (preserve && !timedOut && (!job.process || (await ownerAlive(job.process)))) {
@@ -563,7 +568,8 @@ export class JobManager {
         const sweepForeign = now - this.lastForeignSweep >= FOREIGN_SWEEP_MS;
         if (sweepForeign) this.lastForeignSweep = now;
         const liveOwners = new Map<string, boolean>();
-        for (const job of sweepForeign ? jobs : []) {
+        const candidateJobs = sweepForeign ? jobs : jobs.filter(job => job.orphanPreserved);
+        for (const job of candidateJobs) {
           if (!job.owner || sameOwner(job.owner, this.owner) || (terminal(job) && !job.reserved))
             continue;
           const key = JSON.stringify(job.owner);
