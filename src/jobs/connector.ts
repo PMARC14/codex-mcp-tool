@@ -35,6 +35,8 @@ export interface JobSpec {
   resumeSession?: string;
   transport?: 'exec' | 'app-server';
   approvalTimeoutMin?: number;
+  /** App-server approval policy; `never` (default) matches headless exec, which never asks. */
+  approvals?: 'never' | 'on-request';
   timeoutMin: number;
   stallTimeoutMin?: number;
   onStall?: 'report' | 'kill';
@@ -48,6 +50,8 @@ export type FailureReason = 'quota_exhausted' | 'timeout' | 'cancelled' | 'stall
 
 export interface JobMeta extends Omit<JobSpec, 'prompt'> {
   steers?: number;
+  /** A worker kept alive after its server died while it awaited an answer; recovery leaves it until it exits. */
+  orphanPreserved?: boolean;
   awaitingInput?: { qid: string; question: string; options?: string[]; askedAt: number };
   progressNote?: string;
   pendingApproval?: { id: string | number; kind: string; summary: string; requestedAt: number };
@@ -96,6 +100,13 @@ export interface JobEvent {
 
 export interface Connector {
   id: string;
+  /** Transport used when neither the call, the environment nor config.json names one. */
+  readonly defaultTransport?: 'exec' | 'app-server';
+  /**
+   * Refresh the usage snapshot at a job edge (about to start / just stopped). Must throttle to one
+   * probe per connector per 60 s and reset the normal interval timer. Optional.
+   */
+  refreshUsage?(): Promise<void>;
   detect(): Promise<{ available: boolean; reason?: string; version?: string; exe?: string }>;
   models(): Promise<string[]>;
   usagePercent?(): Promise<number | undefined>;

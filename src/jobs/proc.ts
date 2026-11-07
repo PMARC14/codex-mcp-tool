@@ -1,4 +1,5 @@
 import spawn from 'cross-spawn';
+import { spawnStats } from './spawn-stats.js';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import { closeSync, openSync, readFileSync, readSync, writeSync, statSync } from 'node:fs';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -44,6 +45,17 @@ export function spawnOptions(platform = process.platform): SpawnOptions {
   return { windowsHide: true, shell: false, ...(platform === 'win32' ? {} : { detached: true }) };
 }
 
+/**
+ * Final spawn options. Windows Terminal is the default terminal, so any console program that gets
+ * a new console shows up as a tab: always windowsHide, never a shell, and never `detached` on
+ * Windows (a detached console process allocates its own console).
+ */
+export function finalSpawnOptions(options: SpawnOptions, platform = process.platform): SpawnOptions {
+  const result: SpawnOptions = { ...spawnOptions(platform), ...options, windowsHide: true, shell: false };
+  if (platform === 'win32') delete result.detached;
+  return result;
+}
+
 export function safeSpawn(exe: string, args: string[], options: SpawnOptions, wrapJob = false): ChildProcess {
   if (process.platform === 'win32') {
     if (!isAbsolute(exe) && !/[\\/]/.test(exe)) {
@@ -77,20 +89,16 @@ export function safeSpawn(exe: string, args: string[], options: SpawnOptions, wr
       `Refusing to run ${command.exe} through cmd.exe; use a native executable or JavaScript target`
     );
   }
-  const spawnArgs: SpawnOptions = {
-    ...spawnOptions(),
-    ...options,
-    windowsHide: true,
-    shell: false,
-  };
+  const spawnArgs = finalSpawnOptions(options);
   if (process.platform === 'win32') {
     // Missing targets must fail before cross-spawn's Windows shell fallback.
     if (!statSync(command.exe).isFile()) throw new Error(`Not an executable file: ${command.exe}`);
     if (options.cwd && !statSync(options.cwd).isDirectory())
       throw new Error(`Not a working directory: ${options.cwd}`);
   }
-  if (process.platform === 'win32') delete spawnArgs.detached;
+  spawnStats.count++;
   const wrapper = wrapJob ? jobWrapper() : undefined;
+  if (wrapper) spawnStats.viaLauncher++;
   return wrapper
     ? spawn(wrapper, [command.exe, ...command.args], spawnArgs)
     : spawn(command.exe, command.args, spawnArgs);
@@ -104,7 +112,10 @@ export function runCommandBuffer(
   timeoutMs = 30000
 ): Promise<Buffer> {
   return new Promise((resolveResult, reject) => {
-    const child = safeSpawn(exe, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Short-lived checks (--version, usage, power, git) also go through the launcher on Windows:
+    // it creates the child with CREATE_NO_WINDOW, so no console tab appears even when this server
+    // has no console of its own (Windows Terminal as the default terminal).
+    const child = safeSpawn(exe, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }, process.platform === 'win32');
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     const timer = setTimeout(() => {

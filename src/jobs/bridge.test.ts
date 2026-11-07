@@ -249,9 +249,12 @@ test('tasks update acknowledges with an empty result; the client ignores it and 
     // No update fields are read: the next tasks/get is parsed with re().
     // This is a non-tool acknowledgement, so it has no resultType envelope.
     assert.deepEqual(reply, {});
-    assert.equal(s.manager.store.get(jobId).awaitingInput, undefined);
+    // A foreign responder never writes meta.json; the owner's sampler clears awaitingInput.
+    assert.equal(s.manager.store.get(jobId).awaitingInput?.qid, qid);
     const next = clientTaskGet.parse(await w.rpc('tasks/get', { taskId: jobId }));
-    assert.equal(next.status, 'working');
+    // No owner is sampling this fake record, so it still shows the question; a repeated update is an idempotent success.
+    assert.equal(next.status, 'input_required');
+    assert.deepEqual(await w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'fake' } } } }), {});
     assert.equal(JSON.parse(readFileSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`), 'utf8')).answer, 'fake');
   } finally { await w.close(); await s.cleanup(); }
 });
@@ -265,7 +268,7 @@ test('answering an expired mailbox clears stale pending metadata and reports no 
     s.manager.store.create(meta(s.home, { id: jobId, state: 'running',
       awaitingInput: { qid, question: 'expired?', askedAt: Date.now() } }), 'fake');
     await assert.rejects(s.manager.respond(jobId, { answer: 'late', qid }), /question expired; no answer delivered/i);
-    assert.equal(s.manager.store.get(jobId).awaitingInput, undefined);
+    // Foreign: reported, answer not delivered, metadata left for the owner's sampler to clear.
     assert.equal(existsSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`)), false);
   } finally { await s.cleanup(); }
 });

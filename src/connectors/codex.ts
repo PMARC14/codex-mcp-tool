@@ -25,6 +25,7 @@ interface CodexUsageOptions extends UsageCacheOptions {
 export class CodexConnector implements Connector {
   readonly id = 'codex';
   readonly reviewModel = 'gpt-6-astra';
+  readonly defaultTransport = 'app-server' as const;
 
   constructor(
     private run = runCommand,
@@ -33,11 +34,18 @@ export class CodexConnector implements Connector {
     private usageOptions: CodexUsageOptions = {}
   ) {}
 
-  private usageSnapshot(command = this.resolve().command) {
+  private usageSnapshot(command = this.resolve().command, force = false) {
     return getUsage<CodexUsage>(this.id, async () => {
       const usage = await (this.usageOptions.live ?? readLiveCodexUsage)(command);
       return { ok: usage?.available === true, raw: usage ?? null, parsed: usage ?? null };
-    }, { ...this.usageOptions, now: this.now });
+    }, { ...this.usageOptions, now: this.now, ...(force ? { force: true } : {}) });
+  }
+
+  /** Job edge: one probe (at most one per 60 s) that also restarts the interval timer. */
+  async refreshUsage(): Promise<void> {
+    const resolution = this.resolve();
+    if (!resolution.resolved) return;
+    await this.usageSnapshot(resolution.command, true);
   }
 
   /** All live usage consumers, including auth detection, share the disk snapshot. */

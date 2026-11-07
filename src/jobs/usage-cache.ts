@@ -1,13 +1,20 @@
-import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWrite } from './store.js';
-import { reclaimStale } from './lock.js';
+import { reclaimStale, releaseOwned, tryAcquire } from './lock.js';
 import { runCommand, systemBinary } from './proc.js';
+import { usageIntervals } from './config.js';
 
-export const USAGE_TTL_MS = 5 * 60 * 1000;
+export const USAGE_TTL_MS = 15 * 60 * 1000;
+export const USAGE_BATTERY_TTL_MS = 30 * 60 * 1000;
+/** A failed probe is not retried sooner than this (or the interval, whichever is longer). */
 export const USAGE_BACKOFF_MS = 15 * 60 * 1000;
+/** Never more than one probe per connector in this window, even for forced job-edge refreshes. */
+export const MIN_PROBE_GAP_MS = 60 * 1000;
+/** Power status is read at most this often (Windows needs a PowerShell start for it). */
+export const POWER_TTL_MS = 10 * 60 * 1000;
 
 export interface UsageProbe<T> {
   ok: boolean;
@@ -20,8 +27,12 @@ export interface UsageCacheOptions {
   home?: string;
   now?: () => number;
   onBattery?: boolean | (() => boolean | Promise<boolean>);
+  /** Probe interval on AC / on battery; default from config (15 / 30 minutes). */
   ttlMs?: number;
+  batteryTtlMs?: number;
   backoffMs?: number;
+  /** Job edge (about to start / just stopped): probe now unless one ran in the last 60 s. */
+  force?: boolean;
   /** Must exceed the probe's timeout; defaults to two minutes. */
   staleLockMs?: number;
 }
@@ -53,7 +64,7 @@ async function onBattery(opts: UsageCacheOptions): Promise<boolean> {
   const power = await getUsage('machine-power', async () => {
     const battery = typeof opts.onBattery === 'function' ? await opts.onBattery() : await systemOnBattery();
     return { ok: true, raw: battery, parsed: battery };
-  }, { home: opts.home, now: opts.now, onBattery: false });
+  }, { home: opts.home, now: opts.now, onBattery: false, ttlMs: POWER_TTL_MS });
   return power?.parsed === true;
 }
 
@@ -73,43 +84,43 @@ export async function getUsage<T>(
   const dir = join(home, 'cache');
   const path = join(dir, `${connector}-usage.json`), lock = join(dir, `${connector}-usage.lock`);
   const now = opts.now ?? Date.now;
-  const ttl = opts.ttlMs ?? USAGE_TTL_MS, backoff = opts.backoffMs ?? USAGE_BACKOFF_MS;
+  const configured = usageIntervals();
+  const ttl = opts.ttlMs ?? configured.intervalMs, backoff = opts.backoffMs ?? USAGE_BACKOFF_MS;
+  const batteryTtl = Math.max(opts.batteryTtlMs ?? configured.batteryIntervalMs, ttl);
   const fresh = (value: UsageSnapshot<unknown> | undefined, limit: number) => value && now() >= value.takenAt && now() - value.takenAt < limit;
   let saved = readSnapshot<T>(path);
   const cachedBattery = () => {
     if (typeof opts.onBattery === 'boolean') return opts.onBattery;
     const power = readSnapshot<boolean>(join(dir, 'machine-power-usage.json'));
-    return power?.ok === true && power.parsed === true && !!fresh(power, USAGE_TTL_MS);
+    return power?.ok === true && power.parsed === true && !!fresh(power, POWER_TTL_MS);
   };
-  const snapshotFresh = (value: UsageSnapshot<T> | undefined) =>
-    fresh(value, value?.ok === false || cachedBattery() ? backoff : ttl);
+  // Interval by power source; a failed probe waits the longer of that and the backoff.
+  const snapshotFresh = (value: UsageSnapshot<T> | undefined) => {
+    const interval = cachedBattery() ? batteryTtl : ttl;
+    if (opts.force && !(value && fresh(value, MIN_PROBE_GAP_MS))) return false;
+    if (opts.force) return true;
+    return fresh(value, value?.ok === false ? Math.max(interval, backoff) : interval);
+  };
   if (snapshotFresh(saved)) return saved;
   const token = randomUUID();
   let acquired = false;
   try {
     mkdirSync(dir, { recursive: true });
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 2 && !acquired; attempt++) {
+      // Complete content or no lock at all: a reader never sees a half-written claim.
+      if (tryAcquire(lock, JSON.stringify({ token, ts: now() }))) { acquired = true; break; }
       try {
-        const fd = openSync(lock, 'wx');
-        try { writeFileSync(fd, JSON.stringify({ token, ts: now() })); }
-        finally { closeSync(fd); }
-        acquired = true;
-        break;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        try {
-          const raw = readFileSync(lock, 'utf8');
-          let ts = statSync(lock).mtimeMs;
-          try { const record = JSON.parse(raw); if (Number.isFinite(record.ts)) ts = record.ts; } catch { /* partial claim */ }
-          if (now() - ts < (opts.staleLockMs ?? 120000)) return readSnapshot<T>(path) ?? saved;
-          reclaimStale(lock, raw);
-        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-      }
+        const raw = readFileSync(lock, 'utf8');
+        let ts = statSync(lock).mtimeMs;
+        try { const record = JSON.parse(raw); if (Number.isFinite(record.ts)) ts = record.ts; } catch { /* partial claim */ }
+        if (now() - ts < (opts.staleLockMs ?? 120000)) return readSnapshot<T>(path) ?? saved;
+        if (reclaimStale(lock, raw) === 'busy') return readSnapshot<T>(path) ?? saved;
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
     if (!acquired) return readSnapshot<T>(path) ?? saved;
     saved = readSnapshot<T>(path) ?? saved;
     if (snapshotFresh(saved)) return saved;
-    if (saved?.ok && fresh(saved, backoff)) {
+    if (!opts.force && saved?.ok && fresh(saved, batteryTtl)) {
       try { if (await onBattery({ ...opts, home })) return saved; } catch { /* Power status unavailable: normal TTL. */ }
     }
     let result: UsageProbe<T>;
@@ -121,7 +132,7 @@ export async function getUsage<T>(
   } catch { return saved; } // Cache/lock unavailable: fail open without an uncoordinated probe.
   finally {
     if (acquired) {
-      try { if (JSON.parse(readFileSync(lock, 'utf8')).token === token) unlinkSync(lock); }
+      try { releaseOwned(lock, raw => JSON.parse(raw).token === token); }
       catch { /* A stale lock can be recovered by the next reader. */ }
     }
   }

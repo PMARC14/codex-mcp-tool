@@ -11,6 +11,9 @@ export interface WatchOptions {
   heartbeatMs?: number;
 }
 
+/** A paused job whose quota reset time is known is retried by the queue without any action. */
+export const autoRetries = (job: JobMeta) => job.state === 'paused' && !job.pauseCleared && !!job.resetAt;
+
 export function progressMessage(manager: JobManager, job: JobMeta, showReasoning = false): string {
   // Match agent_status's stdout window, without reading the whole log or probing processes.
   const line = manager.store.tail(job.id, 'stdout', 20).slice(-10000).trim().split(/\r?\n/).pop();
@@ -98,7 +101,8 @@ export async function watchJob(
           approvalKey = job.awaitingInput ? job.awaitingInput.qid : job.pendingApproval ? JSON.stringify([job.pendingApproval.id, job.pendingApproval.requestedAt]) : undefined;
           options.onProgress?.(progressMessage(manager, job, options.showReasoning));
           if (ended) return; // The callback may cancel the request.
-          if (job.state !== 'queued' && job.state !== 'running') finish(false);
+          // A pause the queue will retry by itself (reset time known) keeps the follow going.
+          if (job.state !== 'queued' && job.state !== 'running' && !autoRetries(job)) finish(false);
           else if (timeout) finish(true);
         } catch (error) {
           cleanup();

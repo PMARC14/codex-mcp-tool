@@ -9,6 +9,37 @@ function bounded(value: string, bytes: number): string {
   return Buffer.from(value).subarray(0, bytes - 4).toString('utf8') + '…';
 }
 
+/** Replaces the user's home directory (and any other Users\name profile path) so logs carry no account names. */
+export function redactPaths(text: string): string {
+  const home = homedir();
+  let result = text;
+  const slash = String.fromCharCode(92);
+  for (const variant of new Set([home, home.split(slash).join('/'), home.split(slash).join(slash + slash)]))
+    if (variant) result = result.split(variant).join('~');
+  return result
+    .replace(/[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s"']+/gi, '~')
+    .replace(/\/(?:home|Users)\/[^/\s"']+/g, '~');
+}
+
+/**
+ * A log-safe description of an error: no argument values (Zod messages quote them), home paths
+ * redacted, a short single-line message and a stack of at most 2 KB.
+ */
+export function describeError(error: unknown): { error: string; stack?: string } {
+  let message: string;
+  const issues = (error as { issues?: Array<{ path?: unknown[]; code?: string }> } | undefined)?.issues;
+  if (Array.isArray(issues)) message = `validation failed: ${issues.slice(0, 10).map(issue => `${(issue.path ?? []).join('.')}:${issue.code}`).join(', ')}`;
+  else {
+    message = error instanceof Error ? error.message : String(error);
+    message = message.replace(/^(.*?Invalid arguments for [\w-]+):[\s\S]*$/, '$1');
+  }
+  message = redactPaths(message).replace(/\s+/g, ' ').slice(0, 500);
+  // The first stack line repeats the message, which may quote argument values: keep frames only.
+  const frames = error instanceof Error && error.stack ? error.stack.slice(Math.max(0, error.stack.search(/\n\s+at /))) : undefined;
+  const stack = frames ? bounded(`${error instanceof Error ? error.name : 'Error'}${redactPaths(frames)}`, 2048) : undefined;
+  return { error: message, stack };
+}
+
 /** Never serialize worker content into the traffic log, even at full level. */
 function safeSummary(message: any, full: boolean) {
   const params = message.params;
@@ -32,7 +63,7 @@ function safeSummary(message: any, full: boolean) {
     if (Array.isArray(body.tasks)) summary.tasks = body.tasks.map((task: any) => ({ taskId: task.taskId, status: task.status }));
     if (Array.isArray(body.tools)) summary.tools = body.tools.map((tool: any) => tool.name);
   }
-  if (message.error) summary.error = { code: message.error.code, message: message.error.message };
+  if (message.error) summary.error = { code: message.error.code, message: redactPaths(String(message.error.message ?? '').replace(/\s+/g, ' ').slice(0, 300)) };
   return summary;
 }
 
@@ -64,8 +95,7 @@ export class TrafficLog {
   }
   error(step: string, error: unknown) {
     this.append({ dir: 'out', method: step, size: 0,
-      summary: bounded(JSON.stringify({ error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined }), this.full ? 16384 : 2048) });
+      summary: bounded(JSON.stringify(describeError(error)), this.full ? 16384 : 4096) });
   }
   tail(lines: number) {
     // Read at most the three bounded files, oldest first. No worker files are read.

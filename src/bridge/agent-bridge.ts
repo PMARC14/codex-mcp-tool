@@ -7,7 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema, McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { atomicWrite } from '../jobs/store.js';
-import { claimQuestion, releaseQuestion } from '../jobs/question-claim.js';
+import { claimQuestion, readAnswerFile, releaseQuestion } from '../jobs/question-claim.js';
 
 const askSchema = z.object({ question: z.string().trim().min(1).max(20000),
   options: z.array(z.string().max(500)).max(50).optional(),
@@ -50,20 +50,22 @@ export function createBridge(home: string, jobId: string) {
         let deadline: NodeJS.Timeout;
         const cleanup = () => { clearInterval(timer); clearTimeout(deadline); extra.signal.removeEventListener('abort', abort); };
         const abort = () => { cleanup(); reject(new McpError(ErrorCode.InvalidRequest, 'Bridge question cancelled')); };
+        const readAnswer = () => readAnswerFile(answerPath);
         const check = () => {
           try {
-            // stat only on each tick; read the answer once it exists.
-            if (!statSync(answerPath).isFile()) return;
-            const answer = JSON.parse(readFileSync(answerPath, 'utf8'));
-            if (typeof answer.answer !== 'string') throw new Error('answer field must be a string');
-            cleanup(); resolveAnswer(answer.answer);
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-            cleanup(); reject(error);
-          }
+            const answer = readAnswer();
+            if (answer === undefined) return;
+            cleanup(); resolveAnswer(answer);
+          } catch (error) { cleanup(); reject(error); }
         };
         timer = setInterval(check, 2000);
-        deadline = setTimeout(() => { cleanup(); resolveAnswer(`no answer within ${timeoutSec} s; continue with your best judgement`); }, timeoutSec * 1000);
+        deadline = setTimeout(() => {
+          // An answer that arrived since the last poll still wins over the fallback text.
+          let late: string | undefined;
+          try { late = readAnswer(); } catch { late = undefined; }
+          cleanup();
+          resolveAnswer(late ?? `no answer within ${timeoutSec} s; continue with your best judgement`);
+        }, timeoutSec * 1000);
         extra.signal.addEventListener('abort', abort, { once: true });
         if (extra.signal.aborted) abort(); else check();
       });
@@ -83,7 +85,7 @@ export function createBridge(home: string, jobId: string) {
           }
         }
       } catch (error) { process.stderr.write(`Bridge question cleanup: ${String(error)}\n`); }
-      finally { releaseQuestion(dir, id); }
+      finally { releaseQuestion(dir, id); } // never throws: a busy claim must not replace the answer
     }
   });
   return server;

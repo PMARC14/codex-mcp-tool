@@ -1,8 +1,17 @@
 import spawn from 'cross-spawn';
+import { spawnStats } from './spawn-stats.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+
+/** CreateProcess flags: CREATE_SUSPENDED (0x4) so the child joins the job before it runs, and
+ * CREATE_NO_WINDOW (0x08000000) so no grandchild ever gets a visible console (Windows Terminal tab). */
+export const CREATE_SUSPENDED = 0x00000004;
+export const CREATE_NO_WINDOW = 0x08000000;
+export const LAUNCHER_CREATE_FLAGS = CREATE_SUSPENDED | CREATE_NO_WINDOW;
+/** The C# compiler runs hidden too. */
+export const COMPILER_SPAWN_OPTIONS = { windowsHide: true, encoding: 'utf8', timeout: 30000 } as const;
 
 // The child is assigned before it can create any descendants. The job handle is deliberately
 // non-inheritable, so terminating this wrapper closes the last handle and kills the entire job.
@@ -57,7 +66,7 @@ class JobWrap {
     var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.flags = 0x100;
     si.stdin = GetStdHandle(-10); si.stdout = GetStdHandle(-11); si.stderr = GetStdHandle(-12);
     PROCESS_INFORMATION pi;
-    if (!CreateProcess(args[0], command, IntPtr.Zero, IntPtr.Zero, true, 4, IntPtr.Zero, null, ref si, out pi)) { CloseHandle(job); return 127; }
+    if (!CreateProcess(args[0], command, IntPtr.Zero, IntPtr.Zero, true, 0x08000004, IntPtr.Zero, null, ref si, out pi)) { CloseHandle(job); return 127; }
     if (!AssignProcessToJobObject(job, pi.process)) {
       // Preserve job execution on systems that forbid nested jobs, without claiming containment.
       Console.Error.WriteLine("agent-jobs: Job Object assignment failed; using process-tree cleanup");
@@ -92,7 +101,8 @@ export function jobWrapper(options: { compiler?: string; cacheDir?: string; warn
       source = `${temporary}.cs`;
       output = `${temporary}.exe`;
       writeFileSync(source, JOB_WRAPPER_SOURCE);
-      const compilation = spawn.sync(compiler, ['/nologo', '/target:exe', `/out:${output}`, source], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
+      spawnStats.count++;
+      const compilation = spawn.sync(compiler, ['/nologo', '/target:exe', `/out:${output}`, source], { ...COMPILER_SPAWN_OPTIONS });
       if (compilation.error || compilation.status !== 0) throw new Error(compilation.error?.message || compilation.stderr || compilation.stdout || 'compiler failed');
       try { renameSync(output, target); } catch (error) { if (!existsSync(target)) throw error; }
     }

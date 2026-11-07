@@ -6,7 +6,7 @@ import { codexBridge } from './codexBridge.js';
 import type { JobEvent, JobSpec } from '../jobs/connector.js';
 import type { ApprovalDecision, StdinHandler, StdinPlan } from '../jobs/stdin.js';
 import { usageLimit } from '../jobs/usage-reset.js';
-import { claimQuestion, releaseQuestion } from '../jobs/question-claim.js';
+import { claimQuestion, readAnswerFile, releaseQuestion } from '../jobs/question-claim.js';
 
 const wire = (message: object) => JSON.stringify(message) + '\n';
 const input = (text: string) => [{ type: 'text', text, text_elements: [] }];
@@ -87,18 +87,20 @@ export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(j
       const timer = setInterval(() => {
         const path = join(dirname(job.finalPath), `answer-${qid}.json`);
         try {
-          if (statSync(path).isFile()) {
-            const answer = JSON.parse(readFileSync(path, 'utf8')).answer;
-            if (typeof answer !== 'string') throw new Error('answer field must be a string');
-            reply(answer);
-          }
-        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          const answer = readAnswerFile(path);
+          if (answer !== undefined) reply(answer);
+        } catch (error) {
           context.emit(errorEvent(`native question answer: ${String(error)}`));
           context.apply({ write: wire({ id: message.id, error: { code: -32603, message: 'Could not read question answer' } }) });
           clearQuestion(message.id);
-        } }
+        }
       }, options.questionPollMs ?? 2000);
-      const deadline = setTimeout(() => reply('no answer within 1800 s; continue with your best judgement'), 1800000);
+      const deadline = setTimeout(() => {
+        // An answer that arrived since the last poll still wins over the fallback text.
+        let late: unknown;
+        try { late = JSON.parse(readFileSync(join(dirname(job.finalPath), `answer-${qid}.json`), 'utf8')).answer; } catch { late = undefined; }
+        reply(typeof late === 'string' ? late : 'no answer within 1800 s; continue with your best judgement');
+      }, 1800000);
       nativeQuestions.set(message.id, { qid, questions, timer, deadline });
     };
     const publishApproval = () => {
@@ -150,7 +152,7 @@ export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(j
     const settings = {
       cwd: job.cwd, model: job.model,
       sandbox: { read: 'read-only', write: 'workspace-write', trusted: 'danger-full-access', full: 'danger-full-access' }[job.mode],
-      approvalPolicy: job.mode === 'trusted' || job.mode === 'full' ? 'never' : 'on-request',
+      approvalPolicy: job.mode === 'trusted' || job.mode === 'full' ? 'never' : (job.approvals ?? 'never'),
       config: {
         ...bridge.config,
         ...(job.effort ? { model_reasoning_effort: job.effort } : {}),

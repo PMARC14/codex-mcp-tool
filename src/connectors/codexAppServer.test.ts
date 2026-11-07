@@ -285,8 +285,16 @@ test('app-server settings match sandbox modes and trusted/full never approve', (
     handler('{"id":1,"result":{}}', 'stdout');
     const settings = writes.find(m => m.method === 'thread/start').params;
     assert.equal(settings.sandbox, { read: 'read-only', write: 'workspace-write', trusted: 'danger-full-access', full: 'danger-full-access' }[mode]);
-    assert.equal(settings.approvalPolicy, mode === 'trusted' || mode === 'full' ? 'never' : 'on-request');
+    assert.equal(settings.approvalPolicy, 'never', 'headless jobs never ask by default, like exec');
     handler.dispose!();
+    if (mode === 'read' || mode === 'write') {
+      const optIn = buildAppServer({ ...job, approvals: 'on-request' }, '/fake');
+      const opened: any[] = [];
+      const h = optIn.stdinPlan({ apply: action => { if (action.write) opened.push(...action.write.trim().split(String.fromCharCode(10)).map(line => JSON.parse(line))); }, emit() {} });
+      h('{"id":1,"result":{}}', 'stdout');
+      assert.equal(opened.find(m => m.method === 'thread/start').params.approvalPolicy, 'on-request');
+      h.dispose!();
+    }
   }
   assert.ok(parseAppServer(JSON.stringify({ method: 'error', params: { error: { message: 'You have hit your usage limit' }, willRetry: false } }), 'stdout')?.usageLimit);
   assert.equal(parseAppServer(JSON.stringify({ method: 'error', params: { error: { message: 'retry' }, willRetry: true } }), 'stdout'), null);

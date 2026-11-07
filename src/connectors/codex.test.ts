@@ -225,11 +225,11 @@ test('Codex detection fails open on unknown usage and backs off failed probes fo
   }
 });
 
-test('Codex detection refreshes shared successful usage after five minutes', async () => {
+test('Codex detection refreshes shared successful usage after the configured interval (five minutes here)', async () => {
   const f = fixture(); let calls = 0, time = 1000000;
   const live = async () => { calls++; return { available: true }; };
-  const a = new CodexConnector(undefined, binary, () => time, { home: f.home, onBattery: false, live });
-  const b = new CodexConnector(undefined, binary, () => time, { home: f.home, onBattery: false, live });
+  const a = new CodexConnector(undefined, binary, () => time, { home: f.home, onBattery: false, live, ttlMs: 300000 });
+  const b = new CodexConnector(undefined, binary, () => time, { home: f.home, onBattery: false, live, ttlMs: 300000 });
   try {
     await a.detect(); await b.detect(); assert.equal(calls, 1);
     time += 299999; await b.detect(); assert.equal(calls, 1);

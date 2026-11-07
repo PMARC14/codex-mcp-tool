@@ -1,7 +1,8 @@
 import { closeSync, fstatSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import spawn from 'cross-spawn';
+import type { ChildProcess } from 'node:child_process';
+import { safeSpawn } from '../jobs/proc.js';
 
 import { usageWindow, type UsageWindow } from '../jobs/usage.js';
 export type { UsageWindow } from '../jobs/usage.js';
@@ -135,7 +136,7 @@ export function fromAppServer(result: any, nowMs = Date.now()): CodexUsage | und
 export function readLiveCodexUsage(exe = 'codex', timeoutMs = 20000): Promise<CodexUsage | undefined> {
   return new Promise(resolveUsage => {
     let done = false;
-    let child: ReturnType<typeof spawn> | undefined;
+    let child: ChildProcess | undefined;
     const finish = (usage?: CodexUsage) => {
       if (done) return;
       done = true;
@@ -149,7 +150,7 @@ export function readLiveCodexUsage(exe = 'codex', timeoutMs = 20000): Promise<Co
     };
     const timer = setTimeout(() => finish(), timeoutMs);
     try {
-      child = spawn(exe, ['app-server'], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+      child = safeSpawn(exe, ['app-server'], { stdio: ['pipe', 'pipe', 'ignore'] }, process.platform === 'win32');
     } catch {
       return finish();
     }

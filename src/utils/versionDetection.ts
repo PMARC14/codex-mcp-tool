@@ -1,5 +1,6 @@
 import { Logger } from './logger.js';
 import { executeCommand } from './commandExecutor.js';
+import { usageIntervals } from '../jobs/config.js';
 
 /**
  * Codex CLI version detection.
@@ -37,7 +38,9 @@ export const MINIMUM_CODEX_VERSION_STRING = '0.95.0';
 // Version cache for performance optimization
 let cachedVersion: CodexVersion | null = null;
 let cacheTimestamp = 0;
-const VERSION_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+// The installed CLI does not change under a running server; every uncached lookup spawns it, so
+// the check repeats at most on the usage interval (15 min, configurable) and only when asked.
+const versionCacheTtl = () => usageIntervals().intervalMs;
 
 /**
  * Parse version string into structured format
@@ -108,7 +111,7 @@ export function meetsMinVersion(
  */
 export async function getCodexVersion(bypassCache: boolean = false): Promise<CodexVersion> {
   // Return cached version if valid
-  if (!bypassCache && cachedVersion && Date.now() - cacheTimestamp < VERSION_CACHE_TTL) {
+  if (!bypassCache && cachedVersion && Date.now() - cacheTimestamp < versionCacheTtl()) {
     Logger.debug(`Using cached Codex version: ${cachedVersion.raw}`);
     return cachedVersion;
   }

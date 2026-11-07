@@ -95,8 +95,9 @@ export function registerJobTools(
           .optional()
           .describe('Native CLI session ID to resume, from an earlier result.'),
         ...(prefix === 'codex' ? {
-          transport: z.enum(['exec', 'app-server']).optional().describe('Use app-server for steering and interactive approvals; omitted uses the configured default (exec).'),
+          transport: z.enum(['exec', 'app-server']).optional().describe('Use app-server for steering and interactive approvals; omitted uses the configured default (app-server).'),
           approvalTimeoutMin: z.number().positive().default(30),
+          approvals: z.enum(['never', 'on-request']).default('never').describe('App-server approval policy. never (default) never asks, like headless exec; on-request surfaces approvals as input_required in read/write modes.'),
         } : {}),
         idempotencyKey: z.string().min(1).optional(),
         priority: z.enum(['normal', 'optional']).default('normal'),

@@ -84,7 +84,7 @@ export async function runSelftest(log: TrafficLog = trafficLog) {
     await check('list', async () => { clientTaskList.parse(await rpc('tasks/list')); });
     for (const state of ['queued', 'paused', 'running'] as const) {
       await check(`get ${state === 'running' ? 'input_required' : state}`, async () => {
-        store.write({ ...store.get(taskId), state,
+        store.write({ ...store.get(taskId), state, resetAt: state === 'paused' ? Date.now() + 3600000 : undefined,
           pendingApproval: state === 'running' ? { id: 'fake', kind: 'userInput', summary: 'fake question', requestedAt: Date.now() } : undefined });
         const reply = await rpc('tasks/get', { taskId });
         clientTaskGet.parse(reply);
@@ -93,6 +93,12 @@ export async function runSelftest(log: TrafficLog = trafficLog) {
       });
     }
 
+    await check('get paused without retry', async () => {
+      store.write({ ...store.get(taskId), state: 'paused', resetAt: undefined, pendingApproval: undefined, error: 'usage limit' });
+      const reply = await rpc('tasks/get', { taskId });
+      clientTaskGet.parse(reply);
+      if (reply.status !== 'failed' || !/^quota_exhausted/.test(reply.error?.message ?? '')) throw new Error('wrong status');
+    });
     for (const state of ['completed', 'failed', 'lost'] as const) {
       await check(`get ${state}`, async () => {
         store.write({ ...store.get(taskId), state, pendingApproval: undefined, failureReason: state === 'lost' ? 'lost' : 'cli_error', error: 'fake failure' });

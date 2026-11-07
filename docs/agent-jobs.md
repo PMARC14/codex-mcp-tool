@@ -43,7 +43,7 @@ The default mode is `read` (`read-only`) for inspection. `write` allows edits in
 
 ## Steering and the opt-in Codex app-server transport
 
-`codex_agent` accepts `transport: "exec" | "app-server"`. Omission uses `AGENT_JOBS_CODEX_TRANSPORT`, then `config.json` `connectors.codex.defaultTransport`, then `exec`. The default retains its existing CLI arguments and prompt write-and-close behavior. `app-server` instead launches `codex app-server` through the same process runner, Windows Job Object, hidden-window handling, log files and process-tree cleanup. Transport and `approvalTimeoutMin` are saved in metadata and inherited by message follow-ups and retries.
+`codex_agent` accepts `transport: "exec" | "app-server"`. Omission uses `AGENT_JOBS_CODEX_TRANSPORT`, then `config.json` `connectors.codex.defaultTransport`, then the connector's own default, which is **`app-server`** for Codex (`exec` remains selectable per call, by env or by config). `exec` keeps its CLI arguments and prompt write-and-close behavior. `app-server` launches `codex app-server` through the same process runner, Windows Job Object, hidden-window handling, log files and process-tree cleanup. Transport and `approvalTimeoutMin` are saved in metadata and inherited by message follow-ups and retries.
 
 ```json
 {
@@ -59,7 +59,7 @@ While the job is running, call `codex_agent_message` with its `jobId` and a nonb
 
 For running delivery, the shared `<p>_agent_message` tool checks server ownership. Its connector capability is generic: each process gets a fresh `StdinHandler` from `StdinPlan(context)`, optionally exposing `onSteer(message)` which returns (or resolves to) a stdin action plus `delivered`. `context.apply` supports asynchronous writes/EOF and `context.emit` produces job events. Optional `onInterrupt`, `onRespond` and `dispose` hooks manage interactive lifetimes; existing callable line handlers remain compatible. Connectors without `onSteer`, including default Codex exec and the current agy connector, reject with: `this job can't take mid-turn messages; use <p>_agent_message after it stops, or start it with transport: app-server`. Agy can later supply its own queued stream-json user turn without depending on the Codex protocol.
 
-For app-server, modes map to sandbox `read-only`, `workspace-write`, and `danger-full-access` (`trusted` and `full`). Read/write use approval policy `on-request`; trusted/full use `never`. Thus full bypasses sandboxing and approvals. The existing exec mode mapping is unchanged. Model, reasoning effort, cwd and worktree Git writable directory are passed as thread settings. `resumeSession` uses `thread/resume` instead of `thread/start` before starting the prompt turn. Session IDs, final agent messages, reasoning and usage-limit/error events enter the same job event pipeline as exec.
+For app-server, modes map to sandbox `read-only`, `workspace-write`, and `danger-full-access` (`trusted` and `full`). The approval policy is `never` for every mode by default, matching headless `exec`, which never asks (with `on-request`, a read-only job blocked on an approval nobody saw and died with `approval_timeout`). Pass `approvals: "on-request"` to `codex_agent` to opt in for read/write jobs; approvals, `input_required` and elicitation then work as described below. `trusted` and `full` never ask either; `full` also bypasses the sandbox. The choice is saved in metadata and inherited by follow-ups. The existing exec mode mapping is unchanged. Model, reasoning effort, cwd and worktree Git writable directory are passed as thread settings. `resumeSession` uses `thread/resume` instead of `thread/start` before starting the prompt turn. Session IDs, final agent messages, reasoning and usage-limit/error events enter the same job event pipeline as exec.
 
 App-server cancellation first sends `turn/interrupt`, waits up to three seconds for the process to exit, and then performs the normal process-tree cleanup within the existing cancel deadline. Wall-clock timeouts still use normal cleanup directly.
 
@@ -187,7 +187,7 @@ The machine-wide limit defaults to eight running jobs and is enforced with a loc
   "maxJobs": 8,
   "wakeHold": true,
   "connectors": {
-    "codex": { "enabled": true, "defaultModel": null, "reviewModel": "gpt-6-astra", "defaultTransport": "exec" }
+    "codex": { "enabled": true, "defaultModel": null, "reviewModel": "gpt-6-astra", "defaultTransport": "app-server" }
   }
 }
 ```
@@ -268,3 +268,44 @@ Stopped jobs expose `failureReason` for quota exhaustion, timeout, cancellation,
 For `codex_agent_answer`, pass the `qid` shown in `awaitingInput` or the watch status to reject answers intended for an older question. Omitting it answers the current question; the response includes the `qid` answered, even if the question arrived after the last status read. Bridge questions can be answered by another server; app-server approvals require the owning server.
 
 Native and bridge questions share a per-job claim. A second question receives an "already awaiting an answer" error; it can be retried after the first clears. Claims expire at the question timeout; malformed claims expire after 30 minutes. If a server disappears while a matching file-based question remains unanswered, orphan recovery waits until an answer is written or the question expires, then resumes its usual cleanup; answering does not transfer ownership of the worker.
+
+
+## Stability and cost rules (W1)
+
+### Answers and locks
+
+- A server that does not own a job (a foreign responder) only publishes `answer-<qid>.json`. It never writes `meta.json`; the owner's sampler clears `awaitingInput` once the answer exists or the question expires. An orphaned job's stale `awaitingInput` is cleared by the recovery sweep.
+- Answers are first-writer-wins: the answer is written to a temp file and hard-linked to `answer-<qid>.json`. An identical repeat is an idempotent success, a different answer is an error.
+- An orphaned worker kept alive because it was waiting for an answer is flagged `orphanPreserved` and left supervised until its process exits or its wall-clock timeout passes; answering it does not end preservation.
+- The bridge and the app-server question poller retry `EBUSY`/`EPERM`/`EACCES` on the next tick, and the bridge deadline makes one last answer check before returning the fallback text. A claim that cannot be released never turns a delivered answer into an error. A structurally invalid claim file expires by file age.
+- `src/jobs/lock.ts` is the one cross-process lock: `reclaimStale` serializes reclaimers with a `.reaper` file, re-reads under it, renames the lock to a unique tombstone and verifies the content (restoring a wrongly taken lock with `linkSync`); `releaseOwned` renames the lock to a unique name and checks ownership before deleting. The only remaining window is microseconds, and only if a stale-by-timestamp owner releases at the exact moment of reclamation.
+- Two continuations (`agent_message` resume, `agent_retry`) cannot share one worktree: the second is rejected while another queued, reserved or running job uses it, and promotion also skips a job whose worktree is busy.
+- A retry to another connector clears `resumeSession`, `sessionId` and `transport`. A failed channel send removes its `channel-sent` marker so the hook fallback still fires.
+
+### Idle cost and check cadence
+
+- The 500 ms pump only scans job metadata when nothing is queued, paused (with a due reset) or owned and running. It never calls `detect()` or spawns a process. `detect()` runs only when a job is about to start or auto-retry.
+- Version/sign-in checks and usage probes run at most every **15 minutes on AC and 30 minutes on battery**. Configure with `~/.agent-jobs/config.json` `usage: { "intervalMin": 15, "batteryIntervalMin": 30 }`, or `AGENT_JOBS_USAGE_INTERVAL_MIN` / `AGENT_JOBS_USAGE_BATTERY_INTERVAL_MIN` (environment wins). The battery interval is never shorter than the AC one. A failed probe waits the longer of the interval and the 15-minute backoff. The `--version` result is cached for the same interval.
+- Job edges anchor the checks: just before a job starts (`<p>_agent`, a resume through `_agent_message`, `_agent_retry`, queue auto-retry) the manager calls `connector.refreshUsage()`; when a job stops it calls it again. Each refresh restarts the interval timer, and the cache never probes one connector more than once per 60 s, so several jobs starting together share one probe. Besides job edges, a probe happens only when the cache is older than the interval **and** a reader needs it (`*_usage`, `health`, `selftest`, a status-line reader).
+- Power status is cached for 10 minutes in the usage cache and is read only when the cache needs a TTL decision.
+
+### No console windows (Windows Terminal)
+
+Windows Terminal is the default terminal, and a console program started with a new console shows up as a tab. Every spawn uses `windowsHide: true` and never `detached` on Windows (`finalSpawnOptions` in `proc.ts`). Job processes and all short checks (`--version`, `/usage`, `codex app-server` usage reads, PowerShell, git) go through the Job Object launcher, whose `CreateProcess` call passes `CREATE_SUSPENDED | CREATE_NO_WINDOW` (`0x08000004`, exported as `LAUNCHER_CREATE_FLAGS`), so neither the child nor any grandchild gets a visible console. `runCommand`/`runCommandBuffer` do this automatically on Windows.
+
+**What the agy port must call** (`antigravity-mcp-server/src/utils/commandExecutor.ts` and the agy connector):
+
+1. Replace every direct `spawn`/`cross-spawn`/`execFile` with `safeSpawn(exe, args, options, true)`, or `runCommand(exe, args)` for one-shot checks such as `agy --version` and `agy -p /usage`.
+2. Implement `Connector.refreshUsage()` as `getUsage('agy', probe, { force: true })`.
+3. Make `detect()` read the cached version and usage instead of running `--version` unconditionally; cache the version for `usageIntervals().intervalMs`.
+4. Sync `jobobject.ts`, `proc.ts`, `usage-cache.ts`, `lock.ts`, `config.ts` (`usageIntervals`), `question-claim.ts`, `bridge.ts` and `spawn-stats.ts` unchanged from this fork.
+
+### Tasks and protocol
+
+- A paused job projects as `working` with `statusMessage` "paused until <iso> - will retry" when the queue will retry it (reset time known), and as `failed` with `error.message` starting `quota_exhausted:` when nothing will resume it. A pause changes the status key, so a `notifications/tasks/status` update is sent. `tasks/result` treats the unrecoverable pause as terminal. `<p>_agent_follow` keeps following through an auto-retrying pause.
+- `server/discover` replies carry no `resultType`/`ttlMs`/`cacheScope` (the client-schema evidence only shows these on tool results). Status notifications use the era negotiated on the call that created the task (modern: `ttlMs`/`pollIntervalMs`; 2025: `ttl`/`pollInterval`). Failed projections omit `result` in `tasks/list` and notifications, and terminal payloads are cached per `updatedAt`.
+- The traffic log redacts home-directory paths, never logs argument values (Zod errors are reduced to `path:code`), drops the stack's message line and caps stacks at 2 KB.
+
+### Legacy tools
+
+`ask-codex`, `batch-codex`, `review-changes`, `do-act`, `brainstorm`, `fetch-chunk`, `timeout-test`, `image-gen`, `list-skills`, `list-sessions`, `help`, `ping` and `version` are registered only when `CODEX_MCP_LEGACY_TOOLS=1`. `health`, `codex_usage`, `codex_selftest`, `codex_debug_log` and all `codex_agent*` tools always register.

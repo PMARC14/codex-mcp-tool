@@ -10,7 +10,7 @@ import { getUsage } from './usage-cache.js';
 
 test('usage cache shares five-minute results and backs off fifteen minutes on battery or failure', async () => {
   const f = fixture(); let time = 1000000, calls = 0, battery = false, fail = false;
-  const opts = { home: f.home, now: () => time, onBattery: () => battery };
+  const opts = { home: f.home, now: () => time, onBattery: () => battery, ttlMs: 300000, batteryTtlMs: 900000 };
   const probe = async () => {
     calls++;
     if (fail) throw new Error('offline');
@@ -20,7 +20,7 @@ test('usage cache shares five-minute results and backs off fifteen minutes on ba
     assert.equal((await getUsage('fake', probe, opts))?.parsed?.percent, 42);
     time += 299999; await getUsage('fake', probe, opts); assert.equal(calls, 1);
     time++; await getUsage('fake', probe, opts); assert.equal(calls, 2);
-    battery = true; time += 300000;
+    battery = true; time += 600000; // power status is cached for ten minutes
     await getUsage('fake', probe, opts); assert.equal(calls, 2);
     time += 600000; await getUsage('fake', probe, opts); assert.equal(calls, 3);
     battery = false; fail = true; time += 300000;
@@ -82,19 +82,19 @@ test('usage cache reclaims expired locks and caches unsuccessful probe results',
 
 test('battery readers reuse timestamped power state without taking the usage lock', async () => {
   const f = fixture(); let time = 1000000, powerReads = 0, probes = 0, locks = 0;
-  const original = fs.openSync;
+  const original = fs.linkSync;
   const probe = async () => { probes++; return { ok: true, raw: 42, parsed: 42 }; };
-  const opts = { home: f.home, now: () => time, onBattery: () => { powerReads++; return true; } };
+  const opts = { home: f.home, now: () => time, ttlMs: 300000, batteryTtlMs: 1800000, onBattery: () => { powerReads++; return true; } };
   try {
     await getUsage('fake', probe, opts);
     time += 300000;
     await getUsage('fake', probe, opts); // Detect battery and remember when it was checked.
     const reads = powerReads;
     assert.ok(reads > 0);
-    fs.openSync = ((path: fs.PathLike, flags: any, ...args: any[]) => {
-      if (String(path).endsWith('fake-usage.lock') && flags === 'wx') locks++;
-      return (original as any)(path, flags, ...args);
-    }) as typeof fs.openSync;
+    fs.linkSync = ((existing: fs.PathLike, path: fs.PathLike) => {
+      if (String(path).endsWith('fake-usage.lock')) locks++;
+      return original(existing, path);
+    }) as typeof fs.linkSync;
     syncBuiltinESMExports();
     for (let i = 0; i < 5; i++) {
       time += 1000;
@@ -104,11 +104,11 @@ test('battery readers reuse timestamped power state without taking the usage loc
     assert.equal(locks, 0, 'fresh battery snapshots return before acquiring the usage lock');
     assert.equal(probes, 1);
     assert.equal(JSON.parse(readFileSync(join(f.home, 'cache', 'fake-usage.json'), 'utf8')).takenAt, 1000000);
-    time += 300000;
+    time += 600000;
     await getUsage('fake', probe, opts);
     assert.ok(powerReads > reads, 'power state has its own expiry');
-    time = 1900000;
+    time = 3000000;
     await getUsage('fake', probe, opts);
-    assert.equal(probes, 2, 'battery does not extend quota freshness past fifteen minutes');
-  } finally { fs.openSync = original; syncBuiltinESMExports(); f.cleanup(); }
+    assert.equal(probes, 2, 'battery does not extend quota freshness past the battery interval');
+  } finally { fs.linkSync = original; syncBuiltinESMExports(); f.cleanup(); }
 });

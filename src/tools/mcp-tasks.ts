@@ -19,7 +19,7 @@ import type { JobManager } from '../jobs/manager.js';
 import type { JobMeta } from '../jobs/connector.js';
 import { atomicWrite, terminal } from '../jobs/store.js';
 import { toolRegistry, executeTool } from './registry.js';
-import { progressMessage } from '../jobs/watch.js';
+import { autoRetries, progressMessage } from '../jobs/watch.js';
 import { clientAgentTaskMeta, clientWireId } from './client-schemas.js';
 import { trafficLog, type TrafficLog } from './traffic-log.js';
 
@@ -80,7 +80,7 @@ export class TaskStdioTransport extends StdioServerTransport {
       if (request?.modern && 'result' in message) {
         let result: any = message.result;
         if (result.task) result = { ...modernTask(result.task), ...(result._meta ? { _meta: result._meta } : {}) };
-        else if (result.resultType !== 'task' && !['tasks/get', 'tasks/cancel', 'tasks/list', 'tasks/update'].includes(request.method)) {
+        else if (result.resultType !== 'task' && !['server/discover', 'tasks/get', 'tasks/cancel', 'tasks/list', 'tasks/update'].includes(request.method)) {
           result = { resultType: 'complete', ttlMs: 0, cacheScope: 'private', ...result };
           if (request.method === 'tools/list') {
             result.tools = result.tools.map(({ execution: _execution, ...tool }: any) => tool);
@@ -108,7 +108,13 @@ export function registerMcpTasks(
   }
   const subscribed = new Set<string>();
   const statuses = new Map<string, string>();
-  const statusKey = (job: JobMeta) => `${taskFor(job).status}:${job.awaitingInput?.qid ?? ''}:${job.pendingApproval?.id ?? ''}`;
+  // A pause changes the message but not the status, so the state and reset time are part of the key.
+  const statusKey = (job: JobMeta) => `${taskFor(job).status}:${job.awaitingInput?.qid ?? ''}:${job.pendingApproval?.id ?? ''}:${job.state === 'paused' ? `paused:${job.resetAt ?? ''}` : ''}`;
+  /** Whether a paused job will be retried by the queue by itself (a reset time is known). */
+  const willRetry = autoRetries;
+  /** A paused job that nothing will resume is final for the client: quota_exhausted. */
+  const taskTerminal = (job: JobMeta) => terminal(job) || (job.state === 'paused' && !willRetry(job));
+  const eras = new Map<string, boolean>();
   let unsubscribe: (() => void) | undefined;
   const marker = (id: string) => join(manager.store.dir(id), 'mcp-task.json');
   const jobFor = (id: string) => {
@@ -126,7 +132,13 @@ export function registerMcpTasks(
     if (job.state === 'completed') status = 'completed';
     if (job.state === 'failed' || job.state === 'lost') status = 'failed';
     if (job.state === 'killed') status = 'cancelled';
-    const statusMessage = progressMessage(manager, job);
+    let statusMessage = progressMessage(manager, job);
+    if (job.state === 'paused') {
+      status = willRetry(job) ? 'working' : 'failed';
+      statusMessage = willRetry(job)
+        ? `paused until ${new Date(job.resetAt!).toISOString()} — will retry`
+        : 'paused: usage limit reached and no reset time is known — will not retry (quota_exhausted); use agent_retry';
+    }
     return {
       taskId: job.id,
       status,
@@ -142,7 +154,20 @@ export function registerMcpTasks(
     isError: false,
   });
 
-  const projection = async (job: JobMeta) => {
+  // Terminal payloads are immutable per updatedAt; polling must not re-read the files each time.
+  const payloads = new Map<string, CallToolResult>();
+  const payloadFor = async (job: JobMeta) => {
+    const key = `${job.id}:${job.updatedAt}`;
+    let value = payloads.get(key);
+    if (!value) {
+      value = await payload(job.id);
+      if (payloads.size >= 64) payloads.delete(payloads.keys().next().value!);
+      payloads.set(key, value);
+    }
+    return value;
+  };
+
+  const projection = async (job: JobMeta, withFailureResult = true) => {
     const { resultType: _type, ...base } = modernTask(taskFor(job));
     if (base.status === 'input_required') {
       const input = job.awaitingInput;
@@ -161,12 +186,18 @@ export function registerMcpTasks(
       } } : {} };
 
     }
-    if (base.status === 'completed') return { ...base, result: await payload(job.id) };
-    if (base.status === 'failed') return {
-      ...base, error: { message: `${job.failureReason ?? job.reason ?? job.state}: ${
-        (job.error ?? `Job ${job.state}${job.exitCode != null ? ` (exit ${job.exitCode})` : ''}`).replace(/\s+/g, ' ').slice(0, 300)}` },
-      result: await payload(job.id),
-    };
+    if (base.status === 'completed') return { ...base, result: await payloadFor(job) };
+    if (base.status === 'failed') {
+      const quota = job.state === 'paused';
+      return {
+        ...base, error: { message: quota
+          ? `quota_exhausted: ${(job.error ?? 'usage limit reached; no reset time known').replace(/\s+/g, ' ').slice(0, 300)}`
+          : `${job.failureReason ?? job.reason ?? job.state}: ${
+            (job.error ?? `Job ${job.state}${job.exitCode != null ? ` (exit ${job.exitCode})` : ''}`).replace(/\s+/g, ' ').slice(0, 300)}` },
+        // The client's failed schema ignores result; it is only read for single-task gets.
+        ...(withFailureResult && !quota ? { result: await payloadFor(job) } : {}),
+      };
+    }
     return base;
   };
   const agentMeta = (job: JobMeta) => ({
@@ -248,7 +279,7 @@ export function registerMcpTasks(
       const check = () => {
         try {
           if (extra.signal.aborted) return abort();
-          if (terminal(jobFor(id))) {
+          if (taskTerminal(jobFor(id))) {
             cleanup();
             resolve();
           }
@@ -280,12 +311,12 @@ export function registerMcpTasks(
       tasks: await Promise.all(manager.store
         .list()
         .filter(job => job.connector === manager.connector.id && existsSync(marker(job.id)))
-        .map(job => modern(request.params) ? projection(job) : taskFor(job))),
+        .map(job => modern(request.params) ? projection(job, false) : taskFor(job))),
     };
   });
 
   return {
-    async call(name: string, args: any) {
+    async call(name: string, args: any, requestMeta?: Record<string, unknown>) {
       if (!supportsTask(prefix, name))
         throw new McpError(ErrorCode.InvalidParams, `Tool ${name} does not support tasks`);
       const tool = registry.find(tool => tool.name === name)!;
@@ -303,13 +334,15 @@ export function registerMcpTasks(
       const job = jobFor(id);
       if (!existsSync(marker(id))) atomicWrite(marker(id), '{}');
       subscribed.add(id);
+      eras.set(id, modern({ _meta: requestMeta }));
       statuses.set(id, statusKey(job));
       // Lazily subscribe so clients making only ordinary calls acquire no listeners.
       unsubscribe ??= manager.onTransition(job => {
         if (!subscribed.has(job.id)) return;
         if (statuses.get(job.id) === statusKey(job)) return;
         statuses.set(job.id, statusKey(job));
-        void projection(job).then(params => server
+        // The notification shape must match the era this connection negotiated.
+        void (eras.get(job.id) ? projection(job, false) : Promise.resolve(taskFor(job))).then(params => server
           .notification({ method: 'notifications/tasks/status', params }))
           .catch(error => trafficLog.error('notifications/tasks/status', error));
       });
@@ -320,6 +353,7 @@ export function registerMcpTasks(
       unsubscribe = undefined;
       subscribed.clear();
       statuses.clear();
+      eras.clear();
     },
   };
 }

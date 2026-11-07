@@ -48,6 +48,7 @@ export interface StartOptions {
   resumeSession?: string;
   transport?: JobSpec['transport'];
   approvalTimeoutMin?: number;
+  approvals?: 'never' | 'on-request';
   timeoutMin?: number;
   stallTimeoutMin?: number;
   onStall?: 'report' | 'kill';
@@ -157,20 +158,35 @@ export class JobManager {
   // Must run under the shared lock. The slot and the identities needed to retry the cleanup are
   // only dropped once the tree is confirmed dead; a later recovery pass retries the same record.
   private async recoverOrphan(job: JobMeta, now: number): Promise<void> {
-    // A file-based question can still be answered after its server disappears. Defer
-    // orphan cleanup only while its matching, unexpired mailbox has no answer.
-    if (job.state === 'running' && job.awaitingInput) {
-      const { qid, askedAt } = job.awaitingInput;
-      try {
-        const dir = this.store.dir(job.id);
-        const question = JSON.parse(readFileSync(join(dir, 'question.json'), 'utf8'));
-        let deadline = askedAt + 1800000;
+    // A worker that was waiting on a file-based question survives its server and can still be
+    // answered by a replacement. It is preserved (and flagged, so an answer does not end the
+    // preservation) until its process exits or its wall-clock timeout passes.
+    if (job.state === 'running' && (job.orphanPreserved || job.awaitingInput)) {
+      const dir = this.store.dir(job.id);
+      let preserve = !!job.orphanPreserved;
+      if (!preserve && job.awaitingInput) {
+        const { qid, askedAt } = job.awaitingInput;
         try {
-          const claim = JSON.parse(readFileSync(join(dir, 'question.lock'), 'utf8'));
-          if (claim.id === qid && Number.isFinite(claim.ts) && Number.isFinite(claim.timeoutMs)) deadline = claim.ts + claim.timeoutMs;
-        } catch { /* Old mailbox without a claim uses the default timeout. */ }
-        if (question.id === qid && now < deadline && !existsSync(join(dir, `answer-${qid}.json`))) return;
-      } catch { /* Missing or malformed mailbox permits normal orphan cleanup. */ }
+          const question = JSON.parse(readFileSync(join(dir, 'question.json'), 'utf8'));
+          let deadline = askedAt + 1800000;
+          try {
+            const claim = JSON.parse(readFileSync(join(dir, 'question.lock'), 'utf8'));
+            if (claim.id === qid && Number.isFinite(claim.ts) && Number.isFinite(claim.timeoutMs)) deadline = claim.ts + claim.timeoutMs;
+          } catch { /* Old mailbox without a claim uses the default timeout. */ }
+          preserve = question.id === qid && now < deadline && !existsSync(join(dir, `answer-${qid}.json`));
+        } catch { /* Missing or malformed mailbox permits normal orphan cleanup. */ }
+      }
+      const timedOut = now > (job.startedAt ?? job.createdAt) + job.timeoutMin * 60000;
+      if (preserve && !timedOut && (!job.process || (await ownerAlive(job.process)))) {
+        let changed = !job.orphanPreserved;
+        job.orphanPreserved = true;
+        if (job.awaitingInput && existsSync(join(dir, `answer-${job.awaitingInput.qid}.json`))) {
+          job.awaitingInput = undefined; // answered: nobody else is left to clear it
+          changed = true;
+        }
+        if (changed) this.store.write(job);
+        return;
+      }
     }
     if (job.state === 'lost' && now - (this.cleanupTried.get(job.id) ?? 0) < 2000) return;
     this.cleanupTried.set(job.id, now);
@@ -213,11 +229,18 @@ export class JobManager {
       throw new Error(
         `${this.connector.id} is disabled in agent-jobs config; enable it and restart this MCP server`
       );
+    await this.refreshUsage(); // pre-dispatch budget check; also keeps detect() on a fresh snapshot
     const detected = await this.connector.detect();
     if (!detected.available)
       throw new Error(
         detected.reason || `Install ${this.connector.id} CLI and sign in before starting jobs`
       );
+  }
+
+  /** Job-edge usage refresh (about to start / just stopped). Never throws and never probes more than the connector allows. */
+  private async refreshUsage(): Promise<void> {
+    try { await this.connector.refreshUsage?.(); }
+    catch (error) { this.logger.warn('Usage refresh failed', error); }
   }
 
   private selectModel(requested?: string, connector = this.connector.id): string | undefined {
@@ -261,6 +284,7 @@ export class JobManager {
       throw new Error('verifyTimeoutMin must be positive');
     if (!Number.isFinite(options.stallTimeoutMin ?? 10) || (options.stallTimeoutMin ?? 10) < 0) throw new Error('stallTimeoutMin must be non-negative');
     if (options.transport !== undefined && !['exec', 'app-server'].includes(options.transport)) throw new Error('Unknown job transport');
+    if (options.approvals !== undefined && !['never', 'on-request'].includes(options.approvals)) throw new Error('approvals must be never or on-request');
     if (!Number.isFinite(options.approvalTimeoutMin ?? 30) || (options.approvalTimeoutMin ?? 30) <= 0) throw new Error('approvalTimeoutMin must be positive');
     return withLock(this.config.home, async () => {
       if (options.idempotencyKey && !followUpOf) {
@@ -291,8 +315,9 @@ export class JobManager {
         effort: options.effort,
         label: options.label,
         resumeSession: options.resumeSession,
-        transport: options.transport ?? this.config.connectors[this.connector.id]?.defaultTransport ?? 'exec',
+        transport: options.transport ?? this.config.connectors[this.connector.id]?.defaultTransport ?? this.connector.defaultTransport ?? 'exec',
         approvalTimeoutMin: options.approvalTimeoutMin ?? 30,
+        approvals: options.approvals ?? 'never',
         steers: 0,
         timeoutMin,
         stallTimeoutMin: options.stallTimeoutMin ?? 10,
@@ -323,6 +348,7 @@ export class JobManager {
               : undefined;
           if ((options.mode ?? original.mode) === 'read' && original.verifyCommand)
             throw new Error('verify requires a non-read mode');
+          if (reusable) this.assertWorktreeFree(reusable.path, original.id);
           meta = {
             ...meta,
             connector: original.connector,
@@ -342,6 +368,7 @@ export class JobManager {
             resumeSession: original.sessionId,
             transport: original.transport ?? 'exec',
             approvalTimeoutMin: original.approvalTimeoutMin ?? 30,
+            approvals: options.approvals ?? original.approvals ?? 'never',
             followUpOf,
           };
           this.store.create(meta, prompt);
@@ -370,6 +397,14 @@ export class JobManager {
         `Job is still running or queued; use ${job.connector}_agent_follow and send once it stops, or ${job.connector}_agent_stop first (wait for process cleanup if reserved)`
       );
     if (!job.sessionId) throw new Error('Job has no sessionId; cannot send a follow-up');
+  }
+
+  /** Must run under the shared lock. Two continuations must never edit one worktree at once. */
+  private assertWorktreeFree(path: string, exceptJobId: string): void {
+    const busy = this.store.list().find(other =>
+      other.id !== exceptJobId && other.worktree?.path === path && !other.worktree.removed &&
+      (other.reserved || (!terminal(other) && !(other.state === 'paused' && other.pauseCleared))));
+    if (busy) throw new Error(`Job ${busy.id} already continues in this worktree; wait for it to stop or stop it first`);
   }
 
   async send(
@@ -429,14 +464,14 @@ export class JobManager {
       const qid = job.awaitingInput?.qid;
       try { answerBridge(this.store, job, decision.answer, decision.qid); }
       finally {
-        // Also persist expiry discovered while answering, before the next sampler tick.
-        if (qid && !job.awaitingInput) {
-          if (active) {
-            active.job.awaitingInput = undefined;
-            active.job.stalled = false;
-            active.job.stalledSince = undefined;
-            this.store.save(active.job, this.owner);
-          } else this.store.write(job);
+        // Only the owning server writes job metadata. A foreign responder publishes just the answer
+        // file; the owner's sampler clears awaitingInput when it sees the answer (or expiry).
+        // Expiry discovered while answering is persisted here, before the next sampler tick.
+        if (qid && !job.awaitingInput && active) {
+          active.job.awaitingInput = undefined;
+          active.job.stalled = false;
+          active.job.stalledSince = undefined;
+          this.store.save(active.job, this.owner);
         }
       }
       return { responded: true, qid };
@@ -477,16 +512,21 @@ export class JobManager {
   private async pumpAvailable(): Promise<boolean> {
     const now = Date.now();
     if (!this.detected || now - this.detected.at >= DETECT_TTL_MS)
-      this.detected = { available: (await this.connector.detect()).available, at: now };
+      this.detected = { available: (await (async () => { await this.refreshUsage(); return this.connector.detect(); })()).available, at: now };
     return this.detected.available;
   }
 
   private async promote(): Promise<void> {
-    if (
-      this.config.connectors[this.connector.id]?.enabled === false ||
-      !(await this.pumpAvailable())
-    )
-      return;
+    if (this.config.connectors[this.connector.id]?.enabled === false) return;
+    // Idle servers (the common case in every Claude Code session) only scan metadata: nothing is
+    // spawned, detect() is not called and the shared lock is not taken unless a job needs work.
+    const peek = this.store.list();
+    if (!peek.some(job => !terminal(job) || job.reserved)) return;
+    // detect() can spawn the CLI; ask only when a job is about to start or retry.
+    const now0 = Date.now();
+    const aboutToStart = peek.some(job => job.connector === this.connector.id && !job.pauseCleared &&
+      (job.state === 'queued' || (job.state === 'paused' && !!job.resetAt && job.resetAt <= now0)));
+    if (aboutToStart && !(await this.pumpAvailable())) return;
     const ready: JobMeta[] = [];
     try {
       await withLock(this.config.home, async () => {
@@ -554,6 +594,7 @@ export class JobManager {
         const pauses = saved.filter(pause => !pause.resetAt || pause.resetAt > now);
         if (pauses.length !== saved.length) this.store.writePauses(pauses);
         let slots = jobs.filter(job => job.state === 'running' || job.reserved).length;
+        const busyWorktrees = new Set(jobs.filter(job => (job.state === 'running' || job.reserved) && job.worktree && !job.worktree.removed).map(job => job.worktree!.path));
         for (const job of jobs.reverse()) {
           if (job.connector !== this.connector.id || terminal(job)) continue;
           if (!job.owner && job.state === 'queued') {
@@ -603,6 +644,8 @@ export class JobManager {
             continue;
           }
           if (slots >= this.config.maxJobs) continue;
+          if (job.worktree && !job.worktree.removed && busyWorktrees.has(job.worktree.path)) continue;
+          if (job.worktree && !job.worktree.removed) busyWorktrees.add(job.worktree.path);
           // Reserve before spawning, under the same lock used by both forks.
           job.reserved = true;
           job.manualRequeue = false;
@@ -759,6 +802,7 @@ export class JobManager {
         .finally(() => {
           if (!killFailed) this.active.delete(job.id);
           if (!this.active.size) this.hold.stop();
+          void this.refreshUsage(); // what the job spent; resets the interval timer
           void this.pump().catch(error => this.logger.warn('Job queue error', error));
         });
       const sampleBridge = bridgeSampler(this.store, job);
@@ -1015,6 +1059,7 @@ export class JobManager {
         );
       if (original.worktree?.removed)
         throw new Error('The worktree was removed; start a new job with the saved prompt');
+      if (original.worktree) this.assertWorktreeFree(original.worktree.path, original.id);
       const id = randomUUID();
       const meta: JobMeta = {
         ...original,
@@ -1031,6 +1076,10 @@ export class JobManager {
         descendants: undefined,
         reserved: false,
         sessionId: undefined,
+        // A native session belongs to one CLI; another connector must start fresh.
+        resumeSession: agent === original.connector ? original.resumeSession : undefined,
+        transport: agent === original.connector ? original.transport : undefined,
+        orphanPreserved: undefined,
         pendingApproval: undefined,
         awaitingInput: undefined,
         progressNote: undefined,

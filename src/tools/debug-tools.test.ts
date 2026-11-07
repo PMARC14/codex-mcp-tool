@@ -7,6 +7,7 @@ import { runSelftest } from './debug-tools.js';
 import { TrafficLog, installRequestErrorReporting } from './traffic-log.js';
 import { clientTaskGet, clientInputRequests, clientAgentTaskMeta, clientTaskBase } from './client-schemas.js';
 import { readConfig } from '../jobs/config.js';
+import { CodexConnector } from '../connectors/codex.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { z } from 'zod';
 
@@ -16,7 +17,7 @@ test('live selftest exercises the real adapter in-process without a CLI', async 
     const log = new TrafficLog('codex', home);
     const result = await runSelftest(log);
     assert.equal(result.pass, true, JSON.stringify(result.steps));
-    assert.equal(result.steps.length, 12);
+    assert.equal(result.steps.length, 13);
     assert.equal(result.logPath, log.path);
     const entries = log.tail(200).map(line => JSON.parse(line));
     assert.ok(entries.some(entry => entry.dir === 'in' && entry.method === 'tasks/get'));
@@ -76,10 +77,11 @@ test('handler errors retain a structured code, failing step, field, and logged s
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
-test('Codex transport defaults: exec fallback, config, environment override and invalid values', () => {
+test('Codex transport defaults: app-server fallback, config, environment override and invalid values', () => {
   const home = mkdtempSync(join(tmpdir(), 'task-config-'));
   try {
-    assert.equal(readConfig({ AGENT_JOBS_HOME: home }).connectors.codex?.defaultTransport ?? 'exec', 'exec');
+    assert.equal(readConfig({ AGENT_JOBS_HOME: home }).connectors.codex?.defaultTransport, undefined);
+    assert.equal(new CodexConnector().defaultTransport, 'app-server'); // the fallback when nothing is configured
     writeFileSync(join(home, 'config.json'), JSON.stringify({ connectors: { codex: { defaultTransport: 'app-server' } } }));
     assert.equal(readConfig({ AGENT_JOBS_HOME: home }).connectors.codex.defaultTransport, 'app-server');
     assert.equal(readConfig({ AGENT_JOBS_HOME: home, AGENT_JOBS_CODEX_TRANSPORT: 'exec' }).connectors.codex.defaultTransport, 'exec');

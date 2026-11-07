@@ -22,7 +22,8 @@ import { Logger } from '../utils/logger.js';
 export const codexJobManager = new JobManager(new CodexConnector(), undefined, Logger);
 registerJobTools(toolRegistry, 'codex', codexJobManager);
 
-toolRegistry.push(
+/** Legacy synchronous tools, hidden unless CODEX_MCP_LEGACY_TOOLS=1. */
+export const legacyTools = [
   askCodexTool,
   batchCodexTool,
   reviewCodexTool,
@@ -33,13 +34,18 @@ toolRegistry.push(
   fetchChunkTool,
   timeoutTestTool,
   listSessionsTool,
-  healthTool,
   listSkillsTool,
   doActTool,
   imageGenTool,
-  codexUsageTool,
-  selftestTool,
-  debugLogTool
-);
+];
+
+export const legacyToolsEnabled = (env: NodeJS.ProcessEnv = process.env) => env.CODEX_MCP_LEGACY_TOOLS === '1';
+
+/** health, usage, selftest and debug log always register; the legacy set only on request. */
+export function registerStandaloneTools(registry: typeof toolRegistry, env: NodeJS.ProcessEnv = process.env) {
+  registry.push(...(legacyToolsEnabled(env) ? legacyTools : []), healthTool, codexUsageTool, selftestTool, debugLogTool);
+}
+
+registerStandaloneTools(toolRegistry);
 
 export * from './registry.js';

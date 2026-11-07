@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { JobMeta, JobState, JobLogger } from './connector.js';
@@ -121,11 +121,19 @@ export function startChannelNotifier(
       }
     }
     sent.add(key);
+    // A failed send must not leave the marker behind, or the hook fallback stays suppressed.
+    const unmark = () => {
+      sent.delete(key);
+      if (!manager.store) return;
+      const marker = awaiting ? `channel-sent-${createHash('sha256').update(key).digest('hex')}` : 'channel-sent';
+      try { unlinkSync(join(manager.store.dir(job.id), marker)); } catch { /* already gone */ }
+    };
     try {
       void Promise.resolve(
         server.notification({ method: CHANNEL_METHOD, params: channelEvent(job, prefix) })
-      ).catch(error => logger?.warn('Channel notification failed', error));
+      ).catch(error => { unmark(); logger?.warn('Channel notification failed', error); });
     } catch (error) {
+      unmark();
       logger?.warn('Channel notification failed', error);
     }
   };
