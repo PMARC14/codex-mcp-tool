@@ -90,7 +90,7 @@ test('MCP watch progress is immediate, monotonic, bounded and stops when the cal
   try {
     const progress: { progress: number; message?: string }[] = [];
     const pending = s.client.callTool(
-      { name: 'test_job_watch', arguments: { jobId: s.job.id } },
+      { name: 'test_agent_follow', arguments: { jobId: s.job.id } },
       undefined,
       {
         onprogress: params => progress.push(params),
@@ -119,7 +119,7 @@ test('MCP watch with no progress token sends no notifications', async () => {
   const s = await setup();
   try {
     const result = await s.client.callTool({
-      name: 'test_job_watch',
+      name: 'test_agent_follow',
       arguments: { jobId: s.job.id, maxWaitSec: 0.04 },
     });
     const content = result.content as { type: string; text: string }[];
@@ -136,7 +136,7 @@ for (const action of ['cancel', 'disconnect'] as const) {
     const controller = new AbortController();
     try {
       const pending = s.client.callTool(
-        { name: 'test_job_watch', arguments: { jobId: s.job.id } },
+        { name: 'test_agent_follow', arguments: { jobId: s.job.id } },
         undefined,
         {
           signal: controller.signal,

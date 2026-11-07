@@ -34,7 +34,7 @@ import { getToolDefinitions, toolRegistry } from '../tools/registry.js';
     const messages: string[] = [];
     await manager.watch(jobId, 10, { showReasoning: true, heartbeatMs: 20, onProgress: message => messages.push(message) });
     assert.ok(messages.some(message => message.includes('Last sentence.')));
-    assert.ok(existsSync(join(manager.store.dir(jobId), 'collected')));
+    assert.equal(existsSync(join(manager.store.dir(jobId), 'collected')), false);
   } finally { await manager.dispose(); f.cleanup(); }
 });
 
@@ -44,8 +44,8 @@ test('tool titles reach MCP definitions', () => {
   const before = toolRegistry.length;
   try {
     toolRegistry.push(...jobs);
-    const tool = getToolDefinitions().find(t => t.name === 'codex_job_watch')!;
-    assert.equal(tool.title, 'Codex agent: watch job');
+    const tool = getToolDefinitions().find(t => t.name === 'codex_agent_follow')!;
+    assert.equal(tool.title, 'Codex agent: follow');
     assert.equal(tool.annotations?.title, tool.title);
   } finally { toolRegistry.splice(before); f.cleanup(); }
 });
@@ -175,4 +175,32 @@ test('cancellation while preparing verification prevents the verify process', as
     assert.equal(result.failureReason, 'cancelled');
     assert.equal(manager.store.read(jobId, 'verify'), '');
   } finally { release('bash'); await manager.dispose(); f.cleanup(); }
+});
+
+
+test('only explicit result and follow tools collect fully built stopped results', async () => {
+  const f = fixture(); const manager = new JobManager(fakeConnector(f.script), f.config);
+  const tools: JobTool[] = []; registerJobTools(tools, 'codex', manager);
+  try {
+    await manager.initialize();
+    for (const kind of ['result', 'follow'] as const) {
+      const job = meta(f.home, { id: `collect-${kind}`, state: 'completed' });
+      manager.store.create(job, 'p');
+      const marker = join(manager.store.dir(job.id), 'collected');
+      await manager.result(job.id);
+      assert.equal(existsSync(marker), false, 'internal reads leave the wake eligible');
+      const tool = tools.find(t => t.name === `codex_agent_${kind}`)!;
+      const tail = manager.store.tail;
+      manager.store.tail = () => { throw new Error('result assembly failed'); };
+      try { await assert.rejects(tool.execute({ jobId: job.id }), /result assembly failed/); }
+      finally { manager.store.tail = tail; }
+      assert.equal(existsSync(marker), false, 'failed result assembly must not collect');
+      await tool.execute({ jobId: job.id });
+      assert.equal(existsSync(marker), true);
+    }
+    const job = meta(f.home, { id: 'still-queued' }); manager.store.create(job, 'p');
+    await tools.find(t => t.name === 'codex_agent_result')!.execute({ jobId: job.id });
+    await tools.find(t => t.name === 'codex_agent_follow')!.execute({ jobId: job.id, maxWaitSec: 0 });
+    assert.equal(existsSync(join(manager.store.dir(job.id), 'collected')), false);
+  } finally { await manager.dispose(); f.cleanup(); }
 });

@@ -2,6 +2,8 @@ import type { JobMeta } from './connector.js';
 import type { JobManager } from './manager.js';
 
 export interface WatchOptions {
+  /** Explicit follow tool collection; internal waits leave wake markers untouched. */
+  markCollected?: boolean;
   onProgress?: (message: string) => void;
   signal?: AbortSignal;
   showReasoning?: boolean;
@@ -10,7 +12,7 @@ export interface WatchOptions {
 }
 
 export function progressMessage(manager: JobManager, job: JobMeta, showReasoning = false): string {
-  // Match job_status's stdout window, without reading the whole log or probing processes.
+  // Match agent_status's stdout window, without reading the whole log or probing processes.
   const line = manager.store.tail(job.id, 'stdout', 20).slice(-10000).trim().split(/\r?\n/).pop();
   let summary = line ?? '';
   try {
@@ -128,5 +130,7 @@ export async function watchJob(
   }
   const result = await manager.result(jobId);
   checkAbort();
-  return { ...result, watchedSec: (Date.now() - started) / 1000, timedOut };
+  const response = { ...result, watchedSec: (Date.now() - started) / 1000, timedOut };
+  if (options.markCollected && !['queued', 'running'].includes(response.state)) manager.markCollected(jobId);
+  return response;
 }

@@ -9,6 +9,7 @@ import { JobManager } from '../jobs/manager.js';
 import { fixture, fakeConnector, until } from '../jobs/test-helpers.js';
 import { registerMcpTasks } from '../tools/mcp-tasks.js';
 import { startChannelNotifier } from '../jobs/channel.js';
+import { registerJobTools, type JobTool } from '../jobs/tools.js';
 import { progressMessage } from '../jobs/watch.js';
 import type { JobSpec } from '../jobs/connector.js';
 
@@ -138,7 +139,16 @@ test('app-server steers mid-turn and queues a new turn when completion races the
     try {
       const { jobId } = await f.manager.start({ prompt: JSON.stringify({ hold: true, race }), cwd: f.home, transport: 'app-server' });
       await f.ready(jobId);
-      assert.deepEqual(await f.manager.steer(jobId, 'new instruction'), { delivered: race ? 'queued' : 'mid-turn' });
+      const tools: JobTool[] = []; registerJobTools(tools, 'codex', f.manager);
+      const message = tools.find(t => t.name === 'codex_agent_message')!;
+      assert.deepEqual(JSON.parse(await message.execute({ jobId, message: 'new instruction',
+        mode: 'full', model: 'ignored', effort: 'ultra', timeoutMin: 500 })),
+        { delivered: race ? 'queued' : 'mid-turn', jobId });
+      const saved = f.manager.store.get(jobId);
+      assert.equal(saved.mode, 'read');
+      assert.notEqual(saved.model, 'ignored');
+      assert.notEqual(saved.effort, 'ultra');
+      assert.equal(saved.timeoutMin, 120);
       assert.equal((await f.manager.watch(jobId, 20)).state, 'completed');
       assert.equal((await f.manager.status(jobId) as any).steers, 1);
       const log = JSON.parse(readFileSync(join(f.manager.store.dir(jobId), 'steer.log'), 'utf8'));
@@ -155,7 +165,7 @@ test('exec rejects steering clearly and remains write-and-close', async () => {
   try {
     const { jobId } = await manager.start({ cwd: f.home, prompt: JSON.stringify({ waitMs: 2000 }) });
     await until(() => manager.store.get(jobId).state === 'running');
-    await assert.rejects(() => manager.steer(jobId, 'hello'), /this job can't take mid-turn messages; use codex_job_send after it stops, or start it with transport: app-server/);
+    await assert.rejects(() => manager.steer(jobId, 'hello'), /this job can't take mid-turn messages; use codex_agent_message after it stops, or start it with transport: app-server/);
     assert.equal((await manager.watch(jobId, 20)).state, 'completed');
     assert.equal(manager.store.get(jobId).steers, 0);
   } finally { await manager.dispose(); f.cleanup(); }
@@ -342,15 +352,15 @@ test('native question replies on malformed answer file and primitive multi-answe
     const f = fixture();
     const writes: any[] = [];
     const job = { finalPath: join(f.home, 'final'), cwd: f.home, mode: 'write', prompt: 'fake' } as JobSpec;
-    const plan = buildAppServer(job, 'fake', { config: {}, prompt: 'fake' } as any).stdinPlan;
-    const handler = plan({ apply(action) { if (action.write) writes.push(JSON.parse(action.write)); }, emit() {} });
+    const plan = buildAppServer(job, 'fake', { config: {}, prompt: 'fake' } as any, { questionPollMs: 10 }).stdinPlan;
+    const handler = plan({ apply(action: any) { if (action.write) writes.push(JSON.parse(action.write)); }, emit() {} });
     try {
       handler(JSON.stringify({ id: 'q', method: 'item/tool/requestUserInput', params: { questions: [
         { id: 'one', question: 'One?' }, { id: 'two', question: 'Two?' },
       ] } }), 'stdout');
       const qid = JSON.parse(readFileSync(join(f.home, 'question.json'), 'utf8')).id;
       writeFileSync(join(f.home, `answer-${qid}.json`), raw);
-      await until(() => writes.some(m => m.id === 'q'), 'native reply', 2500);
+      await until(() => writes.some(m => m.id === 'q'), 'native reply', 10000);
       assert.ok(writes.find(m => m.id === 'q').result || writes.find(m => m.id === 'q').error);
     } finally { handler.dispose?.(); f.cleanup(); }
   }
@@ -358,7 +368,7 @@ test('native question replies on malformed answer file and primitive multi-answe
 
 
 
-test('task approval exposes a decision elicitation and routes decline', async () => {
+for (const decision of ['decline', 'acceptForSession'] as const) test(`task approval exposes a decision elicitation and routes ${decision}`, async () => {
   const f = setup();
   const handlers = new Map<string, any>();
   const tasks = registerMcpTasks({ setRequestHandler(schema: any, handler: any) { handlers.set(schema.shape.method.value, handler); } } as unknown as Server, 'codex', f.manager, { capabilities: {} });
@@ -366,11 +376,12 @@ test('task approval exposes a decision elicitation and routes decline', async ()
     const { jobId } = await f.manager.start({ prompt: JSON.stringify({ approval: 'commandExecution' }), cwd: f.home, transport: 'app-server', mode: 'write' });
     await until(() => !!f.manager.store.get(jobId).pendingApproval && f.manager.store.get(jobId).state === 'running');
     const task = await handlers.get('tasks/get')({ params: { taskId: jobId, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } });
+    assert.equal(task.status, 'input_required');
     const [key, request] = Object.entries(task.inputRequests)[0] as [string, any];
     assert.deepEqual(request.params.requestedSchema.properties.decision.enum, ['accept', 'acceptForSession', 'decline', 'cancel']);
-    await handlers.get('tasks/update')({ params: { taskId: jobId, inputResponses: { [key]: { action: 'decline' } } } });
+    await handlers.get('tasks/update')({ params: { taskId: jobId, inputResponses: { [key]: decision === 'decline' ? { action: 'decline' } : { action: 'accept', content: { decision } } } } });
     await until(() => f.messages().some(m => m.id === 'approval-1'));
-    assert.equal(f.messages().find(m => m.id === 'approval-1').result.decision, 'decline');
+    assert.equal(f.messages().find(m => m.id === 'approval-1').result.decision, decision);
   } finally { tasks.close(); await f.cleanup(); }
 });
 

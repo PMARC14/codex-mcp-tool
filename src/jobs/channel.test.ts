@@ -111,7 +111,7 @@ test('each notifying state sends exactly once with metadata only', () => {
     assert.equal(m.label, 'mylabelx');
     assert.equal(
       call.params.content.startsWith(
-        `codex job ${m.state}: call codex_job_result with this job_id`
+        `codex agent ${m.state}: call codex_agent_result with this job_id`
       ),
       true
     );
@@ -122,7 +122,7 @@ test('each notifying state sends exactly once with metadata only', () => {
   assert.match(paused.params.content, /2030-01-02T03:04:05.000Z/);
   const done = calls.find(call => call.params.meta!.state === 'completed')!;
   assert.equal(done.params.meta!.reset_at, undefined);
-  assert.equal(done.params.content, 'codex job completed: call codex_job_result with this job_id');
+  assert.equal(done.params.content, 'codex agent completed: call codex_agent_result with this job_id');
 });
 
 test('label is sanitized, capped and omitted when empty; meta keys are identifiers', () => {
@@ -219,9 +219,9 @@ test('capabilities and instructions merge when enabled', () => {
     experimental: { 'claude/channel': {} },
   });
   const text = withChannelInstructions('Existing.', 'agy', ON)!;
-  assert.match(text, /^Existing\.\n\nBackground job events arrive as <channel source=/);
-  assert.match(text, /call agy_job_result with the job_id/);
-  assert.match(withChannelInstructions(undefined, 'agy', ON)!, /^Background job events/);
+  assert.match(text, /^Existing\.\n\nBackground agent events arrive as <channel source=/);
+  assert.match(text, /call agy_agent_result with the job_id/);
+  assert.match(withChannelInstructions(undefined, 'agy', ON)!, /^Background agent events/);
 });
 
 test('real manager: terminal states notify once without leaking worker output', async () => {

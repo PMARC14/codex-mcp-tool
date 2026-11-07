@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import spawn from 'cross-spawn';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, meta, until } from '../jobs/test-helpers.js';
 import { JobStore } from '../jobs/store.js';
@@ -159,7 +159,7 @@ async function setup(f = fixture(), era: 'legacy' | 'modern' = 'legacy') {
     detects: () => readFileSync(detectsPath, 'utf8'),
     start: (options: any = {}, task?: object) =>
       call(
-        'codex_job_start',
+        'codex_agent',
         {
           cwd: f.home,
           prompt: JSON.stringify({ waitMs: 1800, final: 'task result', ...options }),
@@ -169,7 +169,7 @@ async function setup(f = fixture(), era: 'legacy' | 'modern' = 'legacy') {
   };
 }
 
-test('legacy task start returns immediately, polls metadata, notifies, and returns job_result verbatim', async () => {
+test('legacy task start returns immediately, polls metadata, notifies, and returns agent_result verbatim', async () => {
   const s = await setup();
   try {
     assert.equal(s.initialized.protocolVersion, '2025-11-25');
@@ -188,7 +188,7 @@ test('legacy task start returns immediately, polls metadata, notifies, and retur
     const pendingResult = s.rpc('tasks/result', { taskId });
     await until(() => s.store.get(taskId).state === 'completed');
     const result = await pendingResult;
-    assert.deepEqual(result, await s.call('codex_job_result', { jobId: taskId }));
+    assert.deepEqual(result, await s.call('codex_agent_result', { jobId: taskId }));
     assert.equal(JSON.parse(result.content[0].text).final, 'task result');
     assert.equal((await s.rpc('tasks/get', { taskId })).status, 'completed');
     await until(() =>
@@ -246,7 +246,7 @@ test('paused tasks stay working until reset, and superseded jobs name their repl
     assert.equal(paused.status, 'working');
     assert.match(paused.statusMessage, /Paused until /);
     assert.ok(paused.statusMessage.includes(new Date(s.store.get(taskId).resetAt!).toISOString()));
-    const replacement = await s.call('codex_job_requeue', { jobId: taskId });
+    const replacement = await s.call('codex_agent_retry', { jobId: taskId });
     const supersededBy = JSON.parse(replacement.content[0].text).jobId;
     const superseded = await s.rpc('tasks/get', { taskId });
     assert.equal(superseded.status, 'cancelled');
@@ -265,8 +265,8 @@ test('ordinary calls stay unchanged; task watch adopts the job immediately; exec
     assert.deepEqual(
       tools.filter((tool: any) => tool.execution).map((tool: any) => [tool.name, tool.execution]),
       [
-        ['codex_job_start', { taskSupport: 'optional' }],
-        ['codex_job_watch', { taskSupport: 'optional' }],
+        ['codex_agent', { taskSupport: 'optional' }],
+        ['codex_agent_follow', { taskSupport: 'optional' }],
       ]
     );
     const started = await s.start();
@@ -274,18 +274,18 @@ test('ordinary calls stay unchanged; task watch adopts the job immediately; exec
     assert.equal(started.task, undefined);
     const { jobId } = JSON.parse(started.content[0].text);
     assert.deepEqual((await s.rpc('tasks/list')).tasks, []);
-    const watched = await s.call('codex_job_watch', { jobId, maxWaitSec: 0 });
+    const watched = await s.call('codex_agent_follow', { jobId, maxWaitSec: 0 });
     const watchResult = JSON.parse(watched.content[0].text);
     assert.equal(watchResult.timedOut, true);
     assert.equal(watchResult.jobId, jobId);
     assert.equal(s.notifications.filter(n => n.method === 'notifications/tasks/status').length, 0);
-    const taskWatch = await s.call('codex_job_watch', { jobId }, {});
+    const taskWatch = await s.call('codex_agent_follow', { jobId }, {});
     assert.equal(taskWatch.task.taskId, jobId);
     assert.equal(taskWatch.task.status, 'working');
     await until(() => s.store.get(jobId).state === 'completed');
     assert.deepEqual(
       await s.rpc('tasks/result', { taskId: jobId }),
-      await s.call('codex_job_result', { jobId })
+      await s.call('codex_agent_result', { jobId })
     );
     const invalid = await s.raw('tools/call', { name: 'ping', arguments: {}, task: {} });
     assert.equal(invalid.error.code, -32602);
@@ -312,7 +312,7 @@ test('tasks survive reconnect; read-only lookup does not subscribe and other con
     assert.equal((await s.rpc('tasks/get', { taskId })).status, 'completed');
     assert.deepEqual(
       await s.rpc('tasks/result', { taskId }),
-      await s.call('codex_job_result', { jobId: taskId })
+      await s.call('codex_agent_result', { jobId: taskId })
     );
     assert.deepEqual(
       (await s.rpc('tasks/list')).tasks.map((t: any) => t.taskId),
@@ -360,16 +360,16 @@ test('modern discovery, extension opt-in, task get, and complete envelopes match
     assert.equal(result.resultType, undefined);
     assert.equal(
       result.result.content[0].text,
-      (await s.call('codex_job_result', { jobId: taskId })).content[0].text
+      (await s.call('codex_agent_result', { jobId: taskId })).content[0].text
     );
     const ordinary = await s.raw('tools/call', {
-      name: 'codex_job_start',
+      name: 'codex_agent',
       arguments: { prompt: JSON.stringify({ waitMs: 10 }), cwd: s.f.home },
       _meta: modernMeta(false),
     });
     assert.equal(ordinary.result.resultType, 'complete');
     assert.ok(JSON.parse(ordinary.result.content[0].text).jobId);
-    const watch = await s.call('codex_job_watch', { jobId: taskId });
+    const watch = await s.call('codex_agent_follow', { jobId: taskId });
     assert.equal(watch.resultType, 'task');
     assert.equal(watch.taskId, taskId);
     assert.equal(watch.status, 'completed');
@@ -401,12 +401,12 @@ test('task notifications follow derived approval status and suppress unchanged p
   const manager = { connector: { id: 'codex' }, store, onTransition: store.onWrite.bind(store) };
   const server = { setRequestHandler() {}, async notification(value: any) { notices.push(value); } };
   const before = toolRegistry.length;
-  toolRegistry.push({ name: 'codex_job_watch', zodSchema: z.object({ jobId: z.string() }) } as any);
+  toolRegistry.push({ name: 'codex_agent_follow', zodSchema: z.object({ jobId: z.string() }) } as any);
   const tasks = registerMcpTasks(server as any, 'codex', manager as any, { capabilities: {} });
   try {
     const job = meta(f.home, { state: 'running' });
     store.create(job, 'fake');
-    await tasks.call('codex_job_watch', { jobId: job.id });
+    await tasks.call('codex_agent_follow', { jobId: job.id });
     const approval = { id: 'a', kind: 'commandExecution', summary: 'fake', requestedAt: 1 };
     store.write({ ...job, pendingApproval: approval });
     store.write({ ...job, pendingApproval: approval });
@@ -433,5 +433,24 @@ test('modern cancel returns a task projection with modern timing fields', async 
     const result = await s.rpc('tasks/get', { taskId });
     assert.equal(result.status, 'cancelled');
     assert.equal(result.resultType, undefined);
+  } finally { await s.cleanup(); s.f.cleanup(); }
+});
+
+
+test('modern task projections never collect results or suppress the hook wake', async () => {
+  const s = await setup(undefined, 'modern');
+  try {
+    const { taskId } = await s.start({ waitMs: 20 });
+    await until(() => s.store.get(taskId).state === 'completed');
+    const marker = join(s.store.dir(taskId), 'collected');
+    assert.equal(existsSync(marker), false, 'terminal notifications do not collect');
+    assert.equal((await s.rpc('tasks/get', { taskId })).status, 'completed');
+    assert.equal(existsSync(marker), false, 'polling does not collect');
+    await s.rpc('tasks/list');
+    assert.equal(existsSync(marker), false, 'listing does not collect');
+    await s.rpc('tasks/result', { taskId });
+    assert.equal(existsSync(marker), false, 'task payload reads do not collect');
+    await s.call('codex_agent_result', { jobId: taskId });
+    assert.equal(existsSync(marker), true, 'explicit result tool collects');
   } finally { await s.cleanup(); s.f.cleanup(); }
 });

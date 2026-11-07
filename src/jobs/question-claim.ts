@@ -20,7 +20,7 @@ export function claimQuestion(dir: string, claim: Claim): boolean {
         try {
           const old = JSON.parse(raw) as Claim;
           expired = Number.isFinite(old.ts) && Number.isFinite(old.timeoutMs) && Date.now() >= old.ts + old.timeoutMs;
-        } catch { expired = Date.now() - statSync(path).mtimeMs > 86400000; }
+        } catch { expired = Date.now() - statSync(path).mtimeMs >= 30 * 60 * 1000; }
         if (!expired) return false;
         reclaimStale(path, raw);
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }

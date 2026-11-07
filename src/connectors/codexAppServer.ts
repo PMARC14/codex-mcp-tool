@@ -16,7 +16,7 @@ const errorEvent = (message: string, code?: string): JobEvent => ({
 });
 
 /** Protocol discovered with codex-cli 0.166.0 generate-json-schema / generate-ts. */
-export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(job)) {
+export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(job), options: { questionPollMs?: number } = {}) {
   const stdinPlan: StdinPlan = context => {
     let sequence = 1;
     let threadId: string | undefined;
@@ -97,7 +97,7 @@ export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(j
           context.apply({ write: wire({ id: message.id, error: { code: -32603, message: 'Could not read question answer' } }) });
           clearQuestion(message.id);
         } }
-      }, 2000);
+      }, options.questionPollMs ?? 2000);
       const deadline = setTimeout(() => reply('no answer within 1800 s; continue with your best judgement'), 1800000);
       nativeQuestions.set(message.id, { qid, questions, timer, deadline });
     };

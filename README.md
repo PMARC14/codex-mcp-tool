@@ -13,7 +13,7 @@ MCP server connecting Claude/Cursor to Codex CLI. Enables code analysis via `@` 
 
 ## Features
 
-- **Background jobs and worktrees** — `codex_job_*` tools share a persistent queue and machine-wide limit with the agy fork. See [agent jobs](docs/agent-jobs.md).
+- **Background agents and worktrees** — `codex_agent` and `codex_agent_*` tools share a persistent queue and machine-wide limit with the agy fork. See [agent jobs](docs/agent-jobs.md).
 
 - **File Analysis** — Reference files with `@src/`, `@package.json` syntax
 - **Multi-Turn Sessions** — Conversation continuity with workspace isolation
@@ -94,15 +94,16 @@ claude mcp add codex-cli -- npx -y @trishchuk/codex-mcp-tool
 | `help`           | Return current `codex --help` output                                |
 | `version`        | Report Codex CLI, Node.js, platform, and package versions           |
 | `timeout-test`   | Exercise keepalive and timeout behavior                             |
-| `codex_job_start`, `codex_job_status`, `codex_job_result`, `codex_job_cancel` | Start, inspect, retrieve or cancel shared background jobs. |
-| `codex_job_watch`, `codex_job_send` | Wait with progress or resume a stopped job with a follow-up. |
-| `codex_job_list`, `codex_job_read`, `codex_job_requeue` | List jobs, page saved files or retry a stopped job. |
-| `codex_worktree_collect` | Save a patch and optionally remove a stopped worktree. |
+| `codex_agent`, `codex_agent_status`, `codex_agent_result`, `codex_agent_stop` | Start, inspect, retrieve or cancel shared background jobs. |
+| `codex_agent_follow`, `codex_agent_message` | Follow with progress or message a running agent / resume a stopped session. |
+| `codex_agent_list`, `codex_agent_read`, `codex_agent_retry` | List jobs, page saved files or retry a stopped job. |
+| `codex_agent_answer` | Answer a pending question (`answer`, optional `qid`) or approval (`decision`). |
+| `codex_agent_collect` | Save a patch and optionally remove a stopped worktree. |
 | `codex_usage` | Shared cached quota without a model turn; session-log fallback is marked by source. |
 
 See [agent jobs](docs/agent-jobs.md) and the [symmetry audit](docs/job-surface-audit.md) for shared behavior and vendor differences.
 
-`codex_job_start` and `codex_job_watch` also support MCP tasks, with no server launch flag. Task requests return a handle immediately and expose completion through task polling and status notifications, allowing Claude Code to show the job in `/tasks` and deliver its result. Both the 2025-11-25 protocol and the 2026-07-28 tasks extension are supported; Claude Code's own task feature settings still apply. Calls that do not request tasks retain their existing job ID, watch progress, and channel behavior. See [MCP tasks](docs/agent-jobs.md#mcp-tasks-no-launch-flag) for negotiation and request shapes.
+`codex_agent` and `codex_agent_follow` also support MCP tasks, with no server launch flag. Task requests return a handle immediately and expose completion through task polling and status notifications, allowing Claude Code to show the job in `/tasks` and deliver its result. Claude Code 2.1.319 uses only the 2026-07-28 tasks extension; the 2025-11-25 path remains for SDK compatibility. Claude Code's own task feature settings still apply. Calls that do not request tasks retain their existing job ID, watch progress, and channel behavior. See [MCP tasks](docs/agent-jobs.md#mcp-tasks-no-launch-flag) for negotiation and request shapes.
 
 Codex usage, auth detection, and optional-job quota guards share a machine-wide cache: five minutes normally, fifteen on battery or after a failed probe, with one probe at a time across servers. Channel notifications use their own delivery marker and leave the PostToolUse hook wake available; sessions with both paths may receive two wakes. See [agent jobs](docs/agent-jobs.md) for cache and notification details.
 
@@ -286,6 +287,6 @@ MIT License. Not affiliated with OpenAI.
 [Documentation](https://x51xxx.github.io/codex-mcp-tool/) | [Issues](https://github.com/x51xxx/codex-mcp-tool/issues) | Inspired by [jamubc/gemini-mcp-tool](https://github.com/jamubc/gemini-mcp-tool)
 
 
-Background-task compatibility is tested against Claude Code 2.1.319's status-discriminated schemas. Agents have named status lines and immediate task notes. Use `codex_selftest` after reconnecting to validate the live server without starting a CLI/model, and `codex_debug_log` for redacted, rotating traffic logs. Set `connectors.codex.defaultTransport` in `~/.agent-jobs/config.json` or `AGENT_JOBS_CODEX_TRANSPORT` to `exec` (default) or `app-server`; choose `app-server` when you may need `codex_job_steer`. See [agent jobs](docs/agent-jobs.md).
+Background-task compatibility is tested against Claude Code 2.1.319's status-discriminated schemas. Agents have named status lines and immediate task notes. Use `codex_selftest` after reconnecting to validate the live server without starting a CLI/model, and `codex_debug_log` for redacted, rotating traffic logs. Set `connectors.codex.defaultTransport` in `~/.agent-jobs/config.json` or `AGENT_JOBS_CODEX_TRANSPORT` to `exec` (default) or `app-server`; choose `app-server` when you may need `codex_agent_message`. See [agent jobs](docs/agent-jobs.md).
 
-Workers can now call the per-job `ask_orchestrator` and `report_progress` bridge tools. Pending questions appear as `awaiting answer`; respond with `codex_job_respond { jobId, answer }` or `codex_job_steer`, or use the task's elicitation form. Native app-server questions use the same flow. Read milestone notes with `codex_job_read { jobId, name: "notes" }`. Bridge settings are injected per run and leave global CLI configuration unchanged.
+Workers can now call the per-job `ask_orchestrator` and `report_progress` bridge tools. Pending questions appear as `awaiting answer`; respond with `codex_agent_answer { jobId, answer }` or `codex_agent_message`, or use the task's elicitation form. Native app-server questions use the same flow. Read milestone notes with `codex_agent_read { jobId, name: "notes" }`. Bridge settings are injected per run and leave global CLI configuration unchanged.

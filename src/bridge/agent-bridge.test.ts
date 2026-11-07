@@ -67,14 +67,17 @@ test('live native and bridge questions exclude each other and expired claims can
     handler(JSON.stringify({ method: 'serverRequest/resolved', params: { requestId: 'first' } }), 'stdout');
     // Dispose clears a native request even when the fake server has no initialized thread.
     handler.dispose?.();
-    const ask = p.client.callTool({ name: 'ask_orchestrator', arguments: { question: 'bridge', timeoutSec: 0.3 } });
+    const ask = p.client.callTool({ name: 'ask_orchestrator', arguments: { question: 'bridge', timeoutSec: 3600 } });
     await until(() => existsSync(join(dir, 'question.json')), 'bridge question', 1500);
     const second = buildAppServer(job, 'fake', { config: {}, prompt: 'fake' } as any).stdinPlan({ apply(a) { if (a.write) writes.push(JSON.parse(a.write)); }, emit() {} });
     try {
       second(JSON.stringify({ id: 'second', method: 'item/tool/requestUserInput', params: { questions: [{ id: 'a', question: 'native' }] } }), 'stdout');
       assert.match(writes.find(m => m.id === 'second')?.error?.message ?? '', /already awaiting/i);
     } finally { second.dispose?.(); }
-    await ask;
+    const qid = JSON.parse(readFileSync(join(dir, 'question.json'), 'utf8')).id;
+    writeFileSync(join(dir, `answer-${qid}.json`), JSON.stringify({ answer: 'release claim' }));
+    const reply: any = await ask;
+    assert.equal(reply.content[0].type === 'text' && reply.content[0].text, 'release claim');
     assert.equal(existsSync(join(dir, 'question.lock')), false);
   } finally { handler.dispose?.(); await p.close(); f.cleanup(); }
 });

@@ -1,6 +1,6 @@
 # Job-facing symmetry audit
 
-The ten shared tools (nine `*_job_*` tools plus `*_worktree_collect`) use identical descriptions and schemas after replacing the connector prefix, including watch and send. Registration, watch-specific progress, request cancellation, channel setup, signal disposal and stdio disconnect handling are wired equivalently. No entrypoint changes were needed. Disconnect cancels the watch while running jobs continue saving results; process signals dispose the manager.
+The eleven shared agent tools (`<p>_agent`, message, answer, follow, status, result, read, list, stop, retry, and collect) use the connector prefix with no old-name aliases. Message steers running agents or answers pending questions, and resumes stopped sessions with optional overrides. Task augmentation belongs only to `<p>_agent` and `<p>_agent_follow`. Registration, follow progress, request cancellation, channel setup, signal disposal and stdio disconnect handling use the shared module. Disconnect cancels the follow while running agents continue saving results; process signals dispose the manager. The Codex launch schema adds app-server transport and approval settings.
 
 Fixed: conditional agy read-mode recovery in background and legacy execution; empty recovery answer retention; common usage window/snapshot/meter names and source provenance; shared ISO/duration/clock reset parsing and model-scoped pauses; missing agy health detection/configuration fields and structured failure output; stale read-turn, usage and tool-list documentation.
 
@@ -10,11 +10,11 @@ Intentional differences: tool prefixes and model catalogs; agy model-group quota
 | --- | --- |
 | Codex `do-act` | Verification/fix loop; keep vendor-specific, use shared jobs for orchestration. |
 | Codex `image-gen` | Built-in Codex image tool; keep vendor-specific until agy has an equivalent capability. |
-| Codex `fetch-chunk` | Pages the legacy response cache; use `*_job_read` for shared saved outputs. |
+| Codex `fetch-chunk` | Pages the legacy response cache; use `*_agent_read` for shared saved outputs. |
 | Codex `list-skills` | Discovers Codex workspace skills; retain Codex-specific discovery. |
 | Codex `timeout-test` | Diagnostic keepalive exercise; keep local, use fake watch tests for parity. |
 | agy `bg-antigravity` | Separate detached task store/lifecycle with buffered two-turn read input; prefer shared jobs for conditional recovery. |
-| agy `delegate-antigravity` | Separate worktree delegation lifecycle; prefer job_start(worktree:true) and worktree_collect. |
+| agy `delegate-antigravity` | Separate worktree delegation lifecycle; prefer agent(worktree:true) and agent_collect. |
 | agy `digest-antigravity` | File ingestion helper; retain as a vendor convenience. |
 | agy `plan-antigravity` | Structured planning helper; retain as a vendor convenience using read mode. |
 | agy `metrics` | Local invocation telemetry; keep separate from account quota usage. |

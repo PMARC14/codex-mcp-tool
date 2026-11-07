@@ -47,8 +47,8 @@ for (const action of ['requeue', 'send'] as const) {
 
       const tools: JobTool[] = [];
       registerJobTools(tools, 'codex', manager);
-      for (const name of ['status', 'result', 'watch']) {
-        const tool = tools.find(tool => tool.name === `codex_job_${name}`)!;
+      for (const name of ['status', 'result', 'follow']) {
+        const tool = tools.find(tool => tool.name === `codex_agent_${name}`)!;
         // A long heartbeat and deadline make an accidental wait fail this test promptly.
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 2000);
@@ -59,7 +59,7 @@ for (const action of ['requeue', 'send'] as const) {
           assert.equal(result.state, 'killed');
           assert.equal(result.reason, 'superseded');
           assert.equal(result.supersededBy, replacement.jobId);
-          if (name === 'watch') assert.equal(result.timedOut, false);
+          if (name === 'follow') assert.equal(result.timedOut, false);
         } finally {
           clearTimeout(timeout);
         }

@@ -562,7 +562,7 @@ export function startProcess(options: {
     done,
     ...(inputHandler?.onSteer ? { steer: async (message: string) => {
       if (closed || outcome || !child?.stdin?.writable || child.stdin.writableEnded)
-        throw new Error('Job input has closed; use job_send after it stops');
+        throw new Error('Job input has closed; use agent_message after it stops');
       const action = await inputHandler.onSteer!(message);
       updateStdin(child.stdin, action);
       return action;

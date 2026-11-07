@@ -44,7 +44,7 @@ test('traffic summaries redact content at both levels, bound arguments and bytes
     for (const full of [false, true]) {
       const log = new TrafficLog(full ? 'full' : 'summary', home, 6000, full);
       for (let i = 0; i < 30; i++) {
-        log.message('in', { id: i, method: 'tools/call', params: { name: 'codex_job_start',
+        log.message('in', { id: i, method: 'tools/call', params: { name: 'codex_agent',
           arguments: { prompt: 'secret prompt', nested: { message: 'secret message' }, label: 'x'.repeat(1000) } } });
         log.message('out', { id: i, result: { status: 'completed', content: [{ text: 'secret output' }], result: { reasoning: 'secret reasoning' }, tools: Array.from({ length: 1000 }, () => ({ name: 'test' })) } });
       }

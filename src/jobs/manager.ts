@@ -367,7 +367,7 @@ export class JobManager {
   private assertSendable(job: JobMeta): void {
     if (job.state === 'queued' || job.state === 'running' || job.reserved)
       throw new Error(
-        `Job is still running or queued; use ${job.connector}_job_watch and send once it stops, or ${job.connector}_job_cancel first (wait for process cleanup if reserved)`
+        `Job is still running or queued; use ${job.connector}_agent_follow and send once it stops, or ${job.connector}_agent_stop first (wait for process cleanup if reserved)`
       );
     if (!job.sessionId) throw new Error('Job has no sessionId; cannot send a follow-up');
   }
@@ -385,6 +385,20 @@ export class JobManager {
     return { jobId: result.jobId, state: result.state, followUpOf: jobId };
   }
 
+  async message(
+    jobId: string,
+    message: string,
+    overrides: Pick<StartOptions, 'mode' | 'model' | 'effort' | 'timeoutMin'> = {}
+  ) {
+    await this.initialize();
+    if (this.store.get(jobId).state === 'running') {
+      const { delivered } = await this.steer(jobId, message);
+      return { delivered, jobId };
+    }
+    const followUp = await this.send(jobId, message, overrides);
+    return { delivered: 'resumed' as const, jobId: followUp.jobId };
+  }
+
   watch(jobId: string, maxWaitSec = 1800, options: WatchOptions = {}) {
     return watchJob(this, jobId, maxWaitSec, options, this.watchShutdown.signal);
   }
@@ -397,7 +411,7 @@ export class JobManager {
     if (!message.trim()) throw new Error('Steer message must not be blank');
     if (job.awaitingInput) { await this.respond(jobId, { answer: message }); return { delivered: 'answer' as const }; }
     const active = this.active.get(jobId);
-    if (!active?.process.steer) throw new Error(`this job can't take mid-turn messages; use ${this.connector.id}_job_send after it stops, or start it with transport: app-server`);
+    if (!active?.process.steer) throw new Error(`this job can't take mid-turn messages; use ${this.connector.id}_agent_message after it stops, or start it with transport: app-server`);
     if (active.cancelled) throw new Error('Job is stopping');
     const { delivered } = await active.process.steer(message);
     appendFileSync(join(this.store.dir(jobId), 'steer.log'), JSON.stringify({ timestamp: new Date().toISOString(), message }) + '\n');
@@ -413,12 +427,17 @@ export class JobManager {
       const active = this.active.get(jobId);
       if (job.state !== 'running' || active?.cancelled) throw new Error('No pending question for this running job');
       const qid = job.awaitingInput?.qid;
-      answerBridge(this.store, job, decision.answer, decision.qid);
-      if (active) {
-        active.job.awaitingInput = undefined;
-        active.job.stalled = false;
-        active.job.stalledSince = undefined;
-        this.store.save(active.job, this.owner);
+      try { answerBridge(this.store, job, decision.answer, decision.qid); }
+      finally {
+        // Also persist expiry discovered while answering, before the next sampler tick.
+        if (qid && !job.awaitingInput) {
+          if (active) {
+            active.job.awaitingInput = undefined;
+            active.job.stalled = false;
+            active.job.stalledSince = undefined;
+            this.store.save(active.job, this.owner);
+          } else this.store.write(job);
+        }
       }
       return { responded: true, qid };
     }
@@ -871,7 +890,7 @@ export class JobManager {
     };
   }
 
-  async result(jobId: string, waitSec = 0, includeReasoning = false) {
+  async result(jobId: string, waitSec = 0, includeReasoning = false, options: { markCollected?: boolean } = {}) {
     await this.initialize();
     const deadline = Date.now() + Math.min(10, Math.max(0, waitSec)) * 1000;
     let job = this.store.get(jobId);
@@ -880,12 +899,11 @@ export class JobManager {
       job = this.store.get(jobId);
     }
     const final = await this.store.page(jobId, 'final', 0, 20000);
-    if (!['queued', 'running'].includes(job.state)) writeFileSync(resolve(this.store.dir(jobId), 'collected'), '');
     let reasoningTail: string | undefined;
     if (includeReasoning) {
       try { reasoningTail = readFileSync(this.store.path(jobId, 'reasoning'), 'utf8').slice(-4000); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
-    return {
+    const result = {
       ...(includeReasoning && reasoningTail ? { reasoningTail } : {}),
       stalled: job.stalled ?? false,
       stalledSince: job.stalledSince,
@@ -909,6 +927,14 @@ export class JobManager {
           ? undefined
           : compactDiagnostics(this.tail(jobId, 'stderr', 30), this.publicEvents(jobId, 30)),
     };
+    if (options.markCollected && !['queued', 'running'].includes(result.state)) this.markCollected(jobId);
+    return result;
+  }
+
+  /** Called only after an explicit tool has successfully built its result. */
+  markCollected(jobId: string): void {
+    if (!['queued', 'running'].includes(this.store.get(jobId).state))
+      writeFileSync(resolve(this.store.dir(jobId), 'collected'), '');
   }
 
   async read(jobId: string, name: JobFile, offset = 0, limit = 20000) {

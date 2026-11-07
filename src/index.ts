@@ -165,7 +165,7 @@ server.setRequestHandler(
       const progressToken = (request.params as any)._meta?.progressToken;
 
       // Start progress updates if client requested them
-      const watching = toolName === 'codex_job_watch';
+      const watching = toolName === 'codex_agent_follow';
       const progressData = watching ? undefined : startProgressUpdates(toolName, progressToken);
 
       try {

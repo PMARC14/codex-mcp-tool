@@ -48,11 +48,10 @@ async function systemOnBattery(): Promise<boolean> {
 
 async function onBattery(opts: UsageCacheOptions): Promise<boolean> {
   if (typeof opts.onBattery === 'boolean') return opts.onBattery;
-  if (opts.onBattery) return opts.onBattery();
   // Even power detection is shared: Windows needs a short native power-status
   // query, never a CLI authentication or quota probe. Don't launch it per reader.
   const power = await getUsage('machine-power', async () => {
-    const battery = await systemOnBattery();
+    const battery = typeof opts.onBattery === 'function' ? await opts.onBattery() : await systemOnBattery();
     return { ok: true, raw: battery, parsed: battery };
   }, { home: opts.home, now: opts.now, onBattery: false });
   return power?.parsed === true;
@@ -75,9 +74,16 @@ export async function getUsage<T>(
   const path = join(dir, `${connector}-usage.json`), lock = join(dir, `${connector}-usage.lock`);
   const now = opts.now ?? Date.now;
   const ttl = opts.ttlMs ?? USAGE_TTL_MS, backoff = opts.backoffMs ?? USAGE_BACKOFF_MS;
-  const fresh = (value: UsageSnapshot<T> | undefined, limit: number) => value && now() >= value.takenAt && now() - value.takenAt < limit;
+  const fresh = (value: UsageSnapshot<unknown> | undefined, limit: number) => value && now() >= value.takenAt && now() - value.takenAt < limit;
   let saved = readSnapshot<T>(path);
-  if (fresh(saved, saved?.ok === false ? backoff : ttl)) return saved;
+  const cachedBattery = () => {
+    if (typeof opts.onBattery === 'boolean') return opts.onBattery;
+    const power = readSnapshot<boolean>(join(dir, 'machine-power-usage.json'));
+    return power?.ok === true && power.parsed === true && !!fresh(power, USAGE_TTL_MS);
+  };
+  const snapshotFresh = (value: UsageSnapshot<T> | undefined) =>
+    fresh(value, value?.ok === false || cachedBattery() ? backoff : ttl);
+  if (snapshotFresh(saved)) return saved;
   const token = randomUUID();
   let acquired = false;
   try {
@@ -102,7 +108,7 @@ export async function getUsage<T>(
     }
     if (!acquired) return readSnapshot<T>(path) ?? saved;
     saved = readSnapshot<T>(path) ?? saved;
-    if (fresh(saved, saved?.ok === false ? backoff : ttl)) return saved;
+    if (snapshotFresh(saved)) return saved;
     if (saved?.ok && fresh(saved, backoff)) {
       try { if (await onBattery({ ...opts, home })) return saved; } catch { /* Power status unavailable: normal TTL. */ }
     }

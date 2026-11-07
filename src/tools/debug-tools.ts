@@ -72,7 +72,7 @@ export async function runSelftest(log: TrafficLog = trafficLog) {
   };
   let taskId = '';
   const start = async () => {
-    const created = await rpc('tools/call', { name: 'codex_job_start', arguments: { prompt: 'fake selftest', cwd: home } });
+    const created = await rpc('tools/call', { name: 'codex_agent', arguments: { prompt: 'fake selftest', cwd: home } });
     clientCreateTask.parse(created);
     clientAgentTaskMeta.parse(created._meta['com.anthropic/agent-task']);
     return created.taskId as string;

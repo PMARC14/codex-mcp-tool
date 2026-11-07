@@ -66,7 +66,13 @@ export function answerBridge(store: JobStore, job: JobMeta, answer: string, expe
   if (!job.awaitingInput) throw new Error('No pending question for this running job');
   const { qid } = job.awaitingInput;
   if (expectedQid !== undefined && expectedQid !== qid) throw new Error('inputResponses key does not match the pending question');
-  const question = JSON.parse(readFileSync(join(store.dir(job.id), 'question.json'), 'utf8'));
+  let question;
+  try { question = JSON.parse(readFileSync(join(store.dir(job.id), 'question.json'), 'utf8')); }
+  catch (error) {
+    if (!missing(error)) throw error;
+    job.awaitingInput = undefined;
+    throw new Error('Question expired; no answer delivered');
+  }
   if (question.id !== qid) throw new Error('question changed before answer was delivered');
   atomicWrite(join(store.dir(job.id), `answer-${qid}.json`), JSON.stringify({ answer, answeredAt: Date.now() }));
   job.awaitingInput = undefined;

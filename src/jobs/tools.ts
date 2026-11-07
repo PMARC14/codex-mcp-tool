@@ -20,7 +20,7 @@ export function registerJobTools(
     .string()
     .min(1)
     .describe(
-      'Job ID returned by job_start or job_requeue. Jobs are persisted across client reconnects.'
+      `Job ID returned by ${prefix}_agent or ${prefix}_agent_retry. Jobs persist across client reconnects.`
     );
   const add = (
     name: string,
@@ -34,7 +34,7 @@ export function registerJobTools(
   ) => {
     registry.push({
       name: `${prefix}_${name}`,
-      title: `${prefix === 'codex' ? 'Codex' : prefix} agent: ${name.startsWith('job_') ? `${name.slice(4).replaceAll('_', ' ')} job` : name.replaceAll('_', ' ')}`,
+      title: `${prefix === 'codex' ? 'Codex' : prefix} agent${name === 'agent' ? '' : `: ${name.slice('agent_'.length)}`}`,
       description,
       zodSchema: schema,
       execute: async (args, onProgress, signal) =>
@@ -42,8 +42,8 @@ export function registerJobTools(
     });
   };
   add(
-    'job_start',
-    'Start a background CLI job and return its ID immediately. Default mode is read; full mode bypasses approvals and sandboxing and must be explicitly requested. Use status/result to check completion. use transport app-server if you may need to message the job mid-work (`codex_job_steer`); exec jobs can\'t be steered.',
+    'agent',
+    `Launch a background ${prefix === 'codex' ? 'Codex' : prefix} agent and return its ID immediately. Default mode is read; full mode bypasses approvals and sandboxing and must be explicitly requested. Use ${prefix}_agent_status or ${prefix}_agent_result to check completion.${prefix === 'codex' ? ` Use transport: app-server to message it mid-work with ${prefix}_agent_message; exec agents can answer pending questions but cannot otherwise be steered.` : ''}`,
     z
       .object({
         prompt: z
@@ -116,13 +116,13 @@ export function registerJobTools(
     args => manager.start(args as StartOptions)
   );
   add(
-    'job_status',
+    'agent_status',
     'Read job state, elapsed time, session ID, reason, and recent stderr/events. With no ID, lists live jobs across the common store.',
     z.object({ jobId: jobId.optional() }),
     args => manager.status(args.jobId)
   );
   add(
-    'job_result',
+    'agent_result',
     'Get final text (up to 20,000 characters), full file path, session ID and diagnostics. Optional wait is limited to 10 seconds.',
     z.object({
       jobId,
@@ -134,11 +134,11 @@ export function registerJobTools(
         .default(0)
         .describe('Seconds to wait for a quick job, 0 to poll immediately.'),
     }),
-    args => manager.result(args.jobId, args.waitSec, args.includeReasoning)
+    args => manager.result(args.jobId, args.waitSec, args.includeReasoning, { markCollected: true })
   );
   add(
-    'job_watch',
-    'Watch a job until it stops or pauses, with progress every 20 seconds and on state changes. Cancelling the watch leaves the job running. Returns job_result plus watchedSec and timedOut.',
+    'agent_follow',
+    'Follow an agent until it stops or pauses, with progress every 20 seconds and on state changes. Cancelling the follow leaves the agent running. Returns agent_result plus watchedSec and timedOut.',
     z.object({
       jobId,
       showReasoning: z.boolean().default(false),
@@ -152,49 +152,44 @@ export function registerJobTools(
     (args, onProgress, signal) =>
       manager.watch(args.jobId, args.maxWaitSec, {
         onProgress,
+        markCollected: true,
         showReasoning: args.showReasoning,
         signal,
         heartbeatMs: options.watchHeartbeatMs,
       })
   );
   add(
-    'job_send',
-    'Send a follow-up to a stopped job with a CLI session ID, creating a new resumed job. Inherits connector, directory, worktree, mode and model unless overridden. Running or queued jobs must stop first.',
+    'agent_message',
+    'Message an agent: steer a running agent or answer its pending question; resume a stopped agent session as a new follow-up job. Returns delivered (mid-turn, queued, answer, or resumed) and jobId (the follow-up ID when resumed). Optional mode, model, effort and timeoutMin apply only when resuming. Queued agents must start or stop first.',
     z.object({
       jobId,
       message: z
         .string()
         .min(1)
         .refine(message => message.trim().length > 0, 'Message must not be blank')
-        .describe('Follow-up instructions for the existing CLI session.'),
+        .describe('Instructions or an answer for the agent; stopped sessions resume with this prompt.'),
       mode: z.enum(['read', 'write', 'trusted', 'full']).optional(),
       model: z.string().optional(),
       effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional(),
       timeoutMin: z.number().positive().optional(),
     }),
-    ({ jobId, message, ...overrides }) => manager.send(jobId, message, overrides)
+    ({ jobId, message, ...overrides }) => manager.message(jobId, message, overrides)
   );
   add(
-    'job_steer',
-    'Message a running job owned by this server. Answers a pending bridge question first (including exec jobs); otherwise requires a connector with interactive stdin (Codex: transport app-server). Returns mid-turn or queued delivery.',
-    z.object({ jobId, message: z.string().min(1).refine(message => !!message.trim(), 'Message must not be blank') }),
-    args => manager.steer(args.jobId, args.message)
-  );
-  if (prefix === 'codex') add(
-    'job_respond',
-    'Answer a running job question with answer, or an app-server approval with decision. Inspect awaitingInput/pendingApproval in job_status first.',
+    'agent_answer',
+    `Answer an agent question with answer and optional qid, or an app-server approval with decision. Inspect awaitingInput/pendingApproval in ${prefix}_agent_status first.`,
     z.object({ jobId, decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']).optional(), answer: z.string().trim().min(1).max(20000).optional(), qid: z.string().optional() })
       .refine(args => (args.decision === undefined) !== (args.answer === undefined), { message: 'Provide exactly one of answer or decision' }),
     args => manager.respond(args.jobId, args.answer !== undefined ? { answer: args.answer, qid: args.qid } : args.decision)
   );
   add(
-    'job_cancel',
+    'agent_stop',
     'Cancel an owned job and kill its process tree. Waits up to 10 seconds for termination; reports kill-failed if termination cannot be confirmed. Another server cannot cancel your job.',
     z.object({ jobId }),
     args => manager.cancel(args.jobId)
   );
   add(
-    'job_list',
+    'agent_list',
     'List recent jobs in the shared store, newest first, including jobs from the sibling connector.',
     z.object({
       limit: z
@@ -208,7 +203,7 @@ export function registerJobTools(
     args => manager.list(args.limit)
   );
   add(
-    'job_read',
+    'agent_read',
     'Read a page of a saved job file when the client cannot access server-local paths. Offsets and limits count characters.',
     z.object({
       jobId,
@@ -227,7 +222,7 @@ export function registerJobTools(
     args => manager.read(args.jobId, args.name, args.offset, args.limit)
   );
   add(
-    'job_requeue',
+    'agent_retry',
     'Create a new queued job from a paused, lost or failed job using its saved full prompt. Optionally choose a different model or hand off to the sibling server; it must be enabled to pick up the job.',
     z.object({
       jobId,
@@ -242,7 +237,7 @@ export function registerJobTools(
     args => manager.requeue(args.jobId, args.model, args.agent)
   );
   add(
-    'worktree_collect',
+    'agent_collect',
     'Collect stopped worktree changes, including new/binary files and worker commits. Saves patch.diff before any removal. Returns diff stat, capped patch, full patch path and removal errors.',
     z.object({
       jobId,

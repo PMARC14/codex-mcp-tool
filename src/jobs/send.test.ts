@@ -29,11 +29,11 @@ test('send creates a new resumed follow-up through start, inheriting execution s
     assert.equal((await manager.result(original.jobId, 10)).sessionId, 'fake-session');
     const tools: JobTool[] = [];
     registerJobTools(tools, 'codex', manager);
-    const send = tools.find(tool => tool.name === 'codex_job_send')!;
+    const send = tools.find(tool => tool.name === 'codex_agent_message')!;
     const message = '\nsecond turn\n';
     const result = JSON.parse(await send.execute({ jobId: original.jobId, message }));
     assert.notEqual(result.jobId, original.jobId);
-    assert.deepEqual(result, { jobId: result.jobId, state: 'queued', followUpOf: original.jobId });
+    assert.deepEqual(result, { delivered: 'resumed', jobId: result.jobId });
     const saved = manager.store.get(result.jobId);
     assert.equal(saved.followUpOf, original.jobId);
     assert.equal(saved.resumeSession, 'fake-session');
@@ -47,12 +47,12 @@ test('send creates a new resumed follow-up through start, inheriting execution s
     assert.equal((await manager.result(saved.id, 10)).final, message);
     assert.equal(built[1].resumeSession, 'fake-session');
     assert.equal(built[1].prompt, message);
-    const overridden = await manager.send(saved.id, 'third turn', {
+    const overridden = JSON.parse(await send.execute({ jobId: saved.id, message: 'third turn',
       mode: 'read',
       model: 'replacement',
       effort: 'low',
       timeoutMin: 2,
-    });
+    }));
     const third = manager.store.get(overridden.jobId);
     assert.equal(third.mode, 'read');
     assert.equal(third.model, 'replacement');
@@ -77,7 +77,7 @@ test('send revalidates a paused source under the lock after an availability chec
       manager.store.write({ ...source, state: 'running', reserved: true });
       return detect();
     };
-    await assert.rejects(manager.send(source.id, 'new prompt'), /job_watch.*job_cancel/);
+    await assert.rejects(manager.send(source.id, 'new prompt'), /agent_follow.*agent_stop/);
     assert.equal(manager.store.list().length, 1);
     assert.equal(manager.store.get(source.id).pauseCleared, undefined);
   } finally {
@@ -96,7 +96,7 @@ test('send rejects running, queued, reserved and sessionless jobs with actionabl
     for (const job of [running, queued])
       await assert.rejects(
         manager.send(job.jobId, 'follow-up'),
-        /codex_job_watch.*codex_job_cancel/
+        /codex_agent_follow.*codex_agent_stop/
       );
     manager.store.create(meta(f.home, { id: 'no-session', state: 'completed' }), 'p');
     await assert.rejects(manager.send('no-session', 'follow-up'), /no sessionId/);

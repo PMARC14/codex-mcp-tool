@@ -13,7 +13,7 @@ function setup(heartbeatMs = 20) {
   const manager = new JobManager(fakeConnector(f.script), f.config);
   const tools: JobTool[] = [];
   registerJobTools(tools, 'codex', manager, { watchHeartbeatMs: heartbeatMs });
-  const watch = tools.find(tool => tool.name === 'codex_job_watch')!;
+  const watch = tools.find(tool => tool.name === 'codex_agent_follow')!;
   return {
     f,
     manager,
@@ -25,7 +25,7 @@ function setup(heartbeatMs = 20) {
   };
 }
 
-test('watch resolves on fake-worker completion with the job_result shape and watch metadata', async () => {
+test('watch resolves on fake-worker completion with the agent_result shape and watch metadata', async () => {
   const s = setup();
   try {
     const job = await s.manager.start({

@@ -49,7 +49,7 @@ Requirements: Node `>=18`, `codex` CLI installed and authenticated.
 
 ### Tools
 
-`ask-codex`, `batch-codex`, `review-changes`, `do-act`, `image-gen`, `brainstorm`, `fetch-chunk`, `list-sessions`, `list-skills`, `health`, `ping`, `help`, `version`, `timeout-test`, `codex_usage`, and the eight job and worktree tools described in `docs/agent-jobs.md`
+`ask-codex`, `batch-codex`, `review-changes`, `do-act`, `image-gen`, `brainstorm`, `fetch-chunk`, `list-sessions`, `list-skills`, `health`, `ping`, `help`, `version`, `timeout-test`, `codex_usage`, and the eleven agent and worktree tools described in `docs/agent-jobs.md`
 
 ### Windows
 

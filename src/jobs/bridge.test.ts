@@ -17,7 +17,6 @@ import { registerMcpTasks, TaskStdioTransport, MODERN_PROTOCOL, TASK_EXTENSION, 
 import { clientTaskGet, clientTaskList, clientTaskNotification, clientCreateTask } from '../tools/client-schemas.js';
 import { TrafficLog, installRequestErrorReporting } from '../tools/traffic-log.js';
 import type { UnifiedTool } from '../tools/registry.js';
-import { z } from 'zod';
 
 const bridgePath = fileURLToPath(new URL('../bridge/agent-bridge.js', import.meta.url));
 
@@ -78,7 +77,7 @@ async function wire(s: ReturnType<typeof setup>) {
   const tasks = registerMcpTasks(server, 'codex', s.manager, { capabilities: {} },
     async (name, args) => s.registry.find(tool => tool.name === name)!.execute(args), s.registry);
   server.setRequestHandler(CallToolRequestSchema, async request => {
-    if (request.params.name !== 'codex_job_respond') return tasks.call(request.params.name, request.params.arguments);
+    if (request.params.name !== 'codex_agent_answer') return tasks.call(request.params.name, request.params.arguments);
     const tool = s.registry.find(item => item.name === request.params.name)!;
     return { content: [{ type: 'text' as const, text: String(await tool.execute((request.params.arguments ?? {}) as any)) }] };
   });
@@ -101,7 +100,7 @@ test('fake worker calls bridge: question -> input_required -> elicitation tasks/
   const channels: any[] = [];
   const stop = startChannelNotifier(s.manager, { async notification(notice) { channels.push(notice); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
   try {
-    const created = await w.rpc('tools/call', { name: 'codex_job_start', arguments: {
+    const created = await w.rpc('tools/call', { name: 'codex_agent', arguments: {
       cwd: s.home, prompt: JSON.stringify({ question: 'Sensitive question ' + 'x'.repeat(700), note: 'Milestone ' + 'x'.repeat(100) }),
       label: 'bridge-agent', stallTimeoutMin: 0.0001, onStall: 'report',
     } });
@@ -144,16 +143,17 @@ test('fake worker calls bridge: question -> input_required -> elicitation tasks/
   } finally { stop(); await w.close(); await s.cleanup(); }
 });
 
-for (const via of ['respond', 'steer'] as const) test(`exec fake worker receives bridge answer through job_${via}`, async () => {
+for (const via of ['answer', 'message'] as const) test(`exec fake worker receives bridge answer through agent_${via}`, async () => {
   const s = setup();
   try {
     const { jobId } = await s.manager.start({ cwd: s.home, prompt: '{}' });
     await until(() => !!s.manager.store.get(jobId).awaitingInput);
-    const tool = s.registry.find(tool => tool.name === `codex_job_${via}`)!;
-    const result = JSON.parse(await tool.execute({ jobId, ...(via === 'respond' ? { answer: 'A' } : { message: 'B' }) }) as string);
-    assert.equal(via === 'respond' ? result.responded : result.delivered, via === 'respond' ? true : 'answer');
+    const tool = s.registry.find(tool => tool.name === `codex_agent_${via}`)!;
+    const result = JSON.parse(await tool.execute({ jobId, ...(via === 'answer' ? { answer: 'A' } : { message: 'B' }) }) as string);
+    if (via === 'message') assert.deepEqual(result, { delivered: 'answer', jobId });
+    else assert.equal(result.responded, true);
     await until(() => s.manager.store.get(jobId).state === 'completed');
-    assert.equal((await s.manager.result(jobId)).final, via === 'respond' ? 'A' : 'B');
+    assert.equal((await s.manager.result(jobId)).final, via === 'answer' ? 'A' : 'B');
     assert.equal(s.manager.store.get(jobId).awaitingInput, undefined);
   } finally { await s.cleanup(); }
 });
@@ -188,7 +188,7 @@ test('bridge timeout notifies working and rejects a late tasks update', async ()
   const s = setup();
   const w = await wire(s);
   try {
-    const { taskId } = await w.rpc('tools/call', { name: 'codex_job_start', arguments: {
+    const { taskId } = await w.rpc('tools/call', { name: 'codex_agent', arguments: {
       cwd: s.home, prompt: JSON.stringify({ timeoutSec: 1.5, holdAfter: 2500 }),
     } });
     await until(() => !!s.manager.store.get(taskId).awaitingInput);
@@ -226,7 +226,7 @@ test('fresh manager answers persisted questions from a dead owner via tool and t
     try {
       await s.manager.initialize();
       if (via === 'tool') {
-        const response = await w.rpc('tools/call', { name: 'codex_job_respond', arguments: { jobId, qid, answer: 'reply' } });
+        const response = await w.rpc('tools/call', { name: 'codex_agent_answer', arguments: { jobId, qid, answer: 'reply' } });
         const result = JSON.parse(response.content[0].text);
         assert.equal(result.qid, qid);
       } else await w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'reply' } } } });
@@ -236,15 +236,36 @@ test('fresh manager answers persisted questions from a dead owner via tool and t
 });
 
 
-test('tasks update reply matches the client generic object-result schema', async () => {
+test('tasks update acknowledges with an empty result; the client ignores it and re-polls', async () => {
   const s = setup(); const w = await wire(s);
   try {
     const jobId = 'contract-update', qid = 'contract-question';
     s.manager.store.create(meta(s.home, { id: jobId, state: 'running', awaitingInput: { qid, question: 'fake', askedAt: Date.now() } }), 'fake');
     writeFileSync(join(s.manager.store.dir(jobId), 'question.json'), JSON.stringify({ id: qid, question: 'fake', askedAt: Date.now() }));
     const reply = await w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'fake' } } } });
-    // Claude Code 2.1.319 W0: generic object with optional _meta, extra fields allowed.
-    const clientResult = z.object({ _meta: z.object({}).passthrough().optional() }).passthrough();
-    assert.deepEqual(clientResult.parse(reply), { resultType: 'complete', ttlMs: 0, cacheScope: 'private' });
+    // mmap of claude.exe 2.1.319, z9o (offset 338118498):
+    // await r("tasks/update", {taskId:n,inputResponses:f}, ...), h=0;
+    // for (let t of Object.keys(f)) C.add(t); ... S=A; continue;
+    // No update fields are read: the next tasks/get is parsed with re().
+    // This is a non-tool acknowledgement, so it has no resultType envelope.
+    assert.deepEqual(reply, {});
+    assert.equal(s.manager.store.get(jobId).awaitingInput, undefined);
+    const next = clientTaskGet.parse(await w.rpc('tasks/get', { taskId: jobId }));
+    assert.equal(next.status, 'working');
+    assert.equal(JSON.parse(readFileSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`), 'utf8')).answer, 'fake');
   } finally { await w.close(); await s.cleanup(); }
+});
+
+
+test('answering an expired mailbox clears stale pending metadata and reports no delivery', async () => {
+  const s = setup();
+  try {
+    await s.manager.initialize();
+    const jobId = 'expired-mailbox', qid = 'expired-question';
+    s.manager.store.create(meta(s.home, { id: jobId, state: 'running',
+      awaitingInput: { qid, question: 'expired?', askedAt: Date.now() } }), 'fake');
+    await assert.rejects(s.manager.respond(jobId, { answer: 'late', qid }), /question expired; no answer delivered/i);
+    assert.equal(s.manager.store.get(jobId).awaitingInput, undefined);
+    assert.equal(existsSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`)), false);
+  } finally { await s.cleanup(); }
 });

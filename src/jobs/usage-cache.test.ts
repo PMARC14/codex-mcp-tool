@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import spawn from 'cross-spawn';
 import { fixture, until } from './test-helpers.js';
@@ -76,4 +77,38 @@ test('usage cache reclaims expired locks and caches unsuccessful probe results',
     assert.equal(existsSync(join(f.home, 'cache', 'fake-usage.lock')), false);
     await assert.rejects(getUsage('../escape', probe, opts), /connector/i);
   } finally { f.cleanup(); }
+});
+
+
+test('battery readers reuse timestamped power state without taking the usage lock', async () => {
+  const f = fixture(); let time = 1000000, powerReads = 0, probes = 0, locks = 0;
+  const original = fs.openSync;
+  const probe = async () => { probes++; return { ok: true, raw: 42, parsed: 42 }; };
+  const opts = { home: f.home, now: () => time, onBattery: () => { powerReads++; return true; } };
+  try {
+    await getUsage('fake', probe, opts);
+    time += 300000;
+    await getUsage('fake', probe, opts); // Detect battery and remember when it was checked.
+    const reads = powerReads;
+    assert.ok(reads > 0);
+    fs.openSync = ((path: fs.PathLike, flags: any, ...args: any[]) => {
+      if (String(path).endsWith('fake-usage.lock') && flags === 'wx') locks++;
+      return (original as any)(path, flags, ...args);
+    }) as typeof fs.openSync;
+    syncBuiltinESMExports();
+    for (let i = 0; i < 5; i++) {
+      time += 1000;
+      assert.equal((await getUsage('fake', probe, opts))?.parsed, 42);
+    }
+    assert.equal(powerReads, reads, 'power queries must also be cached');
+    assert.equal(locks, 0, 'fresh battery snapshots return before acquiring the usage lock');
+    assert.equal(probes, 1);
+    assert.equal(JSON.parse(readFileSync(join(f.home, 'cache', 'fake-usage.json'), 'utf8')).takenAt, 1000000);
+    time += 300000;
+    await getUsage('fake', probe, opts);
+    assert.ok(powerReads > reads, 'power state has its own expiry');
+    time = 1900000;
+    await getUsage('fake', probe, opts);
+    assert.equal(probes, 2, 'battery does not extend quota freshness past fifteen minutes');
+  } finally { fs.openSync = original; syncBuiltinESMExports(); f.cleanup(); }
 });

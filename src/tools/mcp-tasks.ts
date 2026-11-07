@@ -31,7 +31,7 @@ const POLL_MS = 15000;
 export const taskCapabilities = { list: {}, cancel: {}, requests: { tools: { call: {} } } };
 const modern = (params: any) => params?._meta?.[VERSION_META] === MODERN_PROTOCOL;
 const supportsTask = (prefix: string, name: string) =>
-  name === `${prefix}_job_start` || name === `${prefix}_job_watch`;
+  name === `${prefix}_agent` || name === `${prefix}_agent_follow`;
 
 function modernTask(task: Task) {
   const { ttl, pollInterval, ...rest } = task;
@@ -80,7 +80,7 @@ export class TaskStdioTransport extends StdioServerTransport {
       if (request?.modern && 'result' in message) {
         let result: any = message.result;
         if (result.task) result = { ...modernTask(result.task), ...(result._meta ? { _meta: result._meta } : {}) };
-        else if (result.resultType !== 'task' && !['tasks/get', 'tasks/cancel', 'tasks/list'].includes(request.method)) {
+        else if (result.resultType !== 'task' && !['tasks/get', 'tasks/cancel', 'tasks/list', 'tasks/update'].includes(request.method)) {
           result = { resultType: 'complete', ttlMs: 0, cacheScope: 'private', ...result };
           if (request.method === 'tools/list') {
             result.tools = result.tools.map(({ execution: _execution, ...tool }: any) => tool);
@@ -173,7 +173,7 @@ export function registerMcpTasks(
     'com.anthropic/agent-task': clientAgentTaskMeta.parse({
       kind: `${prefix}-agent`, taskId: job.id,
       ...(clientWireId.safeParse(job.sessionId).success ? { sessionId: job.sessionId } : {}),
-      modelImmediateResponse: `${prefix === 'codex' ? 'Codex' : prefix} agent "${(job.label ?? 'job').replace(/[\p{C}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 80)}" (${(job.model ?? 'default').slice(0, 80)}, ${job.effort ?? 'default'}, ${job.mode}, ${job.transport ?? 'exec'}) started as job ${job.id}. It runs in the background; you'll be woken when it finishes.${job.transport === 'app-server' ? ` Message it mid-work with ${prefix}_job_steer.` : ''} Answer its questions with ${prefix}_job_respond.`.replace(/[\p{C}\p{Zl}\p{Zp}]+/gu, ' ').slice(0, 20000),
+      modelImmediateResponse: `${prefix === 'codex' ? 'Codex' : prefix} agent "${(job.label ?? 'job').replace(/[\p{C}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 80)}" (${(job.model ?? 'default').slice(0, 80)}, ${job.effort ?? 'default'}, ${job.mode}, ${job.transport ?? 'exec'}) started as job ${job.id}. It runs in the background; you'll be woken when it finishes.${job.transport === 'app-server' ? ` Message it mid-work with ${prefix}_agent_message.` : ''} Answer its questions with ${prefix}_agent_answer.`.replace(/[\p{C}\p{Zl}\p{Zp}]+/gu, ' ').slice(0, 20000),
     }),
   });
 
@@ -297,7 +297,7 @@ export function registerMcpTasks(
         );
       const validated = parsed.data;
       const id: string =
-        name === `${prefix}_job_start`
+        name === `${prefix}_agent`
           ? JSON.parse((await startTool(name, validated)) as string).jobId
           : validated.jobId;
       const job = jobFor(id);

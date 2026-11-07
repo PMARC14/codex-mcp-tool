@@ -14,30 +14,37 @@ test('portable registration exposes prefixed tools with bounded schemas and expl
     assert.deepEqual(
       tools.map(tool => tool.name),
       [
-        'codex_job_start',
-        'codex_job_status',
-        'codex_job_result',
-        'codex_job_watch',
-        'codex_job_send',
-        'codex_job_steer',
-        'codex_job_respond',
-        'codex_job_cancel',
-        'codex_job_list',
-        'codex_job_read',
-        'codex_job_requeue',
-        'codex_worktree_collect',
+        'codex_agent',
+        'codex_agent_status',
+        'codex_agent_result',
+        'codex_agent_follow',
+        'codex_agent_message',
+        'codex_agent_answer',
+        'codex_agent_stop',
+        'codex_agent_list',
+        'codex_agent_read',
+        'codex_agent_retry',
+        'codex_agent_collect',
       ]
     );
+    assert.equal(tools[0].title, 'Codex agent');
+    assert.match(tools[0].description, /^Launch a background Codex agent/);
     for (const tool of tools)
       assert.ok(JSON.stringify(zodToJsonSchema(tool.zodSchema)).includes('object'));
+    for (const tool of tools.slice(1)) assert.equal(tool.title, `Codex agent: ${tool.name.slice('codex_agent_'.length)}`);
+    const agy: JobTool[] = [];
+    registerJobTools(agy, 'agy', manager);
+    assert.deepEqual(agy.map(t => t.name), tools.map(t => t.name.replace('codex_', 'agy_')));
+    assert.match(agy[0].description, /^Launch a background agy agent/);
+    assert.ok(agy.every(t => !t.description.includes('codex_')));
     const start = tools[0];
     assert.equal(start.zodSchema.parse({ prompt: 'p', cwd: f.home }).mode, 'read');
     assert.equal(start.zodSchema.parse({ prompt: 'p', cwd: f.home, mode: 'full' }).mode, 'full');
     assert.throws(() => tools[2].zodSchema.parse({ jobId: 'a', waitSec: 11 }));
-    const watch = tools.find(tool => tool.name === 'codex_job_watch')!;
+    const watch = tools.find(tool => tool.name === 'codex_agent_follow')!;
     assert.equal(watch.zodSchema.parse({ jobId: 'a' }).maxWaitSec, 1800);
     assert.throws(() => watch.zodSchema.parse({ jobId: 'a', maxWaitSec: 7201 }));
-    const read = tools.find(tool => tool.name === 'codex_job_read')!;
+    const read = tools.find(tool => tool.name === 'codex_agent_read')!;
     assert.throws(() => read.zodSchema.parse({ jobId: 'a', name: 'stdout', limit: 20001 }));
     await assert.rejects(() => start.execute({ cwd: f.home }), /exactly one/);
     await assert.rejects(
