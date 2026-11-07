@@ -63,7 +63,8 @@ test('channel marker deduplicates across notifier instances', async () => {
     emit({ ...job, state: 'completed' }, 'running');
     startChannelNotifier(source, server, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1' });
     emit({ ...job, state: 'completed' }, 'running');
-    assert.equal(calls, 1); assert.ok(existsSync(join(manager.store.dir(job.id), 'woken')));
+    assert.equal(calls, 1); assert.ok(existsSync(join(manager.store.dir(job.id), 'channel-sent')));
+    assert.equal(existsSync(join(manager.store.dir(job.id), 'woken')), false);
   } finally { await manager.dispose(); f.cleanup(); }
 });
 

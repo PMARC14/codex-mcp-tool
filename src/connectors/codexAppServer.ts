@@ -6,6 +6,7 @@ import { codexBridge } from './codexBridge.js';
 import type { JobEvent, JobSpec } from '../jobs/connector.js';
 import type { ApprovalDecision, StdinHandler, StdinPlan } from '../jobs/stdin.js';
 import { usageLimit } from '../jobs/usage-reset.js';
+import { claimQuestion, releaseQuestion } from '../jobs/question-claim.js';
 
 const wire = (message: object) => JSON.stringify(message) + '\n';
 const input = (text: string) => [{ type: 'text', text, text_elements: [] }];
@@ -52,28 +53,31 @@ export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(j
       nativeQuestions.delete(id);
       try { if (JSON.parse(readFileSync(questionPath, 'utf8')).id === question.qid) unlinkSync(questionPath); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') context.emit(errorEvent(`native question cleanup: ${String(error)}`)); }
+      try { releaseQuestion(dirname(questionPath), question.qid); } catch (error) { context.emit(errorEvent(`native question claim cleanup: ${String(error)}`)); }
     };
     const askQuestion = (message: any) => {
       if (nativeQuestions.has(message.id)) return;
-      // Serialize questions so one on-disk mailbox always corresponds to one request.
-      try {
-        statSync(questionPath);
-        context.apply({ write: wire({ id: message.id, error: { code: -32600, message: 'Another orchestrator question is pending; retry after it is answered' } }) });
-        return;
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       const questions = message.params?.questions;
       if (!Array.isArray(questions) || !questions.length || questions.some(q => typeof q.id !== 'string' || typeof q.question !== 'string')) {
         context.apply({ write: wire({ id: message.id, error: { code: -32602, message: 'questions requires id and question' } }) });
         return;
       }
       const qid = randomUUID();
-      atomicWrite(questionPath, JSON.stringify({ id: qid,
+      if (!claimQuestion(dirname(questionPath), { owner: 'native', id: qid, ts: Date.now(), timeoutMs: 1800000 })) {
+        context.apply({ write: wire({ id: message.id, error: { code: -32600, message: 'Another question is already awaiting an answer' } }) });
+        return;
+      }
+      try { atomicWrite(questionPath, JSON.stringify({ id: qid,
         question: questions.map(q => `${q.id}: ${q.question}`).join('\n'),
         options: questions.length === 1 ? questions[0].options?.map((o: any) => o.label) : undefined,
-        askedAt: Date.now() }));
+        askedAt: Date.now() })); } catch (error) {
+        releaseQuestion(dirname(questionPath), qid);
+        context.apply({ write: wire({ id: message.id, error: { code: -32603, message: 'Could not create question' } }) });
+        return;
+      }
       const reply = (answer: string) => {
         let keyed: Record<string, unknown> = {};
-        if (questions.length > 1) { try { keyed = JSON.parse(answer); } catch { /* A prose response applies to each question. */ } }
+        if (questions.length > 1) { try { const parsed = JSON.parse(answer); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) keyed = parsed; } catch { /* A prose response applies to each question. */ } }
         const answers = Object.fromEntries(questions.map(q => [q.id, {
           answers: typeof keyed[q.id] === 'string' ? [keyed[q.id]] : [answer],
         }]));
@@ -83,9 +87,15 @@ export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(j
       const timer = setInterval(() => {
         const path = join(dirname(job.finalPath), `answer-${qid}.json`);
         try {
-          if (statSync(path).isFile()) reply(JSON.parse(readFileSync(path, 'utf8')).answer);
+          if (statSync(path).isFile()) {
+            const answer = JSON.parse(readFileSync(path, 'utf8')).answer;
+            if (typeof answer !== 'string') throw new Error('answer field must be a string');
+            reply(answer);
+          }
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          context.emit(errorEvent(`native question answer: ${String(error)}`)); clearQuestion(message.id);
+          context.emit(errorEvent(`native question answer: ${String(error)}`));
+          context.apply({ write: wire({ id: message.id, error: { code: -32603, message: 'Could not read question answer' } }) });
+          clearQuestion(message.id);
         } }
       }, 2000);
       const deadline = setTimeout(() => reply('no answer within 1800 s; continue with your best judgement'), 1800000);

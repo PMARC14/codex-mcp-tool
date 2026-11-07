@@ -8,69 +8,60 @@ import {
 import { MODELS } from '../constants.js';
 import { getCodexVersion, checkMinimumCodexVersion } from '../utils/versionDetection.js';
 import { runCommand } from '../jobs/proc.js';
-import { readCodexUsage, readLiveCodexUsage } from '../utils/codexUsage.js';
+import { readCodexUsage, readLiveCodexUsage, type CodexUsage } from '../utils/codexUsage.js';
 import { usageLimit } from '../jobs/usage-reset.js';
 import { buildAppServer, parseAppServer } from './codexAppServer.js';
+import { getUsage, type UsageCacheOptions } from '../jobs/usage-cache.js';
 
 export { usageReset } from '../jobs/usage-reset.js';
 
-export const LOGIN_CACHE_TTL_MS = 10 * 60 * 1000;
 export const NOT_SIGNED_IN_REASON = 'Codex is not signed in: run codex login';
+
+interface CodexUsageOptions extends UsageCacheOptions {
+  live?: typeof readLiveCodexUsage;
+  local?: typeof readCodexUsage;
+}
 
 export class CodexConnector implements Connector {
   readonly id = 'codex';
   readonly reviewModel = 'gpt-6-astra';
 
-  private loginStatusCache?: {
-    available: boolean;
-    reason?: string;
-    checkedAt: number;
-  };
-  private loginStatusPromise?: Promise<{ available: boolean; reason?: string }>;
-
   constructor(
     private run = runCommand,
     private resolve = () => resolveBinary('codex', CODEX_PATH_ENV),
-    private now = () => Date.now()
+    private now = () => Date.now(),
+    private usageOptions: CodexUsageOptions = {}
   ) {}
 
+  private usageSnapshot(command = this.resolve().command) {
+    return getUsage<CodexUsage>(this.id, async () => {
+      const usage = await (this.usageOptions.live ?? readLiveCodexUsage)(command);
+      return { ok: usage?.available === true, raw: usage ?? null, parsed: usage ?? null };
+    }, { ...this.usageOptions, now: this.now });
+  }
+
+  /** All live usage consumers, including auth detection, share the disk snapshot. */
+  async usage(): Promise<CodexUsage> {
+    const snapshot = await this.usageSnapshot();
+    if (snapshot?.ok && snapshot.parsed) return snapshot.parsed;
+    const local = (this.usageOptions.local ?? readCodexUsage)();
+    return local.available ? local : snapshot?.parsed ?? local;
+  }
+
   async usagePercent(): Promise<number | undefined> {
-    const local = readCodexUsage();
-    const usage = local.available ? local : await readLiveCodexUsage(this.resolve().command);
-    const values = [usage?.fiveHour?.usedPercent, usage?.weekly?.usedPercent].filter((value): value is number => typeof value === 'number');
+    const usage = await this.usage();
+    const values = [usage.fiveHour?.usedPercent, usage.weekly?.usedPercent].filter((value): value is number => typeof value === 'number');
     return values.length ? Math.max(...values) : undefined;
   }
 
   private async checkLogin(command: string): Promise<{ available: boolean; reason?: string }> {
-    if (
-      this.loginStatusCache &&
-      this.now() - this.loginStatusCache.checkedAt < LOGIN_CACHE_TTL_MS
-    ) {
-      return this.loginStatusCache;
-    }
-
-    if (!this.loginStatusPromise) {
-      this.loginStatusPromise = (async () => {
-        let available = true;
-        let reason: string | undefined;
-        try {
-          const status = await this.run(command, ['login', 'status'], undefined, 10000);
-          if (/\bnot (?:logged|signed) in\b/i.test(status)) {
-            available = false;
-            reason = NOT_SIGNED_IN_REASON;
-          }
-        } catch {
-          available = true;
-        }
-        const result = { available, reason };
-        this.loginStatusCache = { ...result, checkedAt: this.now() };
-        return result;
-      })().finally(() => {
-        this.loginStatusPromise = undefined;
-      });
-    }
-
-    return this.loginStatusPromise;
+    const snapshot = await this.usageSnapshot(command);
+    const raw = snapshot?.raw;
+    const reason = typeof raw === 'string' ? raw : raw && typeof raw === 'object' && 'reason' in raw ? String(raw.reason) : '';
+    // Usage success implies auth. An unavailable/unknown probe fails open; never
+    // launch a separate login-status CLI just to disambiguate it.
+    const denied = /\bnot (?:logged|signed) in\b|unauthenticated|authentication required/i.test(reason);
+    return { available: !denied, ...(denied ? { reason: NOT_SIGNED_IN_REASON } : {}) };
   }
 
   protected async versionCheck() {

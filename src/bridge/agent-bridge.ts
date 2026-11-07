@@ -7,6 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema, McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { atomicWrite } from '../jobs/store.js';
+import { claimQuestion, releaseQuestion } from '../jobs/question-claim.js';
 
 const askSchema = z.object({ question: z.string().trim().min(1).max(20000),
   options: z.array(z.string().max(500)).max(50).optional(),
@@ -37,11 +38,10 @@ export function createBridge(home: string, jobId: string) {
     if (request.params.name !== 'ask_orchestrator') throw new McpError(ErrorCode.MethodNotFound, 'Unknown bridge tool');
     const { question, options, timeoutSec } = askSchema.parse(request.params.arguments);
     if (asking) throw new McpError(ErrorCode.InvalidRequest, 'A question is already awaiting an answer');
-    try {
-      if (statSync(questionPath).isFile()) throw new McpError(ErrorCode.InvalidRequest, 'Another question is already awaiting an answer');
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    asking = true;
     const id = randomUUID();
+    if (!claimQuestion(dir, { owner: 'bridge', id, ts: Date.now(), timeoutMs: timeoutSec * 1000 }))
+      throw new McpError(ErrorCode.InvalidRequest, 'Another question is already awaiting an answer');
+    asking = true;
     const answerPath = join(dir, `answer-${id}.json`);
     try {
       atomicWrite(questionPath, JSON.stringify({ id, question, options, askedAt: Date.now() }));
@@ -70,8 +70,20 @@ export function createBridge(home: string, jobId: string) {
       return { content: [{ type: 'text', text }] };
     } finally {
       asking = false;
-      try { if (JSON.parse(readFileSync(questionPath, 'utf8')).id === id) unlinkSync(questionPath); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') process.stderr.write(`Bridge question cleanup: ${String(error)}\n`); }
+      try {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            if (JSON.parse(readFileSync(questionPath, 'utf8')).id === id) unlinkSync(questionPath);
+            break;
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === 'ENOENT') break;
+            if (!['EBUSY', 'EPERM'].includes(code ?? '') || attempt === 4) throw error;
+            await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+          }
+        }
+      } catch (error) { process.stderr.write(`Bridge question cleanup: ${String(error)}\n`); }
+      finally { releaseQuestion(dir, id); }
     }
   });
   return server;

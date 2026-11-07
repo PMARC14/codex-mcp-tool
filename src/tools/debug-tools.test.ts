@@ -86,3 +86,15 @@ test('Codex transport defaults: exec fallback, config, environment override and 
     assert.throws(() => readConfig({ AGENT_JOBS_HOME: home, AGENT_JOBS_CODEX_TRANSPORT: 'bad' }), /defaultTransport/);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
+
+
+test('traffic log redacts task arrays and unknown string fields', () => {
+  const home = mkdtempSync(join(tmpdir(), 'traffic-tasks-'));
+  try {
+    const log = new TrafficLog('codex', home);
+    for (const args of [{ task: 'secret task' }, { tasks: ['secret batch', { future: 'secret future' }] }])
+      log.message('in', { method: 'tools/call', params: { name: 'fake', arguments: args } });
+    assert.doesNotMatch(log.tail(10).join(' '), /secret/);
+    assert.match(log.tail(10).join(' '), /redacted/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});

@@ -145,14 +145,18 @@ export function registerMcpTasks(
   const projection = async (job: JobMeta) => {
     const { resultType: _type, ...base } = modernTask(taskFor(job));
     if (base.status === 'input_required') {
-      // Approvals are answered with job_respond. Do not emit an unsupported
-      // elicitation request which would make Claude cancel the running task.
       const input = job.awaitingInput;
+      const approval = job.pendingApproval;
       return { ...base, inputRequests: input ? { [input.qid]: {
         method: 'elicitation/create', params: { mode: 'form', message: input.question,
           requestedSchema: { type: 'object', properties: {
             answer: { type: 'string', title: 'Answer', ...(input.options?.length ? { enum: input.options } : {}) },
           }, required: ['answer'] },
+        },
+      } } : approval ? { [`approval-${approval.requestedAt}`]: {
+        method: 'elicitation/create', params: { mode: 'form', message: approval.summary,
+          requestedSchema: { type: 'object', properties: { decision: { type: 'string', title: 'Decision',
+            enum: ['accept', 'acceptForSession', 'decline', 'cancel'] } }, required: ['decision'] },
         },
       } } : {} };
 
@@ -201,6 +205,14 @@ export function registerMcpTasks(
     if (entries.length !== 1) throw new McpError(ErrorCode.InvalidParams, 'inputResponses must contain exactly one pending question');
     const [qid, raw] = entries[0];
     if (!/^[a-zA-Z0-9-]+$/.test(qid)) throw new McpError(ErrorCode.InvalidParams, 'inputResponses key is invalid');
+    if (job.pendingApproval && qid === `approval-${job.pendingApproval.requestedAt}`) {
+      const response = z.object({ action: z.enum(['accept', 'decline', 'cancel']),
+        content: z.object({ decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']) }).optional() }).safeParse(raw);
+      if (!response.success || (response.data.action === 'accept' && !response.data.content))
+        throw new McpError(ErrorCode.InvalidParams, 'A valid approval decision is required');
+      await manager.respond(job.id, response.data.action === 'accept' ? response.data.content!.decision : response.data.action);
+      return {};
+    }
     // A retry of an acknowledged answer is harmless; never apply it to a newer qid.
     if (!job.awaitingInput || job.awaitingInput.qid !== qid) {
       if (existsSync(join(manager.store.dir(job.id), `answer-${qid}.json`))) return {};

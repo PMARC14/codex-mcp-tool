@@ -183,9 +183,9 @@ export function registerJobTools(
   if (prefix === 'codex') add(
     'job_respond',
     'Answer a running job question with answer, or an app-server approval with decision. Inspect awaitingInput/pendingApproval in job_status first.',
-    z.object({ jobId, decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']).optional(), answer: z.string().trim().min(1).max(20000).optional() })
+    z.object({ jobId, decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']).optional(), answer: z.string().trim().min(1).max(20000).optional(), qid: z.string().optional() })
       .refine(args => (args.decision === undefined) !== (args.answer === undefined), { message: 'Provide exactly one of answer or decision' }),
-    args => manager.respond(args.jobId, args.answer !== undefined ? { answer: args.answer } : args.decision)
+    args => manager.respond(args.jobId, args.answer !== undefined ? { answer: args.answer, qid: args.qid } : args.decision)
   );
   add(
     'job_cancel',

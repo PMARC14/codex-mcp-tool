@@ -335,3 +335,42 @@ test('native app-server requestUserInput uses the same question mailbox and resp
     assert.deepEqual(f.messages().find(m => m.id === 'native-question' && m.result).result, { answers: { choice: { answers: ['B'] } } });
   } finally { await f.cleanup(); }
 });
+
+
+test('native question replies on malformed answer file and primitive multi-answer', async () => {
+  for (const raw of ['{bad', JSON.stringify({ answer: 'null' })]) {
+    const f = fixture();
+    const writes: any[] = [];
+    const job = { finalPath: join(f.home, 'final'), cwd: f.home, mode: 'write', prompt: 'fake' } as JobSpec;
+    const plan = buildAppServer(job, 'fake', { config: {}, prompt: 'fake' } as any).stdinPlan;
+    const handler = plan({ apply(action) { if (action.write) writes.push(JSON.parse(action.write)); }, emit() {} });
+    try {
+      handler(JSON.stringify({ id: 'q', method: 'item/tool/requestUserInput', params: { questions: [
+        { id: 'one', question: 'One?' }, { id: 'two', question: 'Two?' },
+      ] } }), 'stdout');
+      const qid = JSON.parse(readFileSync(join(f.home, 'question.json'), 'utf8')).id;
+      writeFileSync(join(f.home, `answer-${qid}.json`), raw);
+      await until(() => writes.some(m => m.id === 'q'), 'native reply', 2500);
+      assert.ok(writes.find(m => m.id === 'q').result || writes.find(m => m.id === 'q').error);
+    } finally { handler.dispose?.(); f.cleanup(); }
+  }
+});
+
+
+
+test('task approval exposes a decision elicitation and routes decline', async () => {
+  const f = setup();
+  const handlers = new Map<string, any>();
+  const tasks = registerMcpTasks({ setRequestHandler(schema: any, handler: any) { handlers.set(schema.shape.method.value, handler); } } as unknown as Server, 'codex', f.manager, { capabilities: {} });
+  try {
+    const { jobId } = await f.manager.start({ prompt: JSON.stringify({ approval: 'commandExecution' }), cwd: f.home, transport: 'app-server', mode: 'write' });
+    await until(() => !!f.manager.store.get(jobId).pendingApproval && f.manager.store.get(jobId).state === 'running');
+    const task = await handlers.get('tasks/get')({ params: { taskId: jobId, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } });
+    const [key, request] = Object.entries(task.inputRequests)[0] as [string, any];
+    assert.deepEqual(request.params.requestedSchema.properties.decision.enum, ['accept', 'acceptForSession', 'decline', 'cancel']);
+    await handlers.get('tasks/update')({ params: { taskId: jobId, inputResponses: { [key]: { action: 'decline' } } } });
+    await until(() => f.messages().some(m => m.id === 'approval-1'));
+    assert.equal(f.messages().find(m => m.id === 'approval-1').result.decision, 'decline');
+  } finally { tasks.close(); await f.cleanup(); }
+});
+

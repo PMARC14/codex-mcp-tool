@@ -2,6 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CodexConnector as RealCodexConnector, usageReset } from './codex.js';
 import type { JobSpec } from '../jobs/connector.js';
+import { fixture } from '../jobs/test-helpers.js';
+import { createCodexUsageTool } from '../tools/codex-usage.tool.js';
+import { usageWindow } from '../jobs/usage.js';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // Keep version discovery fake too; injecting only login probes previously leaked --version.
 class CodexConnector extends RealCodexConnector {
@@ -27,6 +32,26 @@ const spec: JobSpec = {
   timeoutMin: 120,
   finalPath: '/jobs/job/final.txt',
 };
+
+test('Codex detection, usage guard and usage tool share one disk probe across connector instances', async () => {
+  const f = fixture();
+  let probes = 0, commands = 0;
+  const deps = {
+    home: f.home, onBattery: false,
+    live: async () => { probes++; return { available: true, source: 'live' as const, fiveHour: usageWindow(42, 2000000000, 1000000) }; },
+    local: () => ({ available: false }),
+  };
+  const make = () => new CodexConnector(async () => { commands++; throw new Error('No independent auth probe'); }, binary, Date.now, deps);
+  try {
+    const a = make(), b = make();
+    assert.equal((await a.detect()).available, true);
+    assert.equal(commands, 0);
+    assert.equal(await b.usagePercent(), 42);
+    const tool = createCodexUsageTool(() => b.usage());
+    assert.equal(JSON.parse(await tool.execute({}) as string).fiveHour.usedPercent, 42);
+    assert.equal(probes, 1);
+  } finally { f.cleanup(); }
+});
 
 test('explicit exec transport is identical to the default and app-server is opt-in', () => {
   assert.deepEqual(connector.build({ ...spec, transport: 'exec' }), connector.build(spec));
@@ -168,107 +193,49 @@ test('Codex jobs run outside git repos too (advice and debate need no repo)', ()
   }
 });
 
-test('Codex detect succeeds when logged in', async () => {
-  let executedExe: string | undefined;
-  let executedArgs: string[] | undefined;
-  let executedTimeout: number | undefined;
-
-  const loggedIn = new CodexConnector(async (exe, args, _cwd, timeoutMs) => {
-    executedExe = exe;
-    executedArgs = args;
-    executedTimeout = timeoutMs;
-    return 'Logged in using ChatGPT';
-  }, binary);
-
-  const result = await loggedIn.detect();
-  assert.equal(result.available, true);
-  assert.equal(executedExe, '/fake/codex.exe');
-  assert.deepEqual(executedArgs, ['login', 'status']);
-  assert.equal(executedTimeout, 10000);
+test('Codex detection derives authentication from cached usage without a login command', async () => {
+  const f = fixture(); let probes = 0, commands = 0;
+  const cache = join(f.home, 'cache', 'codex-usage.json');
+  mkdirSync(join(f.home, 'cache'), { recursive: true });
+  try {
+    for (const available of [true, false]) {
+      writeFileSync(cache, JSON.stringify({ takenAt: Date.now(), ok: available,
+        raw: { available, reason: available ? undefined : 'Not logged in' }, parsed: { available } }));
+      const connector = new CodexConnector(async () => { commands++; throw new Error('No login command'); }, binary, Date.now,
+        { home: f.home, onBattery: false, live: async () => { probes++; return undefined; } });
+      const result = await connector.detect();
+      assert.equal(result.available, available);
+      if (!available) assert.equal(result.reason, 'Codex is not signed in: run codex login');
+    }
+    assert.equal(commands, 0); assert.equal(probes, 0);
+  } finally { f.cleanup(); }
 });
 
-test('Codex detect reports unavailable when not logged in', async () => {
-  const notLoggedIn = new CodexConnector(async (_exe, args) => {
-    assert.deepEqual(args, ['login', 'status']);
-    return 'Not logged in';
-  }, binary);
-
-  const result = await notLoggedIn.detect();
-  assert.equal(result.available, false);
-  assert.equal(result.reason, 'Codex is not signed in: run codex login');
+test('Codex detection fails open on unknown usage and backs off failed probes for fifteen minutes', async () => {
+  for (const failure of ['timeout', 'unknown']) {
+    const f = fixture(); let calls = 0, time = 1000000;
+    const connector = new CodexConnector(async () => { throw new Error('No CLI command'); }, binary, () => time,
+      { home: f.home, onBattery: false, live: async () => { calls++; if (failure === 'timeout') throw new Error('timeout'); return undefined; } });
+    try {
+      assert.equal((await connector.detect()).available, true);
+      time += 14 * 60000; assert.equal((await connector.detect()).available, true); assert.equal(calls, 1);
+      time += 60000; await connector.detect(); assert.equal(calls, 2);
+      assert.equal(JSON.parse(readFileSync(join(f.home, 'cache', 'codex-usage.json'), 'utf8')).ok, false);
+    } finally { f.cleanup(); }
+  }
 });
 
-test('Codex detect probe failure fails open on timeout or error', async () => {
-  const failing = new CodexConnector(async () => {
-    throw new Error('timed out after 10000ms');
-  }, binary);
-
-  const result = await failing.detect();
-  assert.equal(result.available, true);
+test('Codex detection refreshes shared successful usage after five minutes', async () => {
+  const f = fixture(); let calls = 0, time = 1000000;
+  const live = async () => { calls++; return { available: true }; };
+  const a = new CodexConnector(undefined, binary, () => time, { home: f.home, onBattery: false, live });
+  const b = new CodexConnector(undefined, binary, () => time, { home: f.home, onBattery: false, live });
+  try {
+    await a.detect(); await b.detect(); assert.equal(calls, 1);
+    time += 299999; await b.detect(); assert.equal(calls, 1);
+    time++; await b.detect(); assert.equal(calls, 2);
+  } finally { f.cleanup(); }
 });
-
-test('Codex detect probe failure fails open on unknown output', async () => {
-  const unknown = new CodexConnector(async () => {
-    return 'unknown status format from new CLI version';
-  }, binary);
-
-  const result = await unknown.detect();
-  assert.equal(result.available, true);
-});
-
-test('Codex detect caches login status for 10 minutes and refreshes after expiration', async () => {
-  let probeCalls = 0;
-  let now = 1000000;
-  const connector = new CodexConnector(
-    async () => {
-      probeCalls++;
-      return 'Logged in using ChatGPT';
-    },
-    binary,
-    () => now
-  );
-
-  const first = await connector.detect();
-  assert.equal(first.available, true);
-  assert.equal(probeCalls, 1);
-
-  // Immediate subsequent call uses cache
-  const second = await connector.detect();
-  assert.equal(second.available, true);
-  assert.equal(probeCalls, 1);
-
-  // Still within 10 minutes (9 minutes elapsed)
-  now += 9 * 60 * 1000;
-  const third = await connector.detect();
-  assert.equal(third.available, true);
-  assert.equal(probeCalls, 1);
-
-  // Past 10 minutes TTL (10 minutes + 1 ms elapsed)
-  now += 1 * 60 * 1000 + 1;
-  const fourth = await connector.detect();
-  assert.equal(fourth.available, true);
-  assert.equal(probeCalls, 2);
-});
-
-test('Codex detect caches not-logged-in status', async () => {
-  let probeCalls = 0;
-  const connector = new CodexConnector(async () => {
-    probeCalls++;
-    return 'Not logged in';
-  }, binary);
-
-  const first = await connector.detect();
-  assert.equal(first.available, false);
-  assert.equal(first.reason, 'Codex is not signed in: run codex login');
-  assert.equal(probeCalls, 1);
-
-  const second = await connector.detect();
-  assert.equal(second.available, false);
-  assert.equal(second.reason, 'Codex is not signed in: run codex login');
-  assert.equal(probeCalls, 1);
-});
-
-
 
 test('parses completed reasoning items', () => {
   assert.deepEqual(connector.parse(JSON.stringify({ type: 'item.completed', item: { id: 'item_1', type: 'reasoning', text: 'Inspecting the files.' } }), 'stdout'), { reasoning: 'Inspecting the files.' });

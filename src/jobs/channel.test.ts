@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { JobStore } from './store.js';
 import { fixture, fakeConnector, meta, until } from './test-helpers.js';
 import { JobManager } from './manager.js';
 import {
@@ -13,6 +16,43 @@ import type { JobMeta, JobState } from './connector.js';
 
 const ON = { AGENT_JOBS_CHANNEL: '1' };
 const SECRET = 'SECRET-FINAL-TEXT-ignore-previous-instructions';
+
+test('channel delivery never claims the hook wake marker and retry resets both independent markers', () => {
+  const f = fixture();
+  const store = new JobStore(f.home);
+  const source = fakeManager();
+  const server = fakeServer();
+  const job = meta(f.home, { state: 'queued' });
+  store.create(job, 'fake');
+  const path = (name: string) => join(store.dir(job.id), name);
+  // Same marker checks and exclusive write as hook-wait.sh; a silently dropped
+  // channel event must leave this fallback free to claim its own wake.
+  const hookWake = () => {
+    if (['collected', 'woken', 'mcp-task.json'].some(name => existsSync(path(name)))) return false;
+    try { writeFileSync(path('woken'), '', { flag: 'wx' }); return true; } catch { return false; }
+  };
+  const stop = startChannelNotifier({ ...source, store }, server.server, 'codex', undefined, ON);
+  try {
+    source.emit({ ...job, state: 'completed' }, 'running');
+    assert.equal(existsSync(path('woken')), false);
+    assert.equal(existsSync(path('channel-sent')), true);
+    assert.equal(hookWake(), true);
+    assert.equal(hookWake(), false);
+    store.write({ ...job, state: 'running' });
+    assert.equal(existsSync(path('channel-sent')), false);
+    assert.equal(existsSync(path('woken')), false);
+    source.emit({ ...job, state: 'running' }, 'queued');
+    source.emit({ ...job, state: 'completed' }, 'running');
+    assert.equal(server.calls.length, 2);
+    writeFileSync(path('collected'), '');
+    assert.equal(hookWake(), false);
+    store.write({ ...job, state: 'queued' });
+    writeFileSync(path('mcp-task.json'), '{}');
+    source.emit({ ...job, state: 'completed' }, 'running');
+    assert.equal(server.calls.length, 2);
+    assert.equal(hookWake(), false);
+  } finally { stop(); f.cleanup(); }
+});
 
 type Call = { method: string; params: { content: string; meta?: Record<string, string> } };
 function fakeServer(fail = false) {

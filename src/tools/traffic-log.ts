@@ -18,9 +18,9 @@ function safeSummary(message: any, full: boolean) {
   if (params?.arguments) {
     // One 200-character budget for the entire argument preview, with sensitive
     // values removed before serialization (including nested argument objects).
+    const safeKeys = new Set(['jobId', 'qid', 'cwd', 'mode', 'model', 'effort', 'label', 'transport', 'name', 'limit', 'offset', 'timeoutMin', 'worktree', 'remove', 'decision']);
     const redact = (key: string, value: unknown) =>
-      /prompt|message|text|output|reasoning|answer|content|token|secret|password/i.test(key)
-        ? '[redacted]' : typeof value === 'string' ? value.slice(0, 200) : value;
+      typeof value === 'string' ? (safeKeys.has(key) ? value.slice(0, 200) : `[redacted ${value.length} chars]`) : value;
     summary.arguments = JSON.stringify(params.arguments, redact).slice(0, 200);
   }
   const body = result ?? params;

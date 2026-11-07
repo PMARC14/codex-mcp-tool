@@ -1,4 +1,6 @@
 import { test } from 'node:test';
+import spawn from 'cross-spawn';
+import { mkdirSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -6,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { PassThrough, Writable } from 'node:stream';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { fixture, fakeConnector, until } from './test-helpers.js';
+import { fixture, fakeConnector, until, meta } from './test-helpers.js';
 import { JobManager } from './manager.js';
 import { registerJobTools } from './tools.js';
 import { startChannelNotifier } from './channel.js';
@@ -15,6 +17,7 @@ import { registerMcpTasks, TaskStdioTransport, MODERN_PROTOCOL, TASK_EXTENSION, 
 import { clientTaskGet, clientTaskList, clientTaskNotification, clientCreateTask } from '../tools/client-schemas.js';
 import { TrafficLog, installRequestErrorReporting } from '../tools/traffic-log.js';
 import type { UnifiedTool } from '../tools/registry.js';
+import { z } from 'zod';
 
 const bridgePath = fileURLToPath(new URL('../bridge/agent-bridge.js', import.meta.url));
 
@@ -38,6 +41,7 @@ process.stdin.on('end', async () => {
     if (tools.tools.length !== 2) throw new Error('bridge tools missing');
     await client.callTool({name:'report_progress',arguments:{note:opts.note || 'Milestone reached'}});
     const result = await client.callTool({name:'ask_orchestrator',arguments:{question:opts.question || 'Which option?',options:['A','B'],timeoutSec:opts.timeoutSec || 20}});
+    if (opts.holdAfter) await new Promise(resolve => setTimeout(resolve, opts.holdAfter));
     console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:result.content[0].text}}));
   } catch(error) { console.error(error); process.exitCode=1; }
   finally { await client.close(); }
@@ -73,7 +77,11 @@ async function wire(s: ReturnType<typeof setup>) {
   installRequestErrorReporting(server, log);
   const tasks = registerMcpTasks(server, 'codex', s.manager, { capabilities: {} },
     async (name, args) => s.registry.find(tool => tool.name === name)!.execute(args), s.registry);
-  server.setRequestHandler(CallToolRequestSchema, request => tasks.call(request.params.name, request.params.arguments));
+  server.setRequestHandler(CallToolRequestSchema, async request => {
+    if (request.params.name !== 'codex_job_respond') return tasks.call(request.params.name, request.params.arguments);
+    const tool = s.registry.find(item => item.name === request.params.name)!;
+    return { content: [{ type: 'text' as const, text: String(await tool.execute((request.params.arguments ?? {}) as any)) }] };
+  });
   await server.connect(new TaskStdioTransport('codex', log, input, output));
   const rpc = (method: string, params: object = {}) => new Promise<any>((resolve, reject) => {
     const next = ++id;
@@ -162,4 +170,84 @@ test('bridge timeout returns best judgement and clears the mailbox and pending m
     assert.equal(existsSync(join(s.manager.store.dir(jobId), 'question.json')), false);
     assert.equal(s.manager.store.get(jobId).awaitingInput, undefined);
   } finally { await s.cleanup(); }
+});
+
+
+test('another manager answers a pending question with qid and rejects stale qid', async () => {
+  const s = setup();
+  const other = new JobManager(s.manager.connector, s.config);
+  try {
+    const { jobId } = await s.manager.start({ cwd: s.home, prompt: '{}' });
+    await until(() => !!s.manager.store.get(jobId).awaitingInput);
+    const qid = s.manager.store.get(jobId).awaitingInput!.qid;
+    await assert.rejects(other.respond(jobId, { answer: 'wrong', qid: 'stale' }), /pending question/);
+    assert.deepEqual(await other.respond(jobId, { answer: 'A', qid }), { responded: true, qid });
+    await until(() => s.manager.store.get(jobId).state === 'completed');
+  } finally { await other.dispose(); await s.cleanup(); }
+});
+
+
+test('bridge timeout notifies working and rejects a late tasks update', async () => {
+  const s = setup();
+  const w = await wire(s);
+  try {
+    const { taskId } = await w.rpc('tools/call', { name: 'codex_job_start', arguments: {
+      cwd: s.home, prompt: JSON.stringify({ timeoutSec: 1.5, holdAfter: 2500 }),
+    } });
+    await until(() => !!s.manager.store.get(taskId).awaitingInput);
+    const qid = s.manager.store.get(taskId).awaitingInput!.qid;
+    await until(() => w.notices.some(n => n.params?.status === 'input_required'));
+    await until(() => w.notices.some(n => n.params?.status === 'working'));
+    await assert.rejects(w.rpc('tasks/update', { taskId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'late' } } } }), /pending question/);
+  } finally { await w.close(); await s.cleanup(); }
+});
+
+
+test('bridge exits after stdin ends with a pending question', async () => {
+  const f = fixture();
+  const jobId = 'bridge-eof';
+  mkdirSync(join(f.home, 'jobs', jobId), { recursive: true });
+  const child = spawn(process.execPath, [bridgePath], { env: { ...process.env, AGENT_JOBS_HOME: f.home, AGENT_JOB_ID: jobId }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  try {
+    child.stdin!.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'ask_orchestrator', arguments: { question: 'Fake?', timeoutSec: 60 } } }) + '\n');
+    await until(() => existsSync(join(f.home, 'jobs', jobId, 'question.json')), 'question created', 5000);
+    child.stdin!.end();
+    await until(() => child.exitCode !== null, 'bridge exit', 2500);
+    assert.equal(child.exitCode, 0);
+  } finally { if (child.exitCode === null) child.kill(); f.cleanup(); }
+});
+
+
+test('fresh manager answers persisted questions from a dead owner via tool and tasks update', async () => {
+  for (const via of ['tool', 'update'] as const) {
+    const s = setup();
+    const jobId = `restart-${via}`, qid = `qid-${via}`;
+    s.manager.store.create(meta(s.home, { id: jobId, state: 'running', owner: { pid: 2147483647, startTime: 'dead' },
+      awaitingInput: { qid, question: 'persisted?', askedAt: Date.now() } }), 'fake');
+    writeFileSync(join(s.manager.store.dir(jobId), 'question.json'), JSON.stringify({ id: qid, question: 'persisted?', askedAt: Date.now() }));
+    const w = await wire(s);
+    try {
+      await s.manager.initialize();
+      if (via === 'tool') {
+        const response = await w.rpc('tools/call', { name: 'codex_job_respond', arguments: { jobId, qid, answer: 'reply' } });
+        const result = JSON.parse(response.content[0].text);
+        assert.equal(result.qid, qid);
+      } else await w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'reply' } } } });
+      assert.equal(JSON.parse(readFileSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`), 'utf8')).answer, 'reply');
+    } finally { await w.close(); await s.cleanup(); }
+  }
+});
+
+
+test('tasks update reply matches the client generic object-result schema', async () => {
+  const s = setup(); const w = await wire(s);
+  try {
+    const jobId = 'contract-update', qid = 'contract-question';
+    s.manager.store.create(meta(s.home, { id: jobId, state: 'running', awaitingInput: { qid, question: 'fake', askedAt: Date.now() } }), 'fake');
+    writeFileSync(join(s.manager.store.dir(jobId), 'question.json'), JSON.stringify({ id: qid, question: 'fake', askedAt: Date.now() }));
+    const reply = await w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'fake' } } } });
+    // Claude Code 2.1.319 W0: generic object with optional _meta, extra fields allowed.
+    const clientResult = z.object({ _meta: z.object({}).passthrough().optional() }).passthrough();
+    assert.deepEqual(clientResult.parse(reply), { resultType: 'complete', ttlMs: 0, cacheScope: 'private' });
+  } finally { await w.close(); await s.cleanup(); }
 });

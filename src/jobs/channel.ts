@@ -111,7 +111,9 @@ export function startChannelNotifier(
     if (sent.has(key)) return;
     if (manager.store) {
       if (!awaiting && existsSync(join(manager.store.dir(job.id), 'mcp-task.json'))) return;
-      const marker = awaiting ? `${job.awaitingInput ? 'question' : 'approval'}-woken-${createHash('sha256').update(key).digest('hex')}` : 'woken';
+      // Transport success cannot prove the client registered a channel listener.
+      // Only the PostToolUse hook owns `woken`; channel attempts never suppress it.
+      const marker = awaiting ? `channel-sent-${createHash('sha256').update(key).digest('hex')}` : 'channel-sent';
       try { writeFileSync(join(manager.store.dir(job.id), marker), '', { flag: 'wx' }); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') logger?.warn('Unable to create channel marker', error);

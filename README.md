@@ -98,11 +98,13 @@ claude mcp add codex-cli -- npx -y @trishchuk/codex-mcp-tool
 | `codex_job_watch`, `codex_job_send` | Wait with progress or resume a stopped job with a follow-up. |
 | `codex_job_list`, `codex_job_read`, `codex_job_requeue` | List jobs, page saved files or retry a stopped job. |
 | `codex_worktree_collect` | Save a patch and optionally remove a stopped worktree. |
-| `codex_usage` | Live quota without a model turn; session-log fallback is marked by source. |
+| `codex_usage` | Shared cached quota without a model turn; session-log fallback is marked by source. |
 
 See [agent jobs](docs/agent-jobs.md) and the [symmetry audit](docs/job-surface-audit.md) for shared behavior and vendor differences.
 
 `codex_job_start` and `codex_job_watch` also support MCP tasks, with no server launch flag. Task requests return a handle immediately and expose completion through task polling and status notifications, allowing Claude Code to show the job in `/tasks` and deliver its result. Both the 2025-11-25 protocol and the 2026-07-28 tasks extension are supported; Claude Code's own task feature settings still apply. Calls that do not request tasks retain their existing job ID, watch progress, and channel behavior. See [MCP tasks](docs/agent-jobs.md#mcp-tasks-no-launch-flag) for negotiation and request shapes.
+
+Codex usage, auth detection, and optional-job quota guards share a machine-wide cache: five minutes normally, fifteen on battery or after a failed probe, with one probe at a time across servers. Channel notifications use their own delivery marker and leave the PostToolUse hook wake available; sessions with both paths may receive two wakes. See [agent jobs](docs/agent-jobs.md) for cache and notification details.
 
 ## Image generation
 

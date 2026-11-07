@@ -34,7 +34,7 @@ export function progressMessage(manager: JobManager, job: JobMeta, showReasoning
   );
   const model = (job.model ?? 'default').split('/').pop()!.replace(/^gpt-[0-9.]+-/, '').replace(/^gemini-[0-9.]+-/, '');
   const identity = `${job.connector} ${model} \u00b7 ${job.label ?? 'job'}`;
-  const state = job.awaitingInput ? 'awaiting answer' : job.pendingApproval ? (job.pendingApproval.kind === 'userInput' ? 'awaiting answer' : 'awaiting approval') : job.stalled && job.state === 'running' ? `stalled ${Math.floor((Date.now() - (job.stalledSince ?? Date.now())) / 60000)}m` : job.state;
+  const state = job.awaitingInput ? `awaiting answer (qid ${job.awaitingInput.qid})` : job.pendingApproval ? (job.pendingApproval.kind === 'userInput' ? 'awaiting answer' : 'awaiting approval') : job.stalled && job.state === 'running' ? `stalled ${Math.floor((Date.now() - (job.stalledSince ?? Date.now())) / 60000)}m` : job.state;
   const suffix = ` | ${state} | ${elapsed}s`;
   if (job.progressNote) summary = job.progressNote;
   if (job.state === 'paused') summary = job.resetAt ? `Paused until ${new Date(job.resetAt).toISOString()}` : 'Paused until the usage limit is reset; reset time unknown';

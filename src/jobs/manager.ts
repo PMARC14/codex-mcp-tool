@@ -157,6 +157,21 @@ export class JobManager {
   // Must run under the shared lock. The slot and the identities needed to retry the cleanup are
   // only dropped once the tree is confirmed dead; a later recovery pass retries the same record.
   private async recoverOrphan(job: JobMeta, now: number): Promise<void> {
+    // A file-based question can still be answered after its server disappears. Defer
+    // orphan cleanup only while its matching, unexpired mailbox has no answer.
+    if (job.state === 'running' && job.awaitingInput) {
+      const { qid, askedAt } = job.awaitingInput;
+      try {
+        const dir = this.store.dir(job.id);
+        const question = JSON.parse(readFileSync(join(dir, 'question.json'), 'utf8'));
+        let deadline = askedAt + 1800000;
+        try {
+          const claim = JSON.parse(readFileSync(join(dir, 'question.lock'), 'utf8'));
+          if (claim.id === qid && Number.isFinite(claim.ts) && Number.isFinite(claim.timeoutMs)) deadline = claim.ts + claim.timeoutMs;
+        } catch { /* Old mailbox without a claim uses the default timeout. */ }
+        if (question.id === qid && now < deadline && !existsSync(join(dir, `answer-${qid}.json`))) return;
+      } catch { /* Missing or malformed mailbox permits normal orphan cleanup. */ }
+    }
     if (job.state === 'lost' && now - (this.cleanupTried.get(job.id) ?? 0) < 2000) return;
     this.cleanupTried.set(job.id, now);
     let confirmed = true;
@@ -394,17 +409,20 @@ export class JobManager {
   async respond(jobId: string, decision: ApprovalDecision | { answer: string; qid?: string }) {
     await this.initialize();
     const job = this.store.get(jobId);
-    if (!this.owns(job)) throw new Error('Only the owning server can respond to this job');
     if (typeof decision === 'object') {
       const active = this.active.get(jobId);
-      if (job.state !== 'running' || !active || active.cancelled) throw new Error('No pending question for this running job');
+      if (job.state !== 'running' || active?.cancelled) throw new Error('No pending question for this running job');
+      const qid = job.awaitingInput?.qid;
       answerBridge(this.store, job, decision.answer, decision.qid);
-      active.job.awaitingInput = undefined;
-      active.job.stalled = false;
-      active.job.stalledSince = undefined;
-      this.store.save(active.job, this.owner);
-      return { responded: true };
+      if (active) {
+        active.job.awaitingInput = undefined;
+        active.job.stalled = false;
+        active.job.stalledSince = undefined;
+        this.store.save(active.job, this.owner);
+      }
+      return { responded: true, qid };
     }
+    if (!this.owns(job)) throw new Error('Only the owning server can respond to this job');
     if (!['accept', 'acceptForSession', 'decline', 'cancel'].includes(decision)) throw new Error('Invalid approval decision');
     const active = this.active.get(jobId);
     if (job.state !== 'running' || !job.pendingApproval || !active?.process.respond || active.cancelled)
