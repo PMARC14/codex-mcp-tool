@@ -7,7 +7,6 @@ import { JobManager } from './manager.js';
 import { currentOwner } from './proc.js';
 import { fixture, fakeConnector, meta, until } from './test-helpers.js';
 import { fakeChild, flush } from './review-fakes.js';
-import { startChannelNotifier } from './channel.js';
 import type { JobEvent } from './connector.js';
 
 async function setup(t: any, verify = false) {
@@ -87,27 +86,23 @@ test('approval waiting and response restart the stall clock', { skip: process.pl
   } finally { await f.cleanup(); }
 });
 
-test('orphan recorder owns lost jobs, notifies once, and can retry cleanup', async () => {
+test('orphan recorder owns lost jobs and can retry cleanup', async () => {
   const f = fixture();
   let fail = true;
   let kills = 0;
   const manager = new JobManager(fakeConnector(f.script), f.config, undefined, { async killTree() { kills++; if (fail) throw new Error('fake kill failure'); } });
-  const notices: any[] = [];
-  const off = startChannelNotifier(manager, { async notification(event) { notices.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
   try {
     manager.store.create(meta(f.home, { id: 'orphan', state: 'running', reserved: true, owner: { ...(await currentOwner()), startTime: 'dead owner' }, process: { pid: 424252, startTime: 'fake' } }), 'fake');
     await manager.initialize();
     const lost = manager.store.get('orphan');
     assert.equal(lost.state, 'lost');
     assert.equal(manager.isOwn(lost), true);
-    assert.equal(notices.length, 1);
     manager.store.write(lost);
-    assert.equal(notices.length, 1);
     fail = false;
     await manager.cancel('orphan');
     assert.equal(manager.store.get('orphan').reserved, false);
     assert.equal(kills, 2);
-  } finally { off(); await manager.dispose(); f.cleanup(); }
+  } finally { await manager.dispose(); f.cleanup(); }
 });
 
 for (const timerFirst of [false, true]) test(`onClosed waits for settlement before releasing a kill-failed worker slot (deadline=${timerFirst})`, { skip: process.platform !== 'win32' }, async t => {
@@ -190,18 +185,4 @@ test('verification persistence failure retains the slot when cleanup failed', { 
     assert.equal(f.manager.store.get(f.job.id).reserved, true);
     assert.equal((f.manager as any).active.has(f.job.id), true);
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.cleanup(); }
-});
-
-test('startup lost notifications replay once across notifier instances', async () => {
-  const f = fixture();
-  const manager = new JobManager(fakeConnector(f.script), f.config, undefined, { async killTree() {} });
-  const notices: any[] = [];
-  const stops: (() => void)[] = [];
-  try {
-    manager.store.create(meta(f.home, { id: 'startup-orphan', state: 'running', owner: { ...(await currentOwner()), startTime: 'dead owner' } }), 'fake');
-    await manager.initialize();
-    for (let i = 0; i < 2; i++) stops.push(startChannelNotifier(manager, { async notification(event) { notices.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' }));
-    assert.equal(notices.length, 1);
-    assert.equal(notices[0].params.meta.state, 'lost');
-  } finally { stops.forEach(stop => stop()); await manager.dispose(); f.cleanup(); }
 });

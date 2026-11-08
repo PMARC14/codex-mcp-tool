@@ -37,17 +37,9 @@ import { ProgressReporter } from './utils/progress.js';
 import { executeJobWatch } from './tools/job-watch-progress.js';
 import { registerMcpTasks, TaskStdioTransport, taskCapabilities } from './tools/mcp-tasks.js';
 
-import {
-  startChannelNotifier,
-  withChannelCapabilities,
-  withChannelInstructions,
-} from './jobs/channel.js';
-
-const CHANNEL_INSTRUCTIONS = withChannelInstructions(undefined, 'codex');
-let stopChannel = () => {};
-const capabilities = withChannelCapabilities({
+const capabilities = {
   tools: {}, prompts: {}, logging: {}, completions: {}, tasks: taskCapabilities,
-});
+};
 
 const server = new Server(
   {
@@ -56,12 +48,11 @@ const server = new Server(
   },
   {
     capabilities,
-    ...(CHANNEL_INSTRUCTIONS ? { instructions: CHANNEL_INSTRUCTIONS } : {}),
   }
 );
 installRequestErrorReporting(server);
 const mcpTasks = registerMcpTasks(server, 'codex', codexJobManager, {
-  capabilities, instructions: CHANNEL_INSTRUCTIONS,
+  capabilities,
 });
 
 // Removed global state - using per-request state instead
@@ -299,7 +290,6 @@ async function main() {
   await codexJobManager.initialize();
   const transport = new TaskStdioTransport('codex');
   server.onclose = () => {
-    stopChannel();
     mcpTasks.close();
     // The SDK aborts in-flight requests. Job processes and their queue keep running;
     // their open pipes keep this server alive until their results have been saved.
@@ -315,13 +305,11 @@ async function main() {
   process.stdin.once('close', disconnect);
   process.stdout.once('error', disconnect);
   await server.connect(transport);
-  stopChannel = startChannelNotifier(codexJobManager, server, 'codex', Logger);
   Logger.debug('codex-mcp-tool listening on stdio');
 }
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
-    stopChannel();
     mcpTasks.close();
     void codexJobManager.dispose().finally(() => process.exit(0));
   });

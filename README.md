@@ -103,9 +103,9 @@ claude mcp add codex-cli -- npx -y @trishchuk/codex-mcp-tool
 
 See [agent jobs](docs/agent-jobs.md) and the [symmetry audit](docs/job-surface-audit.md) for shared behavior and vendor differences.
 
-`codex_agent` and `codex_agent_follow` also support MCP tasks, with no server launch flag. Task requests return a handle immediately and expose completion through task polling and status notifications, allowing Claude Code to show the job in `/tasks` and deliver its result. Claude Code 2.1.319 uses only the 2026-07-28 tasks extension; the 2025-11-25 path remains for SDK compatibility. Claude Code's own task feature settings still apply. Calls that do not request tasks retain their existing job ID, watch progress, and channel behavior. See [MCP tasks](docs/agent-jobs.md#mcp-tasks-no-launch-flag) for negotiation and request shapes.
+`codex_agent` and `codex_agent_follow` also support MCP tasks, with no server launch flag. Task requests return a handle immediately and expose completion through task polling and status notifications, allowing Claude Code to show the job in `/tasks` and deliver its result. Claude Code 2.1.319 uses only the 2026-07-28 tasks extension; the 2025-11-25 path remains for SDK compatibility. Claude Code's own task feature settings still apply. Calls that do not request tasks retain their existing job ID and watch progress; wakes use the external multi-agent hook-wait PostToolUse hook. See [MCP tasks](docs/agent-jobs.md#mcp-tasks-no-launch-flag) for negotiation and request shapes.
 
-Codex usage, auth detection, and optional-job quota guards share a machine-wide cache: five minutes normally, fifteen on battery or after a failed probe, with one probe at a time across servers. Channel notifications use their own delivery marker and leave the PostToolUse hook wake available; sessions with both paths may receive two wakes. See [agent jobs](docs/agent-jobs.md) for cache and notification details.
+Codex usage, auth detection, and optional-job quota guards share a machine-wide cache: five minutes normally, fifteen on battery or after a failed probe, with one probe at a time across servers. Wakes use an MCP task when requested, else the external multi-agent hook-wait PostToolUse hook. See [agent jobs](docs/agent-jobs.md) for cache and notification details.
 
 ## Image generation
 

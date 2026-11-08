@@ -315,6 +315,10 @@ DEBUG=codex-mcp:parser npx @trishchuk/codex-mcp-tool
 }
 ```
 
+## Background job wakes
+
+Wakes use an MCP task when requested, else the external multi-agent hook-wait PostToolUse hook (`multi-agent/scripts/hook-wait.sh`). If a non-task job does not wake the session, check that this external hook is installed and can read the shared jobs store. MCP-task jobs carry `mcp-task.json` and are skipped by the hook. The hook uses `woken` and `woken-ask-*` to deduplicate wakes; explicit stopped-result collection writes `collected`.
+
 ## Performance Optimization
 
 ### Slow Response Times

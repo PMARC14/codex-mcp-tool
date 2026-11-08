@@ -140,7 +140,7 @@ export class JobStore {
       }
     }
     if ((meta.state === 'queued' || meta.state === 'running') && previous !== meta.state) {
-      for (const marker of ['woken', 'channel-sent', 'collected']) rmSync(join(this.dir(meta.id), marker), { force: true });
+      for (const marker of ['woken', 'collected']) rmSync(join(this.dir(meta.id), marker), { force: true });
     }
     meta.failureReason = failureReason(meta);
     if (meta.state === 'queued' || meta.state === 'running') meta.partial = undefined;

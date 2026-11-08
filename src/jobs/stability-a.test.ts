@@ -269,8 +269,6 @@ test('answer polling treats busy/denied files as "not yet" and retries on the ne
 
 // ---- Coordinator findings ----
 import { mkdirSync as mkdir2 } from 'node:fs';
-import { startChannelNotifier } from './channel.js';
-import { JobStore } from './store.js';
 
 test('a second continuation of a worktree job is rejected while the first is still active', async () => {
   const f = fixture();
@@ -306,20 +304,6 @@ test('a cross-connector retry starts a fresh native session', async () => {
   } finally { await manager.dispose(); f.cleanup(); }
 });
 
-test('a failed channel send removes its marker so the hook fallback is not suppressed', async () => {
-  const f = fixture();
-  try {
-    const store = new JobStore(f.home);
-    const job = meta(f.home, { state: 'queued' });
-    store.create(job, 'fake');
-    let listener: (j: typeof job, p?: string) => void = () => {};
-    const manager = { onTransition: (l: typeof listener) => { listener = l; return () => {}; }, isOwn: () => true, store } as any;
-    startChannelNotifier(manager, { async notification() { throw new Error('transport closed'); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
-    listener({ ...job, state: 'completed' }, 'running');
-    await new Promise(resolve => setTimeout(resolve, 50));
-    assert.equal(existsSync(join(store.dir(job.id), 'channel-sent')), false);
-  } finally { f.cleanup(); }
-});
 
 test('a structurally invalid claim expires by file age instead of never', () => {
   const dir = scratch();

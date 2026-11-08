@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { JobManager } from './manager.js';
 import { fixture, fakeConnector } from './test-helpers.js';
-import { channelEvent } from './channel.js';
 
 for (const [label, command, passed, timedOut] of [
   ['passing', 'echo verified', true, false],
@@ -19,7 +18,6 @@ for (const [label, command, passed, timedOut] of [
       assert.equal(result.verify?.passed, passed);
       assert.equal(result.verify?.timedOut, timedOut);
       if (!timedOut) assert.match((await manager.read(job.jobId, 'verify')).text, passed ? /verified/ : /failed/);
-      assert.equal(channelEvent(manager.store.get(job.jobId), 'codex').meta.verify, passed ? 'passed' : 'failed');
       if (passed) {
         const next = await manager.send(job.jobId, 'follow-up');
         const nextResult = await manager.result(next.jobId, 10);

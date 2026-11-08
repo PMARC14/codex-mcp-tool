@@ -13,7 +13,7 @@ The legacy tools load only with `CODEX_MCP_LEGACY_TOOLS=1`.
 **Key behaviour:**
 - **Transport:** `app-server` by default, which is steerable; approvals are `never` unless `approvals: "on-request"`. `exec` is still selectable.
 - **MCP tasks:** the 2026-07-28 shape, as used by Claude Code 2.1.319; vendored schemas live in `src/tools/client-schemas.ts`.
-- **Wakes, exactly one:** the task; or the hook in plain `claude`; or a channel when `CLAUDE_AGENTS=1` (`claude-agents`).
+- **Wakes, exactly one:** MCP task, else the external multi-agent hook-wait PostToolUse hook.
 - **Ask-back:** the `ask_orchestrator` bridge (`src/bridge/`), plus Codex native questions.
 - **Windows:** every spawn goes through the Job Object launcher (`CREATE_NO_WINDOW`), because Windows Terminal grabs any new console as a tab.
 - **Usage and version checks:** every 15 min (30 on battery), plus one before and after each job; never while idle. Configure with `~/.agent-jobs/config.json` `usage.intervalMin` / `usage.batteryIntervalMin`.

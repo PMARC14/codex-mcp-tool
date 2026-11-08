@@ -4,9 +4,7 @@ import { appendFileSync, existsSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, fakeConnector, meta, until } from './test-helpers.js';
 import { JobManager } from './manager.js';
-import type { JobMeta, JobState } from './connector.js';
 import { progressMessage } from './watch.js';
-import { startChannelNotifier } from './channel.js';
 import { registerJobTools, type JobTool } from './tools.js';
 import { getToolDefinitions, toolRegistry } from '../tools/registry.js';
 
@@ -50,24 +48,6 @@ test('tool titles reach MCP definitions', () => {
   } finally { toolRegistry.splice(before); f.cleanup(); }
 });
 
-test('channel marker deduplicates across notifier instances', async () => {
-  const f = fixture(); const manager = new JobManager(fakeConnector(f.script), f.config);
-  try {
-    await manager.initialize();
-    const job = meta(f.home, { state: 'queued' }); manager.store.create(job, 'p');
-    let calls = 0; const server = { async notification() { calls++; } };
-    // Synthetic transition source keeps ownership independent from process scheduling.
-    let emit!: (item: JobMeta, previous: JobState | undefined) => void;
-    const source = { store: manager.store, isOwn: () => true, onTransition(listener: typeof emit) { emit = listener; return () => {}; } };
-    startChannelNotifier(source, server, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
-    emit({ ...job, state: 'completed' }, 'running');
-    startChannelNotifier(source, server, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
-    emit({ ...job, state: 'completed' }, 'running');
-    assert.equal(calls, 1); assert.ok(existsSync(join(manager.store.dir(job.id), 'channel-sent')));
-    assert.equal(existsSync(join(manager.store.dir(job.id), 'woken')), false);
-  } finally { await manager.dispose(); f.cleanup(); }
-});
-
 test('stall reports and clears on output, and kill permits requeue', async () => {
   const f = fixture(); const manager = new JobManager(fakeConnector(f.script), f.config);
   try {
@@ -99,17 +79,14 @@ test('idempotency and optional quota guard use cached usage', async () => {
   } finally { await manager.dispose(); f.cleanup(); }
 });
 
-test('task markers suppress channels and retry clears delivery markers', async () => {
+test('retry clears hook delivery markers for task jobs', async () => {
   const f = fixture(); const manager = new JobManager(fakeConnector(f.script), f.config);
   try {
     await manager.initialize();
     const job = meta(f.home); manager.store.create(job, 'p');
-    let calls = 0;
-    startChannelNotifier({ store: manager.store, isOwn: () => true, onTransition: manager.onTransition.bind(manager) }, { async notification() { calls++; } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
     const dir = manager.store.dir(job.id);
     writeFileSync(join(dir, 'mcp-task.json'), '{}');
     manager.store.write({ ...job, state: 'paused', reason: 'usage_limit' });
-    assert.equal(calls, 0);
     assert.equal(manager.store.get(job.id).failureReason, 'quota_exhausted');
     writeFileSync(join(dir, 'woken'), ''); writeFileSync(join(dir, 'collected'), '');
     manager.store.write({ ...job, state: 'queued' });

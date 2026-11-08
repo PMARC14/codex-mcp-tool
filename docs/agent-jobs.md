@@ -63,7 +63,7 @@ For app-server, modes map to sandbox `read-only`, `workspace-write`, and `danger
 
 App-server cancellation first sends `turn/interrupt`, waits up to three seconds for the process to exit, and then performs the normal process-tree cleanup within the existing cancel deadline. Wall-clock timeouts still use normal cleanup directly.
 
-Command, file-change and permission approval requests set `pendingApproval: { id, kind, summary, requestedAt }` in metadata; `summary` is capped at 300 characters and `requestedAt` is epoch milliseconds. Watch progress shows `awaiting approval`, task status projects to `input_required`, and the opt-in channel notifier sends one metadata-only event with `state=input_required` for each pending request. This approval event also applies to MCP-task jobs; it does not consume their terminal notification marker. Worker summaries and commands never enter channel payloads. Concurrent requests are held in arrival order and the first is exposed for response. Stall detection waits while approval is pending; the wall-clock timeout still applies.
+Command, file-change and permission approval requests set `pendingApproval: { id, kind, summary, requestedAt }` in metadata; `summary` is capped at 300 characters and `requestedAt` is epoch milliseconds. Watch progress shows `awaiting approval`, and task status projects to `input_required`. Concurrent requests are held in arrival order and the first is exposed for response. Stall detection waits while approval is pending; the wall-clock timeout still applies.
 
 Call `codex_agent_answer` after inspecting `pendingApproval` in status. It sends the matching JSON-RPC response, clears the pending request (or exposes the next request), and returns `{ responded: true }`. `approvalTimeoutMin` is positive, defaults to 30, and automatically declines unanswered requests, persisting `approvalReason: "approval_timeout"` and `reason: "approval_timeout"` (a later cancellation, quota pause or wall-clock timeout can supersede `reason`). Permissions use a grant profile rather than a decision enum: accept grants the requested permissions for the turn, acceptForSession grants them for the session, decline/cancel grant nothing; permissions cancel also interrupts the turn. Turn completion, server-side resolution and process exit clear pending approvals and their timers.
 
@@ -93,7 +93,7 @@ Command/file approval decisions are exactly `accept`, `acceptForSession`, `decli
 
 ## MCP tasks (no launch flag)
 
-Only `codex_agent` and `codex_agent_follow` support task augmentation. Ordinary calls retain their existing responses, progress notifications, cancellation semantics, and optional channels. A task start launches the same job as an ordinary start. A task follow adopts the supplied `jobId` immediately; it tracks the job through pauses and automatic retries, independent of `maxWaitSec`. Its final payload is `agent_result`, without the ordinary follow's `watchedSec` and `timedOut` fields.
+Only `codex_agent` and `codex_agent_follow` support task augmentation. Ordinary calls retain their existing responses, progress notifications, cancellation semantics, and the external multi-agent hook-wait PostToolUse hook. A task start launches the same job as an ordinary start. A task follow adopts the supplied `jobId` immediately; it tracks the job through pauses and automatic retries, independent of `maxWaitSec`. Its final payload is `agent_result`, without the ordinary follow's `watchedSec` and `timedOut` fields.
 
 Task IDs equal job IDs. State and results come from the shared job store; a small `jobs/<id>/mcp-task.json` marker records membership in `tasks/list` across reconnects. Listing includes task-augmented jobs for this connector only. Read-only `tasks/get` and `tasks/result` also accept any known job ID for this connector, without subscribing the new connection to notifications. Cancellation retains the job manager's existing ownership checks: another server process can read a job but cannot cancel it.
 
@@ -112,7 +112,7 @@ Polling is suggested every 15,000 ms. Status reads use saved metadata and a boun
 
 ### Negotiation and wire shapes (Claude Code 2.1.319)
 
-Claude Code 2.1.319 discovers `2026-07-28` using `server/discover` and the `io.modelcontextprotocol/tasks` extension. Task permission is per call: `_meta["io.modelcontextprotocol/protocolVersion"]` is `"2026-07-28"`, and `_meta["io.modelcontextprotocol/clientCapabilities"].extensions["io.modelcontextprotocol/tasks"]` is `{}`. Without that extension, agent/follow retain ordinary behavior. No channel flag is required; client feature gates still control backgrounding and wake delivery.
+Claude Code 2.1.319 discovers `2026-07-28` using `server/discover` and the `io.modelcontextprotocol/tasks` extension. Task permission is per call: `_meta["io.modelcontextprotocol/protocolVersion"]` is `"2026-07-28"`, and `_meta["io.modelcontextprotocol/clientCapabilities"].extensions["io.modelcontextprotocol/tasks"]` is `{}`. Without that extension, agent/follow retain ordinary behavior. No server launch flag is required; client feature gates still control backgrounding and wake delivery.
 
 Create returns `{ resultType: "task", taskId, status, statusMessage, createdAt, lastUpdatedAt, ttlMs: null, pollIntervalMs: 15000, _meta }`. Modern get/cancel and each list entry/status notification use the status-discriminated task shape, without a `resultType` envelope:
 
@@ -170,11 +170,9 @@ The timeout covers the maximum bridge wait plus a margin, rather than the CLI's 
 
 Connectors have an optional `bridgeConfig(job)` hook returning argv and/or `{ path, content, cleanup }` file descriptions. Codex implements it with in-memory per-run config. A future agy implementation can use the file descriptions for temporary project configuration; no agy configuration files or lifecycle changes are implemented in this phase.
 
-### Hooks and channels
+### Hook fallback
 
 Hooks should watch `meta.json.awaitingInput` (`qid`, bounded `question`, `options`, `askedAt`) and `meta.json.pendingApproval` (`id`, `kind`, `summary`, `requestedAt`), independently of the job's `running` state. A pending question needs `codex_agent_answer { answer }`; a pending approval needs `{ decision }`. Cleared fields mean the response was delivered or the request ended. This repository does not modify `multi-agent/scripts/hook-wait.sh`.
-
-With `CLAUDE_AGENTS=1`, each non-task job question emits one deduplicated metadata-only event with `state=input_required`, `kind=question`, and `job_id`. Neither question text, options, note text nor worker output enters channel payloads. Question events do not consume terminal notification markers.
 
 ## Shared store and ownership
 
@@ -211,19 +209,9 @@ After the job stops, collect with `remove: "none"`, `"worktree"`, or `"worktree+
 
 Before removal, collection walks ordinary directories and unlinks junctions and symlinks, including nested and dangling links. It removes only each link, leaving its target untouched. A failed Git removal is retried with `core.longpaths=true`. Before the first removal attempt, `patch.diff.removal-attempted` saves the patch's stat summary. Later collections reuse the saved patch and summary, even after a restart, because a failed removal may have already deleted tracked files. Missing saved artifacts cause an error instead of collecting from a partially removed worktree.
 
-## Claude Code channel notifications (opt-in)
+## Wake delivery
 
-Claude Code Channels let an MCP server push events into a running session. Launch with `claude-agents`, which exports `CLAUDE_AGENTS=1` and loads `server:codex` and `server:agy` as development channels. The launcher flag must equal `1`; otherwise the server declares no channel capability, adds no channel instructions, and sends no events or markers.
-
-| Session or job | Wake path |
-| --- | --- |
-| Plain `claude` | MCP task when used; otherwise the PostToolUse `asyncRewake` hook. |
-| `claude-agents` | MCP task when used; otherwise channel events. The hook stands down in launcher sessions. |
-| MCP-task jobs | Task only; channel and hook skip these jobs. |
-
-The launcher and hook must implement this convention together. `AGENT_JOBS_CHANNEL` is retained in existing configurations but is no longer required or consulted. A plain session does not receive channel events, even if `AGENT_JOBS_CHANNEL=1` is configured. The server declares `experimental: { 'claude/channel': {} }` and sends notifications for its own jobs reaching `completed`, `failed`, `killed`, `paused`, or `lost` only when the launcher flag is set. Other owners and MCP-task jobs are skipped. Claude Code can silently drop events when channels were not loaded, so the launcher must load them as well as export the flag. Claude Code's MCP environment allowlist mode does not inherit this flag; in that mode the launcher must also pass `CLAUDE_AGENTS=1` through the server configuration `env` or a launcher-specific server wrapper.
-
-The payload is metadata only. The content is `codex agent <state>: call codex_agent_result with this job_id` (with the reset time added for `paused`). The attributes are `job_id`, `state`, `agent`, and `verify` (`passed` or `failed` when verification ran), plus `label` (sanitized to `[A-Za-z0-9_-]`, 40 characters at most), `reason`, and `reset_at` when known. Superseding a paused job sends one `killed` transition with `reason: "superseded"` and `superseded_by` identifying its replacement. Worker output (final text, stdout, stderr, patch) is never included, because it would be a prompt-injection vector; call `codex_agent_result` to read it. A failed push is logged and never affects the job.
+Wakes use an MCP task when requested, else the external multi-agent hook-wait PostToolUse hook (`multi-agent/scripts/hook-wait.sh`). MCP-task jobs carry `mcp-task.json`, which lets the hook skip jobs whose task provides the wake. The hook observes stopped jobs and pending questions or approvals from the shared store.
 
 ## Usage
 
@@ -252,7 +240,7 @@ Worktree creation and collection disable Git hooks, fsmonitor, configured clean,
 
 Windows child start-time inspection retries once if the child handle is still alive. If both attempts fail, cancellation uses the live child handle and PID-based `taskkill /T`; a persisted PID without a verified start time alone does not authorize termination. Empty-start owners whose PIDs remain alive retain their slots. Cached Job Object launchers are checked for existence before reuse and rebuilt or replaced by process-tree cleanup when missing. Without Job Object containment, snapshots follow recorded parents even after they exit, while rejecting observed PID reuse. Descendants whose entire intermediate parent lifetime falls between snapshots and was never recorded remain a limitation of this fallback.
 
-Cooperative cancellation gets a three-second interrupt grace followed by a separate ten-second process-tree cleanup budget. A process that closes during the grace needs no further termination. Worker and verification close callbacks wait for settlement before releasing a failed-cleanup reservation. A server recovering its connector's orphan becomes the recorder of the `lost` state and can retry cleanup with `agent_stop`. Lost notifications recovered before transport connection are replayed on notifier startup; the shared exclusive `channel-sent` marker prevents duplicate channel attempts.
+Cooperative cancellation gets a three-second interrupt grace followed by a separate ten-second process-tree cleanup budget. A process that closes during the grace needs no further termination. Worker and verification close callbacks wait for settlement before releasing a failed-cleanup reservation. A server recovering its connector's orphan becomes the recorder of the `lost` state and can retry cleanup with `agent_stop`.
 
 
 ### Reasoning, stalls, and notification markers
@@ -263,10 +251,10 @@ Codex reasoning is saved in the `reasoning` job file, retaining the most recent 
 
 Waiting for approval resets the stall clock on every sample, and an approval response starts a fresh interval. MCP task status notifications track the derived status, including `working` to `input_required` and back. Modern (`2026-07-28`) cancellation returns a task projection with `ttlMs` and `pollIntervalMs`; a terminal `tasks/get` returns the completed result payload. Explicit failure reasons and `lost` take precedence over authentication text, whose fallback matching uses whole words.
 
-A channel notification exclusively creates its own `jobs/<id>/channel-sent` marker to deduplicate channel attempts. Question and approval events use `channel-sent-<hash>`. Channels never create `woken`: that marker belongs to the PostToolUse wake hook. Only a successful explicit `codex_agent_result` or `codex_agent_follow` tool response for a stopped job creates `jobs/<id>/collected`, which lets the hook skip results already collected. Internal result reads, task status notifications, and `tasks/get`, `tasks/list`, and `tasks/result` never create that marker. Result assembly must succeed before collection is marked. The launcher hook stands down in channel sessions, so the separate markers do not cause a second wake.
+The external multi-agent hook-wait PostToolUse hook owns `jobs/<id>/woken` and per-question `woken-ask-*` markers. Only a successful explicit `codex_agent_result` or `codex_agent_follow` tool response for a stopped job creates `jobs/<id>/collected`, which lets the hook skip results already collected. Internal result reads, task status notifications, and `tasks/get`, `tasks/list`, and `tasks/result` never create that marker. Result assembly must succeed before collection is marked.
 
 
-Jobs started or adopted as MCP tasks do not send channel notifications: the task provides its own wake. Returning to queued or running clears the per-attempt `woken`, `channel-sent`, and `collected` markers.
+Jobs started or adopted as MCP tasks carry `mcp-task.json`: the task provides their wake and the hook skips them. Returning to queued or running clears the per-attempt `woken` and `collected` markers.
 
 `agent` accepts an optional `idempotencyKey`; a matching connector and key created within 24 hours returns the existing job. `priority` defaults to `normal`; `optional` starts are rejected when either the five-hour or weekly usage window reaches `usageCeiling` (default 90 percent). The optional-start guard reads the shared usage cache; unknown usage permits the start. Codex uses the same live snapshot as detection and `codex_usage`, with a session-log fallback when live usage is unavailable.
 
@@ -287,7 +275,7 @@ Native and bridge questions share a per-job claim. A second question receives an
 - The bridge and the app-server question poller retry `EBUSY`/`EPERM`/`EACCES` on the next tick, and the bridge deadline makes one last answer check before returning the fallback text. A claim that cannot be released never turns a delivered answer into an error. A structurally invalid claim file expires by file age.
 - `src/jobs/lock.ts` is the one cross-process lock: `reclaimStale` serializes reclaimers with a `.reaper` file, re-reads under it, renames the lock to a unique tombstone and verifies the content (restoring a wrongly taken lock with `linkSync`); `releaseOwned` renames the lock to a unique name and checks ownership before deleting. The only remaining window is microseconds, and only if a stale-by-timestamp owner releases at the exact moment of reclamation.
 - Two continuations (`agent_message` resume, `agent_retry`) cannot share one worktree: the second is rejected while another queued, reserved or running job uses it, and promotion also skips a job whose worktree is busy.
-- A retry to another connector clears `resumeSession`, `sessionId` and `transport`. A failed channel send removes its `channel-sent` marker so the hook fallback still fires.
+- A retry to another connector clears `resumeSession`, `sessionId` and `transport`.
 
 ### Idle cost and check cadence
 

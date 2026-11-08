@@ -32,7 +32,7 @@ async function setup(f = fixture(), era: 'legacy' | 'modern' = 'legacy') {
     await import(${JSON.stringify(new URL('../index.js', import.meta.url).href)});
   `;
   const child = spawn(process.execPath, ['--input-type=module', '-e', bootstrap], {
-    env: { ...process.env, AGENT_JOBS_HOME: f.home, AGENT_JOBS_MAX: '1', AGENT_JOBS_CHANNEL: '0' },
+    env: { ...process.env, AGENT_JOBS_HOME: f.home, AGENT_JOBS_MAX: '1' },
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });

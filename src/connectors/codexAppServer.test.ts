@@ -8,7 +8,6 @@ import { buildAppServer, parseAppServer } from './codexAppServer.js';
 import { JobManager } from '../jobs/manager.js';
 import { fixture, fakeConnector, until } from '../jobs/test-helpers.js';
 import { registerMcpTasks } from '../tools/mcp-tasks.js';
-import { startChannelNotifier } from '../jobs/channel.js';
 import { registerJobTools, type JobTool } from '../jobs/tools.js';
 import { progressMessage } from '../jobs/watch.js';
 import type { JobSpec } from '../jobs/connector.js';
@@ -214,11 +213,9 @@ test('app-server rejects foreign control, blank messages and non-completion stee
   } finally { await foreign.dispose(); await f.cleanup(); }
 });
 
-test('approvals persist, project input_required, notify once, and accept with the discovered responses', async () => {
+test('approvals persist, project input_required, and accept with the discovered responses', async () => {
   for (const kind of ['commandExecution', 'fileChange', 'permissions']) {
     const f = setup();
-    const events: any[] = [];
-    const off = startChannelNotifier(f.manager, { async notification(event) { events.push(event); } }, 'codex', undefined, { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' });
     try {
       const { jobId } = await f.manager.start({ prompt: JSON.stringify({ approval: kind }), cwd: f.home, transport: 'app-server', mode: 'write' });
       await until(() => !!f.manager.store.get(jobId).pendingApproval && f.manager.store.get(jobId).state === 'running');
@@ -232,14 +229,12 @@ test('approvals persist, project input_required, notify once, and accept with th
       assert.equal(task.status, 'input_required');
       tasks.close();
       f.manager.store.write(job);
-      assert.equal(events.filter(e => e.params.meta.state === 'input_required').length, 1);
-      assert.ok(!JSON.stringify(events).includes('fake approval'));
       assert.deepEqual(await f.manager.respond(jobId, 'accept'), { responded: true });
       assert.equal(f.manager.store.get(jobId).pendingApproval, undefined);
       assert.equal((await f.manager.watch(jobId, 20)).state, 'completed');
       const response = f.messages().find(m => m.id === 'approval-1');
       assert.deepEqual(response.result, kind === 'permissions' ? { permissions: { network: { enabled: true } }, scope: 'turn' } : { decision: 'accept' });
-    } finally { off(); await f.cleanup(); }
+    } finally { await f.cleanup(); }
   }
 });
 

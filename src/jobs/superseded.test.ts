@@ -3,17 +3,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { JobManager } from './manager.js';
-import { startChannelNotifier } from './channel.js';
 import { fixture, fakeConnector, meta, until } from './test-helpers.js';
 import { registerJobTools, type JobTool } from './tools.js';
 import { currentOwner } from './proc.js';
 
 for (const action of ['requeue', 'send'] as const) {
-  test(`${action} finishes a paused original, exposes its replacement and notifies once`, async () => {
+  test(`${action} finishes a paused original and exposes its replacement`, async () => {
     const f = fixture();
     const manager = new JobManager(fakeConnector(f.script, 'codex', Date.now() + 60000), f.config);
-    const notifications: Record<string, string>[] = [];
-    let stop = () => {};
     try {
       const original = await manager.start({
         prompt: JSON.stringify({ limit: true }),
@@ -22,17 +19,6 @@ for (const action of ['requeue', 'send'] as const) {
       await until(() => manager.store.get(original.jobId).state === 'paused');
       const pauseFile = join(f.home, 'pauses.json');
       const pauseBefore = readFileSync(pauseFile, 'utf8');
-      stop = startChannelNotifier(
-        manager,
-        {
-          async notification({ params }) {
-            notifications.push(params.meta!);
-          },
-        },
-        'codex',
-        undefined,
-        { AGENT_JOBS_CHANNEL: '1', CLAUDE_AGENTS: '1' }
-      );
       const before = Date.now();
       const replacement =
         action === 'requeue'
@@ -65,19 +51,11 @@ for (const action of ['requeue', 'send'] as const) {
         }
       }
 
-      // A metadata rewrite must not emit a second terminal notification.
-      manager.store.write(saved);
-      const events = notifications.filter(event => event.job_id === original.jobId);
-      assert.equal(events.length, 1);
-      assert.equal(events[0].state, 'killed');
-      assert.equal(events[0].reason, 'superseded');
-      assert.equal(events[0].superseded_by, replacement.jobId);
       const next = await manager.start({ prompt: 'new job', cwd: f.home });
       await until(() => manager.store.get(next.jobId).state === 'paused');
       assert.equal(manager.store.get(next.jobId).reason, 'usage_limit');
       assert.equal(readFileSync(pauseFile, 'utf8'), pauseBefore);
     } finally {
-      stop();
       await manager.dispose();
       f.cleanup();
     }
