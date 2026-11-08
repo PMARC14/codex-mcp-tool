@@ -82,6 +82,17 @@ test('transient start-time failure recovers on its one retry', { skip: process.p
   } finally { f.close(); await proc.done; f.cleanup(); }
 });
 
+test('termination shares its descendant snapshot with killTree', { skip: process.platform !== 'win32' }, async t => {
+  const f = setup(t, ['1234']);
+  const proc = startProcess(f.options);
+  try {
+    await flush();
+    const before = f.snapshots;
+    await proc.stop();
+    assert.equal(f.snapshots - before, 2, 'one pre-kill snapshot and one survivor check');
+  } finally { f.close(); await proc.done; f.cleanup(); }
+});
+
 test('empty-start owner stays alive even when inspection returns a known start time', { skip: process.platform !== 'win32' }, async t => {
   const f = setup(t, ['1234']);
   try { assert.equal(await ownerAlive({ pid: f.child.pid!, startTime: '' }), true); }

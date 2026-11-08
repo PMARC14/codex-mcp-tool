@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { fixture, meta } from './test-helpers.js';
@@ -86,6 +86,24 @@ test('prune removes only finished records older than seven days', () => {
   } finally {
     f.cleanup();
   }
+});
+
+test('prune removes every task for a pruned job and keeps tasks for retained jobs', () => {
+  const f = fixture();
+  try {
+    const store = new JobStore(f.home);
+    const old = Date.now() - 8 * 86400000;
+    store.create(meta(f.home, { id: 'old', state: 'completed', finishedAt: old }), 'p');
+    store.create(meta(f.home, { id: 'keep', state: 'completed' }), 'p');
+    store.create(meta(f.home, { id: 'reserved', state: 'failed', reserved: true, finishedAt: old }), 'p');
+    const dir = join(f.home, 'tasks');
+    mkdirSync(dir);
+    for (const [taskId, jobId] of [['old-launch', 'old'], ['old-follow', 'old'], ['keep-task', 'keep'], ['reserved-task', 'reserved']])
+      writeFileSync(join(dir, `${taskId}.json`), JSON.stringify({ taskId, jobId }));
+    store.prune();
+    assert.deepEqual(readdirSync(dir).sort(), ['keep-task.json', 'reserved-task.json']);
+    assert.equal(existsSync(store.dir('reserved')), true);
+  } finally { f.cleanup(); }
 });
 
 test('paged reads preserve UTF-8 across stream chunks and bound returned characters', async () => {

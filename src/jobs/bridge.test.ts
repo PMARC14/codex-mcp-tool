@@ -246,6 +246,26 @@ test('fresh manager answers a dead owner question through a new agent_answer tas
   } finally { await w.close(); await s.cleanup(); }
 });
 
+test('preserved orphan answer task observes a second bridge question', async () => {
+  const s = setup();
+  const jobId = 'restart-second', qid = 'first-question';
+  s.manager.store.create(meta(s.home, { id: jobId, state: 'running', owner: { pid: 2147483647, startTime: 'dead' },
+    awaitingInput: { qid, question: 'First?', askedAt: Date.now() } }), 'fake');
+  const questionPath = join(s.manager.store.dir(jobId), 'question.json');
+  writeFileSync(questionPath, JSON.stringify({ id: qid, question: 'First?', askedAt: Date.now() }));
+  const w = await wire(s);
+  try {
+    await s.manager.initialize();
+    assert.equal(s.manager.store.get(jobId).orphanPreserved, true);
+    const response = await w.rpc('tools/call', { name: 'codex_agent_answer', arguments: { jobId, qid, answer: 'reply' } });
+    writeFileSync(questionPath, JSON.stringify({ id: 'second-question', question: 'Second?', askedAt: Date.now() }));
+    await until(() => s.manager.store.get(jobId).awaitingInput?.qid === 'second-question', 'preserved orphan samples its next question', 3000);
+    const result = JSON.parse((await w.rpc('tasks/result', { taskId: response.taskId })).content[0].text);
+    assert.equal(result.event, 'question');
+    assert.equal(result.awaitingInput.qid, 'second-question');
+  } finally { await w.close(); await s.cleanup(); }
+});
+
 
 test('tasks/update cannot answer a worker question or open a user form', async () => {
   const s = setup(); const w = await wire(s);

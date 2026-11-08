@@ -106,6 +106,8 @@ interface EventTask {
   statusMessage: string;
   answered: AnsweredInput;
   context: Record<string, unknown>;
+  follow?: boolean;
+  showReasoning?: boolean;
   result?: CallToolResult;
   error?: string;
 }
@@ -138,14 +140,17 @@ export function registerMcpTasks(
   const read = (id: string): EventTask => {
     try {
       const record: EventTask = JSON.parse(readFileSync(path(id), 'utf8'));
-      if (record.taskId === id && record.connector === manager.connector.id) return record;
+      if (record.taskId === id && record.connector === manager.connector.id) {
+        manager.store.get(record.jobId);
+        return record;
+      }
     } catch { /* Invalid or foreign ids are protocol errors. */ }
     throw new McpError(ErrorCode.InvalidParams, `Unknown task: ${id}`);
   };
   const load = (id: string) => {
     const cached = records.get(id);
-    if (cached && watches.has(id)) return cached;
     const record = read(id);
+    if (cached && watches.has(id)) return cached;
     records.set(id, record);
     return record;
   };
@@ -176,6 +181,7 @@ export function registerMcpTasks(
     watches.set(record.taskId, entry);
     entry.done = watchJob(manager, record.jobId, undefined, {
       unlimited: true, untilNextEvent: record.answered, signal: controller.signal,
+      markCollected: record.follow, showReasoning: record.showReasoning,
       onProgress(message) {
         if (record.status !== 'working' || message === record.statusMessage) return;
         record.statusMessage = message;
@@ -249,6 +255,16 @@ export function registerMcpTasks(
     if (record.status !== 'working') throw new McpError(ErrorCode.InvalidParams, 'Cannot cancel a terminal task');
     const active = ensureWatch(record)!;
     active.cancelling = true;
+    if (record.follow) {
+      active.controller.abort();
+      await active.done;
+      record.status = 'cancelled';
+      record.statusMessage = `${record.jobId}: watch cancelled`;
+      record.updatedAt = Date.now();
+      save(record);
+      notify(record);
+      return modern(request.params) ? projection(record) : base(record);
+    }
     try { await manager.cancel(record.jobId); }
     catch (error) { active.cancelling = false; throw error; }
     await active.done;
@@ -287,6 +303,7 @@ export function registerMcpTasks(
         taskId, jobId, connector: manager.connector.id, createdAt: Date.now(), updatedAt: Date.now(),
         modern: modern({ _meta: requestMeta }), status: 'working', statusMessage: progressMessage(manager, job),
         answered: { qid: context.qid ?? before?.awaitingInput?.qid, approvalId: before?.pendingApproval?.id }, context,
+        follow: name === `${prefix}_agent_follow`, showReasoning: validated.showReasoning,
       };
       save(record);
       const marker = join(manager.store.dir(jobId), 'mcp-task.json');

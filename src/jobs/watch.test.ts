@@ -213,3 +213,23 @@ test('heartbeat observes transitions persisted through another store instance', 
     await s.cleanup();
   }
 });
+
+test('new approval wakes a watch while its answered question remains pending', async () => {
+  const s = setup();
+  const controller = new AbortController();
+  try {
+    await s.manager.initialize();
+    const job = meta(s.f.home, { state: 'running', awaitingInput: { qid: 'answered', question: 'Question?', askedAt: Date.now() } });
+    s.manager.store.create(job, 'p');
+    let samples = 0;
+    const pending = s.manager.watch(job.id, 5, { untilNextEvent: { qid: 'answered' }, signal: controller.signal, onProgress() { samples++; } });
+    void pending.catch(() => {});
+    await until(() => samples > 0);
+    const before = samples;
+    s.manager.store.write({ ...job, pendingApproval: { id: 'new', kind: 'command', summary: 'Approve?', requestedAt: Date.now() } });
+    assert.equal(samples, before + 1, 'approval must be sampled synchronously, before the heartbeat');
+    const result = await pending;
+    assert.equal(result.event, 'approval');
+    assert.equal(result.pendingApproval?.id, 'new');
+  } finally { controller.abort(); await s.cleanup(); }
+});

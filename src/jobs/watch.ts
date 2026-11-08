@@ -3,6 +3,7 @@ import type { JobManager } from './manager.js';
 
 export type JobEvent = 'stopped' | 'paused' | 'question' | 'approval';
 export interface AnsweredInput { qid?: string; approvalId?: string | number }
+const inputKey = (job: JobMeta) => JSON.stringify([job.awaitingInput?.qid, job.pendingApproval?.id, job.pendingApproval?.requestedAt]);
 
 export function nextJobEvent(job: JobMeta, answered: AnsweredInput = {}): JobEvent | undefined {
   if (job.state === 'paused') return 'paused';
@@ -117,7 +118,7 @@ export async function watchJob(
         try {
           checkAbort();
           const job = manager.store.get(jobId);
-          approvalKey = job.awaitingInput ? job.awaitingInput.qid : job.pendingApproval ? JSON.stringify([job.pendingApproval.id, job.pendingApproval.requestedAt]) : undefined;
+          approvalKey = inputKey(job);
           options.onProgress?.(progressMessage(manager, job, options.showReasoning));
           if (ended) return; // The callback may cancel the request.
           // Event waits return on every pause; other internal watches may follow automatic retries.
@@ -143,7 +144,7 @@ export async function watchJob(
         }
       };
       unsubscribe = manager.onTransition((job, previous) => {
-        const nextApproval = job.awaitingInput ? job.awaitingInput.qid : job.pendingApproval ? JSON.stringify([job.pendingApproval.id, job.pendingApproval.requestedAt]) : undefined;
+        const nextApproval = inputKey(job);
         if (job.id === jobId && (job.state !== previous || nextApproval !== approvalKey)) sample();
       });
       for (const signal of signals) signal.addEventListener('abort', abort, { once: true });

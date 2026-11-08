@@ -4,12 +4,12 @@ import cp from 'node:child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { JobManager } from './manager.js';
-import { currentOwner } from './proc.js';
+import { currentOwner, processTreeAlive } from './proc.js';
 import { fixture, fakeConnector, meta, until } from './test-helpers.js';
 import { fakeChild, flush } from './review-fakes.js';
 import type { JobEvent } from './connector.js';
 
-async function setup(t: any, verify = false) {
+async function setup(t: any, verify = false, treeAlive?: typeof processTreeAlive) {
   const f = fixture();
   const connector = fakeConnector(f.script);
   let emit!: (event: JobEvent) => void;
@@ -17,7 +17,7 @@ async function setup(t: any, verify = false) {
     emit = context.emit;
     return () => undefined;
   } });
-  const manager = new JobManager(connector, f.config, undefined, { verifyShell: async () => process.execPath });
+  const manager = new JobManager(connector, f.config, undefined, { verifyShell: async () => process.execPath, processTreeAlive: treeAlive });
   await manager.initialize();
   t.mock.method(manager as any, 'pump', async () => {});
   const owner = await currentOwner();
@@ -125,6 +125,62 @@ test('orphan recorder owns lost jobs and can retry cleanup', async () => {
     assert.equal(manager.store.get('orphan').reserved, false);
     assert.equal(kills, 2);
   } finally { await manager.dispose(); f.cleanup(); }
+});
+
+test('pump retains a kill-failed reservation until its POSIX group disappears', async () => {
+  const f = fixture();
+  let groupAlive = true;
+  let probes = 0;
+  const manager = new JobManager(fakeConnector(f.script), f.config, undefined, {
+    processTreeAlive: (root, recorded) => processTreeAlive(root, recorded, {
+      platform: 'linux', ownerAlive: async () => false, startTime: async () => undefined,
+      kill(pid, signal) {
+        assert.equal(pid, -424254); assert.equal(signal, 0); probes++;
+        if (!groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+      },
+    }),
+  });
+  try {
+    await manager.initialize();
+    const job = meta(f.home, { state: 'failed', reason: 'kill-failed', reserved: true,
+      owner: await currentOwner(), managerId: (manager as any).id, process: { pid: 424254, startTime: '42' } });
+    manager.store.create(job, 'p');
+    await (manager as any).pump();
+    assert.equal(manager.store.get(job.id).reserved, true);
+    groupAlive = false;
+    await (manager as any).pump();
+    assert.equal(manager.store.get(job.id).reserved, false);
+    assert.ok(probes >= 2);
+  } finally { await manager.dispose(); f.cleanup(); }
+});
+
+test('onClosed retains a kill-failed reservation while its POSIX group lives', async t => {
+  let groupAlive = true;
+  let probes = 0;
+  const f = await setup(t, false, (root, recorded) => processTreeAlive(root, recorded, {
+    platform: 'linux', ownerAlive: async () => false, startTime: async () => undefined,
+    kill(pid, signal) {
+      assert.equal(pid, -424250); assert.equal(signal, 0); probes++;
+      if (!groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    },
+  }));
+  try {
+    const timers: { fire(): void; ms: number }[] = [];
+    t.mock.method(globalThis, 'setTimeout', (fire: () => void, ms: number) => { timers.push({ fire, ms }); return { unref() {} } as any; });
+    const stopping = f.active.process.stop();
+    await flush();
+    timers.find(timer => timer.ms === 10000)!.fire();
+    await stopping;
+    await f.active.finished;
+    f.alive.delete(f.children[0].pid);
+    f.children[0].close();
+    await flush();
+    assert.ok(probes > 0);
+    assert.equal(f.manager.store.get(f.job.id).reserved, true);
+    groupAlive = false;
+    await (f.manager as any).promote();
+    assert.equal(f.manager.store.get(f.job.id).reserved, false);
+  } finally { await f.cleanup(); }
 });
 
 for (const timerFirst of [false, true]) test(`onClosed waits for settlement before releasing a kill-failed worker slot (deadline=${timerFirst})`, { skip: process.platform !== 'win32' }, async t => {

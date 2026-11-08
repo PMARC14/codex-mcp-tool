@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import spawn from 'cross-spawn';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, meta, until } from '../jobs/test-helpers.js';
 import { JobStore } from '../jobs/store.js';
@@ -518,8 +518,59 @@ test('task payloads expose failed/lost stops and pauses without task input state
       assert.equal(reply.status, 'completed');
       assert.equal(eventResult(reply.result).event, state === 'paused' ? 'paused' : 'stopped');
       assert.equal(eventResult(reply.result).state, state);
+      assert.equal(existsSync(join(s.store.dir(jobId), 'collected')), true, 'explicit task follow collects the stopped result');
     }
     noForms(s);
+  } finally { await s.cleanup(); s.f.cleanup(); }
+});
+
+test('task reads skip working and completed records whose jobs are missing', async () => {
+  const s = await setup(undefined, 'modern');
+  try {
+    for (const state of ['running', 'completed'] as const) {
+      const jobId = `missing-${state}`;
+      s.store.create(meta(s.f.home, { id: jobId, state }), 'p');
+      const taskId = taskIdOf(await s.call('codex_agent_follow', { jobId }));
+      rmSync(s.store.dir(jobId), { recursive: true });
+      assert.equal((await s.raw('tasks/get', { taskId })).error?.code, -32602);
+      assert.equal((await s.raw('tasks/result', { taskId })).error?.code, -32602);
+    }
+    assert.deepEqual((await s.rpc('tasks/list')).tasks, []);
+  } finally { await s.cleanup(); s.f.cleanup(); }
+});
+
+for (const era of ['legacy', 'modern'] as const) test(`${era} cancelling a follow task ends only its watch across reconnect`, async () => {
+  const f = fixture();
+  const first = await setup(f, era);
+  const jobId = 'followed-job';
+  let taskId = '';
+  try {
+    first.store.create(meta(f.home, { id: jobId, state: 'running' }), 'p');
+    taskId = taskIdOf(await first.call('codex_agent_follow', { jobId }, {}));
+    await first.disconnect();
+  } finally { await first.cleanup(); }
+  const s = await setup(f, era);
+  try {
+    const cancelled = await s.rpc('tasks/cancel', { taskId });
+    assert.equal(cancelled.status, 'cancelled');
+    assert.equal(s.store.get(jobId).state, 'running');
+    assert.equal((await s.rpc('tasks/get', { taskId })).status, 'cancelled');
+    assert.equal(existsSync(join(s.store.dir(jobId), 'collected')), false);
+    const follow = taskIdOf(await s.call('codex_agent_follow', { jobId }, {}));
+    assert.equal((await s.rpc('tasks/get', { taskId: follow })).status, 'working');
+  } finally { await s.cleanup(); f.cleanup(); }
+});
+
+test('follow task preserves reasoning progress', async () => {
+  const s = await setup(undefined, 'modern');
+  try {
+    const jobId = 'follow-reasoning';
+    s.store.create(meta(s.f.home, { id: jobId, state: 'running' }), 'p');
+    writeFileSync(s.store.path(jobId, 'reasoning'), 'First thought. Reasoning progress sentence.');
+    const taskId = taskIdOf(await s.call('codex_agent_follow', { jobId, showReasoning: true }));
+    const working = await s.rpc('tasks/get', { taskId });
+    assert.match(working.statusMessage, /Reasoning progress sentence/);
+    assert.equal(existsSync(join(s.store.dir(jobId), 'collected')), false);
   } finally { await s.cleanup(); s.f.cleanup(); }
 });
 

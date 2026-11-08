@@ -339,7 +339,7 @@ test('subagent turns on other threads cannot hide the root turn completion', asy
   const writes: any[] = [];
   let closes = 0;
   const command = buildAppServer({ id: 'fake', connector: 'codex', prompt: 'hi', cwd: '/fake', mode: 'read', timeoutMin: 1, finalPath: '/fake/final' }, '/fake');
-  const handler = command.stdinPlan({ apply(action) { if (action.close) closes++; if (action.write) writes.push(JSON.parse(action.write)); }, emit() {} });
+  const handler = command.stdinPlan({ apply(action) { if (action.close) { assert.equal(action.done, true); closes++; } if (action.write) writes.push(JSON.parse(action.write)); }, emit() {} });
   const feed = (value: any) => handler(JSON.stringify(value), 'stdout');
   const flush = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
   try {

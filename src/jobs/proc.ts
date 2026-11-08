@@ -4,12 +4,12 @@ import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import { closeSync, openSync, readFileSync, readSync, writeSync, statSync } from 'node:fs';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { JobEvent, Owner } from './connector.js';
-import { updateStdin, type ApprovalDecision, type SteerResult, type StdinPlan } from './stdin.js';
+import { updateStdin, type ApprovalDecision, type SteerResult, type StdinAction, type StdinPlan } from './stdin.js';
 import { jobWrapper } from './jobobject.js';
 
 /** stdin write errors that only mean the child stopped reading (EOF is the Windows form of EPIPE). */
 const CLOSED_PIPE_CODES = new Set(['EPIPE', 'EOF', 'ECONNRESET']);
-// After stdin closes or the child exits, wait this long for the pipes to close. A worker's own
+// After work completes or the child exits, wait this long for the pipes to close. A worker's own
 // background processes can keep the child alive or hold its pipes open; then the tree is killed.
 export const closeGrace = { ms: 15_000 };
 
@@ -224,6 +224,26 @@ export async function ownerAlive(owner: Owner): Promise<boolean> {
   return startTime === undefined || startTime === owner.startTime;
 }
 
+/** Conservative slot-release check, including a POSIX group that outlives its root. */
+export async function processTreeAlive(root?: Owner, recorded: Owner[] = [], deps = {
+  platform: process.platform as NodeJS.Platform,
+  ownerAlive,
+  startTime: processStartTime,
+  kill: (pid: number, signal: 0) => { process.kill(pid, signal); },
+}): Promise<boolean> {
+  const identities = [...(root ? [root] : []), ...recorded];
+  if ((await Promise.all(identities.map(identity => deps.ownerAlive(identity)))).some(Boolean)) return true;
+  if (deps.platform === 'win32' || !root) return false;
+  const current = await deps.startTime(root.pid);
+  if (current && current !== root.startTime) return false;
+  try {
+    deps.kill(-root.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
 // The job pump asks about the same few owners every 500 ms, and on Windows each fresh lookup
 // starts a powershell.exe. ownerAlive is the conservative check, so a recently seen start time
 // is good enough there: a PID reused inside the TTL only delays orphan recovery until it expires.
@@ -295,11 +315,11 @@ export function snapshotDescendants(rows: ProcessRow[], root: Owner, known: Owne
   return [...found.values()].filter(p => !byPid.has(p.pid) ? false : byPid.get(p.pid)!.Start === p.startTime);
 }
 
-export async function killTree(root?: Owner, recorded: Owner[] = [], child?: ChildProcess): Promise<void> {
+export async function killTree(root?: Owner, recorded: Owner[] = [], child?: ChildProcess, snapshot?: ProcessRow[] | null): Promise<void> {
   if (process.platform === 'win32') {
     // One snapshot, one batched taskkill, one re-check: per-PID probes cannot finish inside the
     // 10 second cancel deadline once a job has recorded hundreds of descendants.
-    const rows = await processRows().catch(() => undefined);
+    const rows = snapshot === undefined ? await processRows().catch(() => undefined) : snapshot ?? undefined;
     const all = [...(root ? [root] : []), ...(rows && root ? snapshotDescendants(rows, root, recorded) : recorded)];
     // Only a still-live child handle authorizes PID-based termination without a start time.
     // Persisted empty identities alone must never authorize killing a possibly reused PID.
@@ -438,13 +458,17 @@ export function startProcess(options: {
   });
   const fds: number[] = [];
   const buffers = { stdout: '', stderr: '' };
+  const applyInput = (action: StdinAction) => {
+    updateStdin(child?.stdin, action);
+    if (action.done) armGrace();
+  };
   const inputHandler = options.stdinPlan?.({
-    apply: action => { updateStdin(child?.stdin, action); if (action.close) armGrace(); },
+    apply: applyInput,
     emit: event => options.onEvent?.(event),
   });
   const onLine = (line: string, stream: 'stdout' | 'stderr') => {
     const action = inputHandler?.(line, stream);
-    if (action) { updateStdin(child.stdin, action); if (action.close) armGrace(); }
+    if (action) applyInput(action);
     options.onLine(line, stream);
   };
   function armGrace() {
@@ -470,15 +494,17 @@ export function startProcess(options: {
     termination ??= spawnEvent
       .then(() => spawnReady)
       .then(async () => {
+        let rows: ProcessRow[] | null | undefined;
         if (process.platform === 'win32' && root) {
-          children = await descendants(root, children).catch(() => children);
+          rows = await processRows().catch(() => null);
+          if (rows) children = snapshotDescendants(rows, root, children);
           try {
             options.onSnapshot(children);
           } catch {
             /* Continue killing if persistence fails. */
           }
         }
-        await killTree(root, children, child);
+        await killTree(root, children, child, rows);
       })
       .catch(() => {
         if (outcome) outcome.killFailed = true;
@@ -618,19 +644,19 @@ export function startProcess(options: {
       if (closed || outcome || !child?.stdin?.writable || child.stdin.writableEnded)
         throw new Error('Job input has closed; use agent_message after it stops');
       const action = await inputHandler.onSteer!(message);
-      updateStdin(child.stdin, action);
+      applyInput(action);
       return action;
     } } : {}),
     ...(inputHandler?.onRespond ? { respond: (decision: ApprovalDecision) => {
       if (closed || outcome || !child?.stdin?.writable || child.stdin.writableEnded)
         throw new Error('Job input has closed');
-      updateStdin(child.stdin, inputHandler.onRespond!(decision));
+      applyInput(inputHandler.onRespond!(decision));
     } } : {}),
     async stop(reason = 'cancel') {
       if (closed) return done;
       claim({ kind: reason, code: null });
       if (reason === 'cancel' && inputHandler?.onInterrupt) {
-        try { const action = inputHandler.onInterrupt(); if (action) updateStdin(child.stdin, action); }
+        try { const action = inputHandler.onInterrupt(); if (action) applyInput(action); }
         catch { /* Continue with process-tree cleanup. */ }
         let interruptTimer: NodeJS.Timeout | undefined;
         await Promise.race([done, new Promise<void>(resolve => { interruptTimer = setTimeout(resolve, 3000); })]);

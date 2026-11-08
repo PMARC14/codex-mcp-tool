@@ -109,22 +109,11 @@ Command/file approval decisions are exactly `accept`, `acceptForSession`, `decli
 
 ## MCP tasks (no launch flag)
 
-Only `codex_agent` and `codex_agent_follow` support task augmentation. Ordinary calls retain their existing responses, progress notifications, cancellation semantics, and the external multi-agent hook-wait PostToolUse hook. A task start launches the same job as an ordinary start. A task follow adopts the supplied `jobId` immediately; it tracks the job through pauses and automatic retries, independent of `maxWaitSec`. Its final payload is `agent_result`, without the ordinary follow's `watchedSec` and `timedOut` fields.
+`codex_agent`, `codex_agent_follow`, `codex_agent_retry`, `codex_agent_resume`, and `codex_agent_answer` support task augmentation. A message that resumes a stopped session also returns a task. Each task observes the next stop, pause, question or approval; its result includes `event`, `jobId`, `state` and input details. Each answer starts a new task for the same job and ignores the input ID just answered.
 
-Task IDs equal job IDs. State and results come from the shared job store; a small `jobs/<id>/mcp-task.json` marker records membership in `tasks/list` across reconnects. Listing includes task-augmented jobs for this connector only. Read-only `tasks/get` and `tasks/result` also accept any known job ID for this connector, without subscribing the new connection to notifications. Cancellation retains the job manager's existing ownership checks: another server process can read a job but cannot cancel it.
+Task IDs and job IDs can differ. Completed event results are immutable and persist across reconnects under `~/.agent-jobs/tasks/`. Only task-augmented calls appear in `tasks/list`; reads reject tasks whose jobs are missing. Pruning terminal jobs older than seven days removes their task records too. Task TTL is `null`; polling is suggested every 15,000 ms.
 
-| Job state | Task status | Message |
-| --- | --- | --- |
-| queued, running | `working` | The same bounded progress line as ordinary follow |
-| running with pendingApproval | `input_required` | awaiting approval |
-| running with awaitingInput | `input_required` | awaiting answer |
-| paused | `working` | Paused until the ISO reset time, or reset time unknown |
-| completed | `completed` | Watch progress line |
-| failed, lost | `failed` | Watch progress line |
-| killed | `cancelled` | Watch progress line |
-| killed with reason superseded | `cancelled` | Names `supersededBy`; the replacement has its own job/task ID |
-
-Polling is suggested every 15,000 ms. Status reads use saved metadata and a bounded stdout tail; they never spawn a process or probe process liveness. The server sends `notifications/tasks/status` on local state transitions only for tasks started or adopted through the current connection. Closing the connection removes its subscription and leaves workers running. Foreign writes are visible on polling. `tasks/result` waits for a terminal state using transitions plus a 5-second metadata check, and returns exactly the same JSON text and MCP content wrapper as `codex_agent_result`. Cancelling that pending request only stops the wait; `tasks/cancel` stops the job. Requested TTLs do not shorten job retention: `ttl` / `ttlMs` is `null`, with no separate task expiry timer; the existing cleanup of terminal jobs older than seven days still applies.
+A task follow adopts the supplied `jobId` and waits without a deadline, independent of `maxWaitSec`. It honors `showReasoning` for progress and marks stopped results collected like a blocking follow. Cancelling a follow task ends its watch and leaves the worker running. Cancelling a launch task stops its job and retains the manager's ownership checks. Disconnecting ends local watches; reconnecting can resume pending observations.
 
 ### Negotiation and wire shapes (Claude Code 2.1.319)
 
@@ -132,13 +121,12 @@ Claude Code 2.1.319 discovers `2026-07-28` using `server/discover` and the `io.m
 
 Create returns `{ resultType: "task", taskId, status, statusMessage, createdAt, lastUpdatedAt, ttlMs: null, pollIntervalMs: 15000, _meta }`. Modern get/cancel and each list entry/status notification use the status-discriminated task shape, without a `resultType` envelope:
 
-- `working` for queued/running/paused jobs;
-- `input_required` with a keyed `elicitation/create` form: a decision enum for approvals, or an answer field for bridge/native questions; these can also be answered via `codex_agent_answer`;
-- `completed` with `result: { content, isError }`, identical to `codex_agent_result`;
-- `failed` for failed/lost jobs, with `error.message` containing failureReason and a short reason; `result` remains available for diagnostics;
-- `cancelled` for killed jobs.
+- `working` while waiting for the next job event;
+- `completed` with the saved event result, including failed/lost stops, pauses, questions and approvals;
+- `failed` with `error.message` when observation fails;
+- `cancelled` when the task is cancelled.
 
-`tasks/result` still returns the tool content wrapper. The previous terminal `{ resultType: "complete", content, ... }` get reply lacked `status` and failed the client's union parser. Vendored Zod schemas in `src/tools/client-schemas.ts` mirror the binary's `_`, `re`, `X_a`, `se` and input-request schemas; raw stdio contract tests validate modern replies against them.
+`tasks/result` returns the tool content wrapper. Questions and approvals use `codex_agent_answer`; `tasks/update`, `input_required`, and `inputRequests` are not used. Vendored Zod schemas in `src/tools/client-schemas.ts` validate modern replies in raw stdio contract tests.
 
 The isolated 2025 SDK adapter and its tests remain for clients using the installed MCP SDK's task helpers and `initialize` negotiation. They use `{ task: ... }`, `ttl`, and `pollInterval`. Claude Code 2.1.319 explicitly no longer restores that era's tasks and uses only the modern path. Keeping this compatibility adapter requires no legacy dependency or separate scheduler.
 
@@ -229,9 +217,9 @@ Before removal, collection walks ordinary directories and unlinks junctions and 
 
 Wakes use Claude Code's native MCP tasks or pending tool calls. Every wait ends at the job's next event and returns `jobId`, `state`, and `event`: `stopped`, `paused`, `question`, or `approval`. Input events include `awaitingInput` or `pendingApproval`. Worker questions reach Claude as results; they never open user elicitation forms. No external `hook-wait.sh` PostToolUse hook is needed.
 
-With task support, `codex_agent`, `codex_agent_follow`, `codex_agent_retry`, `codex_agent_resume`, and `codex_agent_answer` return tasks. Each answer starts a new task for the same job and ignores the input ID just answered. A task completes even when the job remains running for a question, or paused for an automatic retry. Completed task results are immutable and persist across reconnects under `~/.agent-jobs/tasks/`. Task IDs and job IDs can differ; use the result's `jobId` for job tools. Questions and approvals are answered only through `codex_agent_answer`; `tasks/update`, `input_required`, and `inputRequests` are not used.
+Task-augmented calls return the event snapshots described in [MCP tasks](#mcp-tasks-no-launch-flag).
 
-Without task support, the same calls remain pending until the next event. Implicit waits have no deadline. Explicit blocking `codex_agent_follow` retains `maxWaitSec`; expiry returns `timedOut: true` without an event. Progress includes the job ID, every 20 seconds and on state/input changes. Cancelling a wait leaves the job running; `tasks/cancel` stops it.
+Without task support, the same calls remain pending until the next event. Implicit waits have no deadline. Explicit blocking `codex_agent_follow` retains `maxWaitSec`; expiry returns `timedOut: true` without an event. Progress includes the job ID, every 20 seconds and on state/input changes. Cancelling a blocking wait leaves the job running; task cancellation follows the rules in [MCP tasks](#mcp-tasks-no-launch-flag).
 
 `codex_agent_message` steers a running job and returns immediately. On a stopped or failed job it resumes the session as a new job, with the same task or blocking wait as `codex_agent_resume { jobId, message, mode?, model?, effort?, timeoutMin? }`. Pending input makes message reject with an instruction naming `codex_agent_answer` and the input ID. Discovery connects before job recovery finishes; job tools wait for initialization before accessing the manager.
 
@@ -271,9 +259,9 @@ Codex reasoning is saved in the `reasoning` job file, retaining the most recent 
 
 `agent` accepts `stallTimeoutMin` (default 10, zero disables detection) and `onStall` (`report`, the default, or `kill`). A stall means no meaningful output arrived within the interval. Connectors can classify notification lines with `isNoise`; Codex excludes `skills/changed`, `account/rateLimits/updated`, and `mcpServer/startupStatus/updated`. These notifications neither reset the timer nor clear a reported stall. Connectors without this classifier also count output file growth. Status and results expose `stalled` and `stalledSince`; meaningful output clears the flag. The kill option stops the worker with reason `stalled`, allowing requeue. Follow-ups and requeues inherit these settings and the original job label.
 
-Waiting for approval resets the stall clock on every sample, and an approval response starts a fresh interval. MCP task status notifications track the derived status, including `working` to `input_required` and back. Modern (`2026-07-28`) cancellation returns a task projection with `ttlMs` and `pollIntervalMs`; a terminal `tasks/get` returns the completed result payload. Explicit failure reasons and `lost` take precedence over authentication text, whose fallback matching uses whole words.
+Waiting for approval resets the stall clock on every sample, and an approval response starts a fresh interval. MCP task status notifications report the event-task statuses described in [MCP tasks](#mcp-tasks-no-launch-flag). Modern (`2026-07-28`) cancellation returns a task projection with `ttlMs` and `pollIntervalMs`; a terminal `tasks/get` returns the completed result payload. Explicit failure reasons and `lost` take precedence over authentication text, whose fallback matching uses whole words.
 
-The external multi-agent hook-wait PostToolUse hook owns `jobs/<id>/woken` and per-question `woken-ask-*` markers. Only a successful explicit `codex_agent_result` or `codex_agent_follow` tool response for a stopped job creates `jobs/<id>/collected`, which lets the hook skip results already collected. Internal result reads, task status notifications, and `tasks/get`, `tasks/list`, and `tasks/result` never create that marker. Result assembly must succeed before collection is marked.
+The external multi-agent hook-wait PostToolUse hook owns `jobs/<id>/woken` and per-question `woken-ask-*` markers. Only a successful explicit `codex_agent_result` or `codex_agent_follow` tool response for a stopped job creates `jobs/<id>/collected`, which lets the hook skip results already collected. Internal result reads and task status notifications leave that marker untouched; explicit task follows use the collection rule in [MCP tasks](#mcp-tasks-no-launch-flag). Result assembly must succeed before collection is marked.
 
 
 Jobs started or adopted as MCP tasks carry `mcp-task.json`: the task provides their wake and the hook skips them. Returning to queued or running clears the per-attempt `woken` and `collected` markers.
@@ -319,8 +307,7 @@ Windows Terminal is the default terminal, and a console program started with a n
 
 ### Tasks and protocol
 
-- A paused job projects as `working` with `statusMessage` "paused until <iso> - will retry" when the queue will retry it (reset time known), and as `failed` with `error.message` starting `quota_exhausted:` when nothing will resume it. A pause changes the status key, so a `notifications/tasks/status` update is sent. `tasks/result` treats the unrecoverable pause as terminal. `<p>_agent_follow` keeps following through an auto-retrying pause.
-- `server/discover` replies carry no `resultType`/`ttlMs`/`cacheScope` (the client-schema evidence only shows these on tool results). Status notifications use the era negotiated on the call that created the task (modern: `ttlMs`/`pollIntervalMs`; 2025: `ttl`/`pollInterval`). Failed projections omit `result` in `tasks/list` and notifications, and terminal payloads are cached per `updatedAt`.
+- `server/discover` replies carry no `resultType`/`ttlMs`/`cacheScope` (the client-schema evidence only shows these on tool results). Status notifications use the era negotiated on the call that created the task (modern: `ttlMs`/`pollIntervalMs`; 2025: `ttl`/`pollInterval`). Failed projections omit `result` in `tasks/list` and notifications.
 - The traffic log redacts home-directory paths, never logs argument values (Zod errors are reduced to `path:code`), drops the stack's message line and caps stacks at 2 KB.
 
 ### Legacy tools

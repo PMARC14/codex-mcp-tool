@@ -211,6 +211,7 @@ export class JobStore {
   }
 
   prune(now = Date.now()): void {
+    const pruned = new Set<string>();
     for (const job of this.list()) {
       if (
         terminal(job) &&
@@ -218,7 +219,16 @@ export class JobStore {
         now - (job.finishedAt ?? job.updatedAt) > 7 * 86400000
       ) {
         rmSync(this.dir(job.id), { recursive: true, force: true });
+        pruned.add(job.id);
       }
+    }
+    const tasks = join(this.home, 'tasks');
+    if (!pruned.size || !existsSync(tasks)) return;
+    for (const file of readdirSync(tasks).filter(file => file.endsWith('.json'))) {
+      let jobId: string;
+      try { jobId = JSON.parse(readFileSync(join(tasks, file), 'utf8')).jobId; }
+      catch { continue; }
+      if (pruned.has(jobId)) rmSync(join(tasks, file), { force: true });
     }
   }
 }

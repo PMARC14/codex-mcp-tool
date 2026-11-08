@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { writeFileSync, readFileSync } from 'node:fs';
-import { fixture } from './test-helpers.js';
+import { fixture, until } from './test-helpers.js';
 import {
   startProcess,
   resolveCommand,
@@ -15,6 +15,7 @@ import {
   snapshotDescendants,
   runCommandBuffer,
   killProcessGroup,
+  processTreeAlive,
   closeGrace,
   liveIn,
   type GroupKillDeps,
@@ -347,7 +348,7 @@ for (const [name, script] of [
       exe: process.execPath,
       args: ['-e', script],
       stdin: 'done\n',
-      stdinPlan: () => (line: string) => (line === 'turn-completed' ? { close: true } : undefined),
+      stdinPlan: () => (line: string) => (line === 'turn-completed' ? { close: true, done: true } : undefined),
       cwd: f.home,
       stdout: join(f.home, 'out'),
       stderr: join(f.home, 'err'),
@@ -363,4 +364,102 @@ for (const [name, script] of [
     closeGrace.ms = saved;
     f.cleanup();
   }
+});
+
+test('closing stdin lets the final turn run longer than close grace', { timeout: 20000 }, async t => {
+  const f = fixture();
+  const saved = closeGrace.ms;
+  closeGrace.ms = 100;
+  const realTimeout = setTimeout;
+  let graceArms = 0;
+  let armsAtClose = -1;
+  t.mock.method(globalThis, 'setTimeout', (callback: (...args: any[]) => void, ms: number, ...args: any[]) => {
+    if (ms === closeGrace.ms) graceArms++;
+    return realTimeout(callback, ms, ...args);
+  });
+  let proc: ReturnType<typeof startProcess> | undefined;
+  try {
+    proc = startProcess({
+      exe: process.execPath,
+      args: ['-e', 'console.log("ready"); process.stdin.resume(); process.stdin.on("end", () => setTimeout(() => console.log("final turn completed"), 700));'],
+      stdin: '',
+      stdinPlan: () => line => line === 'ready' ? { write: 'final turn\n', close: true } : undefined,
+      cwd: f.home, stdout: join(f.home, 'out'), stderr: join(f.home, 'err'),
+      async onSpawn() {}, onSnapshot() {}, onLine(line) { if (line === 'ready') armsAtClose = graceArms; },
+    });
+    assert.equal((await proc.done).code, 0);
+    assert.equal(armsAtClose, 0, 'closing stdin cannot arm the work-done grace');
+    assert.match(readFileSync(join(f.home, 'out'), 'utf8'), /final turn completed/);
+  } finally { if (proc) await proc.stop(); closeGrace.ms = saved; f.cleanup(); }
+});
+
+for (const trigger of ['done', 'exit'] as const) test(`${trigger} grace kills a grandchild holding the pipes`, { timeout: 30000 }, async () => {
+  const f = fixture();
+  const saved = closeGrace.ms;
+  const noJob = process.env.AGENT_JOBS_NO_JOBOBJECT;
+  process.env.AGENT_JOBS_NO_JOBOBJECT = '1';
+  closeGrace.ms = 1500;
+  const exitGate = join(f.home, 'exit');
+  let spawned = false;
+  let proc: ReturnType<typeof startProcess> | undefined;
+  let grandchild: Owner | undefined;
+  try {
+    proc = startProcess({
+      exe: process.execPath,
+      args: ['-e', `const p = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit', windowsHide: true, detached: process.platform === 'win32' }); console.log(p.pid); ${trigger === 'exit' ? `setInterval(() => { if (require('node:fs').existsSync(${JSON.stringify(exitGate)})) process.exit(0); }, 20);` : 'setInterval(() => {}, 1000);'}`],
+      ...(trigger === 'done' ? { stdin: '', stdinPlan: () => (line: string) => /^\d+$/.test(line) ? { done: true } : undefined } : {}),
+      cwd: f.home, stdout: join(f.home, 'out'), stderr: join(f.home, 'err'),
+      async onSpawn() { spawned = true; }, onSnapshot() {},
+      onLine(line) { if (/^\d+$/.test(line)) grandchild = { pid: Number(line), startTime: '' }; },
+    });
+    await until(() => !!grandchild && spawned, 'grandchild started and root identified');
+    grandchild!.startTime = (await processStartTime(grandchild!.pid))!;
+    assert.ok(grandchild!.startTime);
+    assert.equal(await isAlive(grandchild!), true, 'grandchild is running before root exit');
+    const released = Date.now();
+    writeFileSync(exitGate, '');
+    const outcome = await proc.done;
+    if (trigger === 'exit') assert.ok(Date.now() - released >= closeGrace.ms, 'inherited pipes require the exit-triggered grace');
+    assert.equal(outcome.kind, 'exit');
+    assert.equal(outcome.code, 0);
+    assert.equal(outcome.killFailed, undefined);
+    assert.equal(await isAlive(grandchild!), false, 'grandchild must be dead before completion');
+  } finally {
+    if (proc) await proc.stop();
+    if (grandchild && await isAlive(grandchild)) process.kill(grandchild.pid, 'SIGKILL');
+    if (noJob === undefined) delete process.env.AGENT_JOBS_NO_JOBOBJECT; else process.env.AGENT_JOBS_NO_JOBOBJECT = noJob;
+    closeGrace.ms = saved; f.cleanup();
+  }
+});
+
+test('POSIX reservation liveness includes root groups, permission failures and verified descendants', async () => {
+  const root = { pid: 77, startTime: '42' };
+  let groupError: string | undefined;
+  let current: string | undefined;
+  let livePid: number | undefined;
+  const probes: number[] = [];
+  const deps = {
+    platform: 'linux' as const,
+    ownerAlive: async (identity: Owner) => identity.pid === livePid,
+    startTime: async () => current,
+    kill(pid: number, signal: 0) {
+      probes.push(pid); assert.equal(signal, 0);
+      if (groupError) throw Object.assign(new Error(groupError), { code: groupError });
+    },
+  };
+  assert.equal(await processTreeAlive(root, [], deps), true, 'dead root can leave a live group');
+  assert.deepEqual(probes, [-77]);
+  groupError = 'EPERM';
+  assert.equal(await processTreeAlive(root, [], deps), true, 'denied inspection keeps the slot');
+  groupError = 'ESRCH';
+  assert.equal(await processTreeAlive(root, [], deps), false);
+  groupError = undefined; current = 'reused';
+  const before = probes.length;
+  assert.equal(await processTreeAlive(root, [], deps), false, 'reused root identity does not own the group');
+  assert.equal(probes.length, before);
+  livePid = 88;
+  assert.equal(await processTreeAlive(root, [{ pid: 88, startTime: '43' }], deps), true);
+  livePid = undefined; current = undefined;
+  assert.equal(await processTreeAlive(root, [], { ...deps, platform: 'win32' }), false);
+  assert.equal(probes.length, before, 'Windows does not probe negative PIDs');
 });

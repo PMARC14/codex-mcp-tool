@@ -4,6 +4,7 @@ import type { JobEvent } from './connector.js';
 export interface StdinAction {
   write?: string;
   close?: boolean;
+  done?: boolean;
 }
 
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';

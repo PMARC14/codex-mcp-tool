@@ -133,7 +133,7 @@ export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(j
       if (!completed || controls || disposed) return;
       clearImmediate(closeSoon);
       closeSoon = setImmediate(() => {
-        if (completed && !controls && !disposed) context.apply({ close: true });
+        if (completed && !controls && !disposed) context.apply({ close: true, done: true });
       });
     };
     const startTurn = async (text: string) => {

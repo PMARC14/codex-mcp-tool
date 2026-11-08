@@ -25,6 +25,7 @@ import { withLock } from './lock.js';
 import {
   currentOwner,
   ownerAlive,
+  processTreeAlive,
   killTree,
   startProcess,
   type ProcessOutcome,
@@ -107,6 +108,7 @@ export class JobManager {
   private hold: WakeHold;
   private disposed = false;
   private readonly kill: typeof killTree;
+  private readonly treeAlive: typeof processTreeAlive;
   private readonly resolveVerifyShell: typeof verifyShell;
   private cleanupTried = new Map<string, number>();
   private usageCache = new Map<string | undefined, { at: number; value: number | undefined }>();
@@ -116,9 +118,10 @@ export class JobManager {
     readonly connector: Connector,
     config = readConfig(),
     private logger = quiet,
-    deps: { killTree?: typeof killTree; verifyShell?: typeof verifyShell } = {}
+    deps: { killTree?: typeof killTree; verifyShell?: typeof verifyShell; processTreeAlive?: typeof processTreeAlive } = {}
   ) {
     this.kill = deps.killTree ?? killTree;
+    this.treeAlive = deps.processTreeAlive ?? processTreeAlive;
     this.resolveVerifyShell = deps.verifyShell ?? verifyShell;
     this.config = config;
     this.store = new JobStore(config.home);
@@ -191,6 +194,8 @@ export class JobManager {
           job.awaitingInput = undefined; // answered: nobody else is left to clear it
           changed = true;
         }
+        try { changed = bridgeSampler(this.store, job)() || changed; }
+        catch (error) { this.logger.warn(`Job ${job.id} bridge sample failed`, error); }
         if (changed) this.store.write(job);
         return;
       }
@@ -566,8 +571,7 @@ export class JobManager {
           }
           if (!this.owns(job) || !terminal(job) || !job.reserved) continue;
           if (job.state === 'lost') { await this.recoverOrphan(job, now); continue; }
-          const identities = [...(job.process ? [job.process] : []), ...(job.descendants ?? [])];
-          if (!(await Promise.all(identities.map(ownerAlive))).some(Boolean)) {
+          if (!(await this.treeAlive(job.process, job.descendants))) {
             job.reserved = false;
             this.store.save(job, this.owner);
             this.active.delete(job.id);
@@ -727,8 +731,7 @@ export class JobManager {
           // awaiting persistence. Release only after their final reserved write.
           await finished;
           if (!job.reserved) return;
-          const identities = [...(job.process ? [job.process] : []), ...(job.descendants ?? [])];
-          if ((await Promise.all(identities.map(ownerAlive))).some(Boolean)) return;
+          if (await this.treeAlive(job.process, job.descendants)) return;
           job.reserved = false;
           this.store.save(job, this.owner);
           this.active.delete(job.id);
