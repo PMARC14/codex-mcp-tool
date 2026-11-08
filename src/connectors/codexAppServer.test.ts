@@ -294,6 +294,31 @@ test('app-server settings match sandbox modes and trusted/full never approve', (
   assert.ok(parseAppServer(JSON.stringify({ method: 'error', params: { error: { message: 'You have hit your usage limit' }, willRetry: false } }), 'stdout')?.usageLimit);
   assert.equal(parseAppServer(JSON.stringify({ method: 'error', params: { error: { message: 'retry' }, willRetry: true } }), 'stdout'), null);
 });
+test('subagent turns on other threads cannot hide the root turn completion', async () => {
+  const writes: any[] = [];
+  let closes = 0;
+  const command = buildAppServer({ id: 'fake', connector: 'codex', prompt: 'hi', cwd: '/fake', mode: 'read', timeoutMin: 1, finalPath: '/fake/final' }, '/fake');
+  const handler = command.stdinPlan({ apply(action) { if (action.close) closes++; if (action.write) writes.push(JSON.parse(action.write)); }, emit() {} });
+  const feed = (value: any) => handler(JSON.stringify(value), 'stdout');
+  const flush = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
+  try {
+    feed({ id: 1, result: {} });
+    feed({ id: writes.at(-1).id, result: { thread: { id: 'root' } } });
+    await flush();
+    feed({ method: 'turn/started', params: { threadId: 'root', turn: { id: 'main' } } });
+    feed({ id: writes.at(-1).id, result: { turn: { id: 'main' } } });
+    await flush();
+    // A subagent spawned by the worker runs its own turn on another thread.
+    feed({ method: 'turn/started', params: { threadId: 'sub', turn: { id: 'sub-turn' } } });
+    feed({ method: 'turn/completed', params: { threadId: 'sub', turn: { id: 'sub-turn' } } });
+    await flush();
+    assert.equal(closes, 0, 'a subagent completion must not finish the job');
+    feed({ method: 'turn/completed', params: { threadId: 'root', turn: { id: 'main' } } });
+    await flush();
+    assert.equal(closes, 1, 'the root turn completion finishes the job');
+  } finally { handler.dispose!(); }
+});
+
 test('late completion cannot close a replacement turn and failed replacement closes the idle peer', async () => {
   for (const fail of [false, true]) {
     const writes: any[] = [];

@@ -202,7 +202,8 @@ export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(j
         }, (job.approvalTimeoutMin ?? 30) * 60000);
         approvals.set(message.id, { kind, params: message.params ?? {}, requestedAt: Date.now(), timer });
         publishApproval();
-      } else if (message.method === 'turn/started') {
+      } else if (message.method === 'turn/started' && (!message.params?.threadId || message.params.threadId === threadId)) {
+        // Subagent turns run on their own threads; only the root thread's turn is ours.
         turnId = message.params.turn.id;
         completed = false;
       } else if (message.method === 'serverRequest/resolved' && message.params.threadId === threadId) {
