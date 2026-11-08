@@ -34,7 +34,7 @@ import {
 } from './tools/index.js';
 import { getCompletionValues } from './utils/completions.js';
 import { ProgressReporter } from './utils/progress.js';
-import { executeJobWatch } from './tools/job-watch-progress.js';
+import { executeJobWatch, needsJobWatch } from './tools/job-watch-progress.js';
 import { registerMcpTasks, TaskStdioTransport, taskCapabilities } from './tools/mcp-tasks.js';
 
 const capabilities = {
@@ -156,7 +156,7 @@ server.setRequestHandler(
       const progressToken = (request.params as any)._meta?.progressToken;
 
       // Start progress updates if client requested them
-      const watching = toolName === 'codex_agent_follow';
+      const watching = needsJobWatch(toolName);
       const progressData = watching ? undefined : startProgressUpdates(toolName, progressToken);
 
       try {
@@ -170,6 +170,7 @@ server.setRequestHandler(
           ? await executeJobWatch(toolName, args, {
               progressToken,
               signal: extra.signal,
+              manager: codexJobManager,
               notify: params =>
                 extra.sendNotification({
                   method: PROTOCOL.NOTIFICATIONS.PROGRESS,
@@ -287,7 +288,6 @@ server.setRequestHandler(CompleteRequestSchema, async (request: CompleteRequest)
 // Start the server
 async function main() {
   Logger.debug('init codex-mcp-tool');
-  await codexJobManager.initialize();
   const transport = new TaskStdioTransport('codex');
   server.onclose = () => {
     mcpTasks.close();
@@ -306,6 +306,9 @@ async function main() {
   process.stdout.once('error', disconnect);
   await server.connect(transport);
   Logger.debug('codex-mcp-tool listening on stdio');
+  // Discovery must be served before recovery/lock/process inspection can delay startup.
+  // Job tools and task handlers await the same idempotent initialization promise.
+  await codexJobManager.initialize();
 }
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {

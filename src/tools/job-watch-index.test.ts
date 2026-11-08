@@ -35,6 +35,10 @@ async function setup() {
       return () => { if (active) { listeners--; record(); } active = false; off(); };
     };
     toolRegistry.push({
+      name: 'test_start', description: 'Start a fixture job for follow tests', zodSchema: z.object({}).passthrough(),
+      execute: async args => JSON.stringify(await manager.start(args)),
+    });
+    toolRegistry.push({
       name: 'test_keepalive', description: 'Fake slow tool', zodSchema: z.object({}),
       execute: async (_args, onProgress) => {
         onProgress?.('fixture output');
@@ -107,7 +111,7 @@ async function setup() {
     listeners: () => Number(readFileSync(listenersPath, 'utf8')),
     async startJob(waitMs = 1200, gate?: string) {
       const response = await client.callTool({
-        name: 'codex_agent',
+        name: 'test_start',
         arguments: {
           prompt: JSON.stringify({ waitMs, gate, final: 'survived' }),
           cwd: f.home,
@@ -162,7 +166,7 @@ test('index dispatch forwards request cancellation and sends no watch progress w
   const s = await setup();
   const controller = new AbortController();
   try {
-    const jobId = await s.startJob();
+    const jobId = await s.startJob(10, s.gate);
     const pending = s.client.callTool(
       { name: 'codex_agent_follow', arguments: { jobId } },
       undefined,
@@ -189,6 +193,7 @@ test('index dispatch forwards request cancellation and sends no watch progress w
     });
     assert.equal(response.isError, false);
     assert.equal(notifications, 0);
+    writeFileSync(s.gate, '');
     await until(() => s.store.get(jobId).state === 'completed');
   } finally {
     controller.abort();
@@ -199,7 +204,7 @@ test('index dispatch forwards request cancellation and sends no watch progress w
 test('stdio EOF aborts the index watch while its real fake worker runs to completion', async () => {
   const s = await setup();
   try {
-    const jobId = await s.startJob();
+    const jobId = await s.startJob(10, s.gate);
     const pending = s.client.callTool(
       { name: 'codex_agent_follow', arguments: { jobId } },
       undefined,
@@ -213,6 +218,7 @@ test('stdio EOF aborts the index watch while its real fake worker runs to comple
     await rejected;
     await until(() => s.listeners() === 0, 'EOF removes the watch listener');
     assert.equal(s.store.get(jobId).state, 'running');
+    writeFileSync(s.gate, '');
     await until(
       () => s.store.get(jobId).state === 'completed',
       'worker completes after disconnect'

@@ -19,6 +19,7 @@ test('portable registration exposes prefixed tools with bounded schemas and expl
         'codex_agent_result',
         'codex_agent_follow',
         'codex_agent_message',
+        'codex_agent_resume',
         'codex_agent_answer',
         'codex_agent_stop',
         'codex_agent_list',

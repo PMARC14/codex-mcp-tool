@@ -38,6 +38,7 @@ test('watch resolves on fake-worker completion with the agent_result shape and w
     );
     assert.deepEqual(result, {
       ...JSON.parse(JSON.stringify(await s.manager.result(job.jobId))),
+      event: 'stopped',
       watchedSec: result.watchedSec,
       timedOut: false,
     });
@@ -74,7 +75,7 @@ test('watch wakes immediately on transitions and emits heartbeat summaries cappe
       controller.signal
     );
     await until(() => messages.length >= 2, 'initial progress and heartbeat');
-    assert.match(messages[0], /^codex default \u00b7 job \| running \| \d+s \| Step one x/);
+    assert.match(messages[0], /^codex test-job default \u00b7 job \| running \| \d+s \| Step one x/);
     assert.ok(messages.every(text => text.length <= 120 && !text.includes('\n')));
     const before = messages.length;
     s.manager.store.write({ ...job, state: 'paused' });

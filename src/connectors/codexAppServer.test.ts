@@ -237,9 +237,18 @@ test('app-server rejects foreign control, blank messages and non-completion stee
   } finally { await foreign.dispose(); await f.cleanup(); }
 });
 
-test('approvals persist, project input_required, and accept with the discovered responses', async () => {
+test('approvals persist, complete event tasks, and accept through agent_answer', async () => {
   for (const kind of ['commandExecution', 'fileChange', 'permissions']) {
     const f = setup();
+    const handlers = new Map<string, any>();
+    const notices: any[] = [];
+    const registry: JobTool[] = [];
+    registerJobTools(registry, 'codex', f.manager);
+    const tasks = registerMcpTasks({
+      setRequestHandler(schema: any, handler: any) { handlers.set(schema.shape.method.value, handler); },
+      async notification(notice: any) { notices.push(notice); },
+    } as unknown as Server, 'codex', f.manager, { capabilities: {} },
+    async (name, args) => registry.find(tool => tool.name === name)!.execute(args), registry);
     try {
       const { jobId } = await f.manager.start({ prompt: JSON.stringify({ approval: kind }), cwd: f.home, transport: 'app-server', mode: 'write' });
       await until(() => !!f.manager.store.get(jobId).pendingApproval && f.manager.store.get(jobId).state === 'running');
@@ -247,18 +256,26 @@ test('approvals persist, project input_required, and accept with the discovered 
       assert.equal(job.pendingApproval!.kind, kind);
       assert.ok(job.pendingApproval!.summary.length <= 300);
       assert.match(progressMessage(f.manager, job), /awaiting approval/);
-      const handlers = new Map<string, any>();
-      const tasks = registerMcpTasks({ setRequestHandler(schema: any, handler: any) { handlers.set(schema.shape.method.value, handler); } } as unknown as Server, 'codex', f.manager, { capabilities: {} });
-      const task = await handlers.get('tasks/get')({ params: { taskId: jobId } });
-      assert.equal(task.status, 'input_required');
-      tasks.close();
-      f.manager.store.write(job);
-      assert.deepEqual(await f.manager.respond(jobId, 'accept'), { responded: true });
+      const followed = await tasks.call('codex_agent_follow', { jobId });
+      assert.ok(followed.task);
+      const task = await handlers.get('tasks/get')({ params: { taskId: followed.task.taskId, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } });
+      assert.equal(task.status, 'completed');
+      const event = JSON.parse(task.result.content[0].text);
+      assert.equal(event.event, 'approval');
+      assert.equal(event.jobId, jobId);
+      assert.deepEqual(event.pendingApproval, job.pendingApproval);
+      assert.equal(task.inputRequests, undefined);
+      assert.equal(handlers.has('tasks/update'), false);
+      const answered = await tasks.call('codex_agent_answer', { jobId, decision: 'accept' });
+      assert.ok(answered.task);
+      assert.notEqual(answered.task.taskId, followed.task.taskId);
+      const final = await handlers.get('tasks/result')({ params: { taskId: answered.task.taskId } }, { signal: new AbortController().signal });
+      assert.equal(JSON.parse(final.content[0].text).event, 'stopped');
       assert.equal(f.manager.store.get(jobId).pendingApproval, undefined);
-      assert.equal((await f.manager.watch(jobId, 20)).state, 'completed');
       const response = f.messages().find(m => m.id === 'approval-1');
       assert.deepEqual(response.result, kind === 'permissions' ? { permissions: { network: { enabled: true } }, scope: 'turn' } : { decision: 'accept' });
-    } finally { await f.cleanup(); }
+      assert.ok(notices.every(notice => notice.method !== 'elicitation/create' && notice.params.status !== 'input_required' && !notice.params.inputRequests));
+    } finally { tasks.close(); await f.cleanup(); }
   }
 });
 
@@ -420,20 +437,30 @@ test('native question replies on malformed answer file and primitive multi-answe
 
 
 
-for (const decision of ['decline', 'acceptForSession'] as const) test(`task approval exposes a decision elicitation and routes ${decision}`, async () => {
+for (const decision of ['decline', 'acceptForSession'] as const) test(`task approval completes with details and agent_answer routes ${decision}`, async () => {
   const f = setup();
   const handlers = new Map<string, any>();
-  const tasks = registerMcpTasks({ setRequestHandler(schema: any, handler: any) { handlers.set(schema.shape.method.value, handler); } } as unknown as Server, 'codex', f.manager, { capabilities: {} });
+  const notices: any[] = [];
+  const registry: JobTool[] = [];
+  registerJobTools(registry, 'codex', f.manager);
+  const tasks = registerMcpTasks({
+    setRequestHandler(schema: any, handler: any) { handlers.set(schema.shape.method.value, handler); },
+    async notification(notice: any) { notices.push(notice); },
+  } as unknown as Server, 'codex', f.manager, { capabilities: {} },
+  async (name, args) => registry.find(tool => tool.name === name)!.execute(args), registry);
   try {
     const { jobId } = await f.manager.start({ prompt: JSON.stringify({ approval: 'commandExecution' }), cwd: f.home, transport: 'app-server', mode: 'write' });
     await until(() => !!f.manager.store.get(jobId).pendingApproval && f.manager.store.get(jobId).state === 'running');
-    const task = await handlers.get('tasks/get')({ params: { taskId: jobId, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } });
-    assert.equal(task.status, 'input_required');
-    const [key, request] = Object.entries(task.inputRequests)[0] as [string, any];
-    assert.deepEqual(request.params.requestedSchema.properties.decision.enum, ['accept', 'acceptForSession', 'decline', 'cancel']);
-    await handlers.get('tasks/update')({ params: { taskId: jobId, inputResponses: { [key]: decision === 'decline' ? { action: 'decline' } : { action: 'accept', content: { decision } } } } });
-    await until(() => f.messages().some(m => m.id === 'approval-1'));
+    const followed = await tasks.call('codex_agent_follow', { jobId });
+    assert.ok(followed.task);
+    const task = await handlers.get('tasks/get')({ params: { taskId: followed.task.taskId, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } });
+    assert.equal(task.status, 'completed');
+    assert.equal(JSON.parse(task.result.content[0].text).event, 'approval');
+    assert.equal(task.inputRequests, undefined);
+    const answered = await tasks.call('codex_agent_answer', { jobId, decision });
+    assert.ok(answered.task);
+    await handlers.get('tasks/result')({ params: { taskId: answered.task.taskId } }, { signal: new AbortController().signal });
     assert.equal(f.messages().find(m => m.id === 'approval-1').result.decision, decision);
+    assert.ok(notices.every(notice => notice.params.status !== 'input_required' && !notice.params.inputRequests));
   } finally { tasks.close(); await f.cleanup(); }
 });
-

@@ -76,7 +76,7 @@ async function wire(s: ReturnType<typeof setup>) {
   const tasks = registerMcpTasks(server, 'codex', s.manager, { capabilities: {} },
     async (name, args) => s.registry.find(tool => tool.name === name)!.execute(args), s.registry);
   server.setRequestHandler(CallToolRequestSchema, async request => {
-    if (request.params.name !== 'codex_agent_answer') return tasks.call(request.params.name, request.params.arguments);
+    if (request.params.task !== undefined) return tasks.call(request.params.name, request.params.arguments, request.params._meta);
     const tool = s.registry.find(item => item.name === request.params.name)!;
     return { content: [{ type: 'text' as const, text: String(await tool.execute((request.params.arguments ?? {}) as any)) }] };
   });
@@ -93,7 +93,7 @@ async function wire(s: ReturnType<typeof setup>) {
   return { rpc, notices, log, async close() { tasks.close(); await server.close(); input.destroy(); output.destroy(); for (const entry of pending.values()) clearTimeout(entry.timer); } };
 }
 
-test('fake worker calls bridge: question -> input_required -> elicitation tasks/update -> delivered answer', async () => {
+test('fake worker question completes its task; agent_answer creates a new task without user forms', async () => {
   const s = setup();
   const w = await wire(s);
   try {
@@ -102,53 +102,62 @@ test('fake worker calls bridge: question -> input_required -> elicitation tasks/
       label: 'bridge-agent', stallTimeoutMin: 0.0001, onStall: 'report',
     } });
     clientCreateTask.parse(created);
-    const taskId = created.taskId;
-    await until(() => !!s.manager.store.get(taskId).awaitingInput, 'bridge question observed');
-    const job = s.manager.store.get(taskId);
-    assert.equal(job.awaitingInput!.question.length, 500);
-    assert.deepEqual(job.awaitingInput!.options, ['A', 'B']);
+    const taskId = created.taskId, jobId = taskId;
+    const first = await w.rpc('tasks/result', { taskId });
+    const question = JSON.parse(first.content[0].text);
+    assert.equal(question.event, 'question');
+    assert.equal(question.jobId, jobId);
+    assert.equal(question.state, 'running');
+    assert.equal(question.awaitingInput.question.length, 500);
+    assert.deepEqual(question.awaitingInput.options, ['A', 'B']);
+    const job = s.manager.store.get(jobId);
     assert.ok(job.progressNote!.length <= 80);
     assert.match(progressMessage(s.manager, job), /awaiting answer/);
     assert.match(progressMessage(s.manager, job), /Milestone/);
     const poll = await w.rpc('tasks/get', { taskId });
     clientTaskGet.parse(poll);
-    assert.equal(poll.status, 'input_required');
-    const qid = job.awaitingInput!.qid;
-    assert.equal(poll.inputRequests[qid].method, 'elicitation/create');
-    assert.deepEqual(poll.inputRequests[qid].params.requestedSchema.properties.answer.enum, ['A', 'B']);
+    assert.equal(poll.status, 'completed');
+    assert.equal(poll.inputRequests, undefined);
+    const qid = question.awaitingInput.qid;
     clientTaskList.parse(await w.rpc('tasks/list'));
     // Let multiple samples run while pending: no stall killing.
     await new Promise(resolve => setTimeout(resolve, 1100));
-    assert.equal(s.manager.store.get(taskId).state, 'running');
-    await assert.rejects(w.rpc('tasks/update', { taskId, inputResponses: { stale: { action: 'accept', content: { answer: 'wrong' } } } }), /pending question/);
-    assert.equal(s.manager.store.get(taskId).awaitingInput!.qid, qid);
-    const response = { taskId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'B' } } } };
-    await w.rpc('tasks/update', response);
-    await w.rpc('tasks/update', response); // Lost-ack retry is idempotent.
-    assert.equal(s.manager.store.get(taskId).awaitingInput, undefined);
-    assert.ok(existsSync(join(s.manager.store.dir(taskId), `answer-${qid}.json`)));
-    await until(() => s.manager.store.get(taskId).state === 'completed');
-    const final = await w.rpc('tasks/get', { taskId });
-    clientTaskGet.parse(final);
-    assert.equal(final.status, 'completed');
-    assert.equal(JSON.parse(final.result.content[0].text).final, 'B');
-    assert.match((await s.manager.read(taskId, 'notes')).text, /Milestone/);
+    assert.equal(s.manager.store.get(jobId).state, 'running');
+    await assert.rejects(w.rpc('tasks/update', { taskId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'wrong' } } } }), /method not found/i);
+    await assert.rejects(w.rpc('tools/call', { name: 'codex_agent_answer', arguments: { jobId, qid: 'stale', answer: 'wrong' } }), /pending question/);
+    assert.equal(s.manager.store.get(jobId).awaitingInput!.qid, qid);
+    const answered = await w.rpc('tools/call', { name: 'codex_agent_answer', arguments: { jobId, qid, answer: 'B' } });
+    clientCreateTask.parse(answered);
+    assert.notEqual(answered.taskId, taskId);
+    assert.ok(existsSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`)));
+    const final = JSON.parse((await w.rpc('tasks/result', { taskId: answered.taskId })).content[0].text);
+    assert.equal(final.event, 'stopped');
+    assert.equal(final.jobId, jobId);
+    assert.equal(final.final, 'B');
+    assert.deepEqual(await w.rpc('tasks/result', { taskId }), first);
+    assert.match((await s.manager.read(jobId, 'notes')).text, /Milestone/);
     w.notices.forEach(notice => clientTaskNotification.parse(notice));
+    assert.ok(w.notices.every(notice => notice.params?.status !== 'input_required' && !notice.params?.inputRequests));
+    assert.doesNotMatch(JSON.stringify(w.notices), /elicitation\/create/);
     assert.doesNotMatch(w.log.tail(200).join('\n'), /Sensitive question|Milestone/);
   } finally { await w.close(); await s.cleanup(); }
 });
 
-for (const via of ['answer', 'message'] as const) test(`exec fake worker receives bridge answer through agent_${via}`, async () => {
+for (const via of ['answer', 'message'] as const) test(`exec bridge question uses agent_answer; agent_${via} respects that boundary`, async () => {
   const s = setup();
   try {
     const { jobId } = await s.manager.start({ cwd: s.home, prompt: '{}' });
     await until(() => !!s.manager.store.get(jobId).awaitingInput);
     const tool = s.registry.find(tool => tool.name === `codex_agent_${via}`)!;
-    const result = JSON.parse(await tool.execute({ jobId, ...(via === 'answer' ? { answer: 'A' } : { message: 'B' }) }) as string);
-    if (via === 'message') assert.deepEqual(result, { delivered: 'answer', jobId });
-    else assert.equal(result.responded, true);
+    if (via === 'message') {
+      await assert.rejects(tool.execute({ jobId, message: 'B' }), /codex_agent_answer.*qid/);
+      assert.ok(s.manager.store.get(jobId).awaitingInput);
+    }
+    const answer = s.registry.find(tool => tool.name === 'codex_agent_answer')!;
+    const result = JSON.parse(await answer.execute({ jobId, answer: 'A' }) as string);
+    assert.equal(result.responded, true);
     await until(() => s.manager.store.get(jobId).state === 'completed');
-    assert.equal((await s.manager.result(jobId)).final, via === 'answer' ? 'A' : 'B');
+    assert.equal((await s.manager.result(jobId)).final, 'A');
     assert.equal(s.manager.store.get(jobId).awaitingInput, undefined);
   } finally { await s.cleanup(); }
 });
@@ -179,18 +188,23 @@ test('another manager answers a pending question with qid and rejects stale qid'
 });
 
 
-test('bridge timeout notifies working and rejects a late tasks update', async () => {
+test('bridge timeout cannot change the completed question task; follow observes completion', async () => {
   const s = setup();
   const w = await wire(s);
   try {
     const { taskId } = await w.rpc('tools/call', { name: 'codex_agent', arguments: {
-      cwd: s.home, prompt: JSON.stringify({ timeoutSec: 1.5, holdAfter: 2500 }),
+      cwd: s.home, prompt: JSON.stringify({ timeoutSec: 2, holdAfter: 600 }),
     } });
-    await until(() => !!s.manager.store.get(taskId).awaitingInput);
-    const qid = s.manager.store.get(taskId).awaitingInput!.qid;
-    await until(() => w.notices.some(n => n.params?.status === 'input_required'));
-    await until(() => w.notices.some(n => n.params?.status === 'working'));
-    await assert.rejects(w.rpc('tasks/update', { taskId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'late' } } } }), /pending question/);
+    const first = await w.rpc('tasks/result', { taskId });
+    const qid = JSON.parse(first.content[0].text).awaitingInput.qid;
+    await until(() => s.manager.store.get(taskId).state === 'completed');
+    assert.deepEqual(await w.rpc('tasks/result', { taskId }), first);
+    const follow = await w.rpc('tools/call', { name: 'codex_agent_follow', arguments: { jobId: taskId } });
+    const final = JSON.parse((await w.rpc('tasks/result', { taskId: follow.taskId })).content[0].text);
+    assert.equal(final.event, 'stopped');
+    assert.match(final.final, /no answer within 2 s/);
+    await assert.rejects(w.rpc('tasks/update', { taskId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'late' } } } }), /method not found/i);
+    assert.ok(w.notices.every(n => n.params?.status !== 'input_required'));
   } finally { await w.close(); await s.cleanup(); }
 });
 
@@ -210,47 +224,43 @@ test('bridge exits after stdin ends with a pending question', async () => {
 });
 
 
-test('fresh manager answers persisted questions from a dead owner via tool and tasks update', async () => {
-  for (const via of ['tool', 'update'] as const) {
-    const s = setup();
-    const jobId = `restart-${via}`, qid = `qid-${via}`;
-    s.manager.store.create(meta(s.home, { id: jobId, state: 'running', owner: { pid: 2147483647, startTime: 'dead' },
-      awaitingInput: { qid, question: 'persisted?', askedAt: Date.now() } }), 'fake');
-    writeFileSync(join(s.manager.store.dir(jobId), 'question.json'), JSON.stringify({ id: qid, question: 'persisted?', askedAt: Date.now() }));
-    const w = await wire(s);
-    try {
-      await s.manager.initialize();
-      if (via === 'tool') {
-        const response = await w.rpc('tools/call', { name: 'codex_agent_answer', arguments: { jobId, qid, answer: 'reply' } });
-        const result = JSON.parse(response.content[0].text);
-        assert.equal(result.qid, qid);
-      } else await w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'reply' } } } });
-      assert.equal(JSON.parse(readFileSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`), 'utf8')).answer, 'reply');
-    } finally { await w.close(); await s.cleanup(); }
-  }
+test('fresh manager answers a dead owner question through a new agent_answer task', async () => {
+  const s = setup();
+  const jobId = 'restart-tool', qid = 'qid-tool';
+  s.manager.store.create(meta(s.home, { id: jobId, state: 'running', owner: { pid: 2147483647, startTime: 'dead' },
+    awaitingInput: { qid, question: 'persisted?', askedAt: Date.now() } }), 'fake');
+  writeFileSync(join(s.manager.store.dir(jobId), 'question.json'), JSON.stringify({ id: qid, question: 'persisted?', askedAt: Date.now() }));
+  const w = await wire(s);
+  try {
+    await s.manager.initialize();
+    const response = await w.rpc('tools/call', { name: 'codex_agent_answer', arguments: { jobId, qid, answer: 'reply' } });
+    clientCreateTask.parse(response);
+    assert.notEqual(response.taskId, jobId);
+    assert.equal(JSON.parse(readFileSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`), 'utf8')).answer, 'reply');
+    // This persisted fixture has no worker; publish its next event through the owner's store.
+    s.manager.store.write({ ...s.manager.store.get(jobId), state: 'completed', awaitingInput: undefined });
+    const result = JSON.parse((await w.rpc('tasks/result', { taskId: response.taskId })).content[0].text);
+    assert.equal(result.event, 'stopped');
+    assert.equal(result.jobId, jobId);
+    assert.equal(result.qid, qid);
+  } finally { await w.close(); await s.cleanup(); }
 });
 
 
-test('tasks update acknowledges with an empty result; the client ignores it and re-polls', async () => {
+test('tasks/update cannot answer a worker question or open a user form', async () => {
   const s = setup(); const w = await wire(s);
   try {
     const jobId = 'contract-update', qid = 'contract-question';
     s.manager.store.create(meta(s.home, { id: jobId, state: 'running', awaitingInput: { qid, question: 'fake', askedAt: Date.now() } }), 'fake');
     writeFileSync(join(s.manager.store.dir(jobId), 'question.json'), JSON.stringify({ id: qid, question: 'fake', askedAt: Date.now() }));
-    const reply = await w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'fake' } } } });
-    // mmap of claude.exe 2.1.319, z9o (offset 338118498):
-    // await r("tasks/update", {taskId:n,inputResponses:f}, ...), h=0;
-    // for (let t of Object.keys(f)) C.add(t); ... S=A; continue;
-    // No update fields are read: the next tasks/get is parsed with re().
-    // This is a non-tool acknowledgement, so it has no resultType envelope.
-    assert.deepEqual(reply, {});
-    // A foreign responder never writes meta.json; the owner's sampler clears awaitingInput.
-    assert.equal(s.manager.store.get(jobId).awaitingInput?.qid, qid);
-    const next = clientTaskGet.parse(await w.rpc('tasks/get', { taskId: jobId }));
-    // No owner is sampling this fake record, so it still shows the question; a repeated update is an idempotent success.
-    assert.equal(next.status, 'input_required');
-    assert.deepEqual(await w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'fake' } } } }), {});
-    assert.equal(JSON.parse(readFileSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`), 'utf8')).answer, 'fake');
+    await assert.rejects(w.rpc('tasks/update', { taskId: jobId, inputResponses: { [qid]: { action: 'accept', content: { answer: 'fake' } } } }), /method not found/i);
+    assert.equal(existsSync(join(s.manager.store.dir(jobId), `answer-${qid}.json`)), false);
+    const followed = await w.rpc('tools/call', { name: 'codex_agent_follow', arguments: { jobId } });
+    const next = clientTaskGet.parse(await w.rpc('tasks/get', { taskId: followed.taskId })) as any;
+    assert.equal(next.status, 'completed');
+    assert.equal(JSON.parse(next.result.content[0].text).event, 'question');
+    assert.equal(next.inputRequests, undefined);
+    assert.ok(w.notices.every(notice => notice.method !== 'elicitation/create' && notice.params?.status !== 'input_required'));
   } finally { await w.close(); await s.cleanup(); }
 });
 

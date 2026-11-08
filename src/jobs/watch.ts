@@ -1,7 +1,23 @@
 import type { JobMeta } from './connector.js';
 import type { JobManager } from './manager.js';
 
+export type JobEvent = 'stopped' | 'paused' | 'question' | 'approval';
+export interface AnsweredInput { qid?: string; approvalId?: string | number }
+
+export function nextJobEvent(job: JobMeta, answered: AnsweredInput = {}): JobEvent | undefined {
+  if (job.state === 'paused') return 'paused';
+  if (job.state !== 'queued' && job.state !== 'running') return 'stopped';
+  if (job.awaitingInput && job.awaitingInput.qid !== answered.qid) return 'question';
+  if (job.pendingApproval && job.pendingApproval.id !== answered.approvalId)
+    return job.pendingApproval.kind === 'userInput' ? 'question' : 'approval';
+  return undefined;
+}
+
 export interface WatchOptions {
+  /** Implicit waits have no deadline; explicit follow keeps its bounded maxWaitSec. */
+  unlimited?: boolean;
+  /** Return on pauses or input, ignoring only the question/approval just answered. */
+  untilNextEvent?: AnsweredInput;
   /** Explicit follow tool collection; internal waits leave wake markers untouched. */
   markCollected?: boolean;
   onProgress?: (message: string) => void;
@@ -38,14 +54,14 @@ export function progressMessage(manager: JobManager, job: JobMeta, showReasoning
     Math.floor(((job.finishedAt ?? Date.now()) - (job.startedAt ?? job.createdAt)) / 1000)
   );
   const model = (job.model ?? 'default').split('/').pop()!.replace(/^gpt-[0-9.]+-/, '').replace(/^gemini-[0-9.]+-/, '');
-  const identity = `${job.connector} ${model} \u00b7 ${job.label ?? 'job'}`;
-  const state = job.awaitingInput ? `awaiting answer (qid ${job.awaitingInput.qid})` : job.pendingApproval ? (job.pendingApproval.kind === 'userInput' ? 'awaiting answer' : 'awaiting approval') : job.stalled && job.state === 'running' ? `stalled ${Math.floor((Date.now() - (job.stalledSince ?? Date.now())) / 60000)}m` : job.state;
+  const identity = `${job.connector} ${job.id} ${model} \u00b7 ${job.label ?? 'job'}`;
+  const state = job.awaitingInput ? 'awaiting answer' : job.pendingApproval ? (job.pendingApproval.kind === 'userInput' ? 'awaiting answer' : 'awaiting approval') : job.stalled && job.state === 'running' ? `stalled ${Math.floor((Date.now() - (job.stalledSince ?? Date.now())) / 60000)}m` : job.state;
   const suffix = ` | ${state} | ${elapsed}s`;
   if (job.progressNote) summary = job.progressNote;
   if (job.state === 'paused') summary = job.resetAt ? `Paused until ${new Date(job.resetAt).toISOString()}` : 'Paused until the usage limit is reset; reset time unknown';
   if (job.reason === 'superseded') summary = `Superseded by ${job.supersededBy ?? 'a replacement job'}`;
   const step = (summary || (job.state === 'queued' ? 'waiting for slot' : job.state === 'running' ? 'working' : job.state)).replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Variation_Selector}]+/gu, ' ').replace(/\s+/g, ' ').trim();
-  const reserveStep = Math.min(40, step.length) + 3;
+  const reserveStep = Math.min(job.reason === 'superseded' ? 60 : 40, step.length) + 3;
   const head = identity.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Variation_Selector}]+/gu, ' ').slice(0, Math.max(0, 120 - suffix.length - reserveStep)) + suffix;
   return head + ' | ' + step.slice(0, 120 - head.length - 3);
 }
@@ -77,6 +93,9 @@ export async function watchJob(
   let deadline: ReturnType<typeof setTimeout> | undefined;
   let abort = () => {};
   let approvalKey: string | undefined;
+  let input: Pick<JobMeta, 'awaitingInput' | 'pendingApproval'> | undefined;
+  let event: JobEvent | undefined;
+  let eventState: JobMeta['state'] | undefined;
   let ended = false;
   const cleanup = () => {
     if (ended) return;
@@ -101,8 +120,14 @@ export async function watchJob(
           approvalKey = job.awaitingInput ? job.awaitingInput.qid : job.pendingApproval ? JSON.stringify([job.pendingApproval.id, job.pendingApproval.requestedAt]) : undefined;
           options.onProgress?.(progressMessage(manager, job, options.showReasoning));
           if (ended) return; // The callback may cancel the request.
-          // A pause the queue will retry by itself (reset time known) keeps the follow going.
-          if (job.state !== 'queued' && job.state !== 'running' && !autoRetries(job)) finish(false);
+          // Event waits return on every pause; other internal watches may follow automatic retries.
+          const nextEvent = options.untilNextEvent;
+          event = nextEvent ? nextJobEvent(job, nextEvent) : undefined;
+          if (event) {
+            eventState = job.state;
+            input = { awaitingInput: job.awaitingInput, pendingApproval: job.pendingApproval };
+            finish(false);
+          } else if (job.state !== 'queued' && job.state !== 'running' && (nextEvent || !autoRetries(job))) finish(false);
           else if (timeout) finish(true);
         } catch (error) {
           cleanup();
@@ -126,15 +151,15 @@ export async function watchJob(
         () => sample(),
         Math.min(20000, Math.max(1, options.heartbeatMs ?? 20000))
       );
-      deadline = setTimeout(() => sample(true), maxWaitSec * 1000);
-      sample(maxWaitSec === 0);
+      if (!options.unlimited) deadline = setTimeout(() => sample(true), maxWaitSec * 1000);
+      sample(!options.unlimited && maxWaitSec === 0);
     });
   } finally {
     cleanup();
   }
   const result = await manager.result(jobId);
   checkAbort();
-  const response = { ...result, watchedSec: (Date.now() - started) / 1000, timedOut };
+  const response = { ...result, ...input, ...(event ? { event, state: eventState! } : {}), watchedSec: (Date.now() - started) / 1000, timedOut };
   if (options.markCollected && !['queued', 'running'].includes(response.state)) manager.markCollected(jobId);
   return response;
 }

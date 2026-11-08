@@ -29,11 +29,11 @@ test('send creates a new resumed follow-up through start, inheriting execution s
     assert.equal((await manager.result(original.jobId, 10)).sessionId, 'fake-session');
     const tools: JobTool[] = [];
     registerJobTools(tools, 'codex', manager);
-    const send = tools.find(tool => tool.name === 'codex_agent_message')!;
+    const send = tools.find(tool => tool.name === 'codex_agent_resume')!;
     const message = '\nsecond turn\n';
     const result = JSON.parse(await send.execute({ jobId: original.jobId, message }));
     assert.notEqual(result.jobId, original.jobId);
-    assert.deepEqual(result, { delivered: 'resumed', jobId: result.jobId });
+    assert.deepEqual(result, { jobId: result.jobId, state: 'queued', followUpOf: original.jobId });
     const saved = manager.store.get(result.jobId);
     assert.equal(saved.followUpOf, original.jobId);
     assert.equal(saved.resumeSession, 'fake-session');

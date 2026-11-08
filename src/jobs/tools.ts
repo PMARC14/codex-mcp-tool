@@ -37,13 +37,16 @@ export function registerJobTools(
       title: `${prefix === 'codex' ? 'Codex' : prefix} agent${name === 'agent' ? '' : `: ${name.slice('agent_'.length)}`}`,
       description,
       zodSchema: schema,
-      execute: async (args, onProgress, signal) =>
-        JSON.stringify(await execute(schema.parse(args), onProgress, signal)),
+      execute: async (args, onProgress, signal) => {
+        const parsed = schema.parse(args);
+        await manager.initialize();
+        return JSON.stringify(await execute(parsed, onProgress, signal));
+      },
     });
   };
   add(
     'agent',
-    `Launch a background ${prefix === 'codex' ? 'Codex' : prefix} agent and return its ID immediately. Default mode is read; full mode bypasses approvals and sandboxing and must be explicitly requested. Use ${prefix}_agent_status or ${prefix}_agent_result to check completion.${prefix === 'codex' ? ` Use transport: app-server to message it mid-work with ${prefix}_agent_message; exec agents can answer pending questions but cannot otherwise be steered.` : ''}`,
+    `Launch a background ${prefix === 'codex' ? 'Codex' : prefix} agent. Returns an MCP task when supported; otherwise waits until it stops, pauses, or needs input. Default mode is read; full mode bypasses approvals and sandboxing and must be explicitly requested. Use ${prefix}_agent_status or ${prefix}_agent_result to check completion.${prefix === 'codex' ? ` Use transport: app-server to message it mid-work with ${prefix}_agent_message; exec agents can answer pending questions but cannot otherwise be steered.` : ''}`,
     z
       .object({
         prompt: z
@@ -97,7 +100,7 @@ export function registerJobTools(
         ...(prefix === 'codex' ? {
           transport: z.enum(['exec', 'app-server']).optional().describe('Use app-server for steering and interactive approvals; omitted uses the configured default (app-server).'),
           approvalTimeoutMin: z.number().positive().default(30),
-          approvals: z.enum(['never', 'on-request']).default('never').describe('App-server approval policy. never (default) never asks, like headless exec; on-request surfaces approvals as input_required in read/write modes.'),
+          approvals: z.enum(['never', 'on-request']).default('never').describe('App-server approval policy. never (default) never asks, like headless exec; on-request returns questions and approvals as next-event results in read/write modes.'),
         } : {}),
         idempotencyKey: z.string().min(1).optional(),
         priority: z.enum(['normal', 'optional']).default('normal'),
@@ -139,7 +142,7 @@ export function registerJobTools(
   );
   add(
     'agent_follow',
-    'Follow an agent until it stops or pauses, with progress every 20 seconds and on state changes. Cancelling the follow leaves the agent running. Returns agent_result plus watchedSec and timedOut.',
+    'Follow an agent until its next stop, pause, question or approval, with progress every 20 seconds and on state changes. Returns event, jobId, state and input details. Cancelling the follow leaves the agent running. Explicit waits retain maxWaitSec.',
     z.object({
       jobId,
       showReasoning: z.boolean().default(false),
@@ -153,6 +156,7 @@ export function registerJobTools(
     (args, onProgress, signal) =>
       manager.watch(args.jobId, args.maxWaitSec, {
         onProgress,
+        untilNextEvent: {},
         markCollected: true,
         showReasoning: args.showReasoning,
         signal,
@@ -161,24 +165,46 @@ export function registerJobTools(
   );
   add(
     'agent_message',
-    'Message an agent: steer a running agent or answer its pending question; resume a stopped agent session as a new follow-up job. Returns delivered (mid-turn, queued, answer, or resumed) and jobId (the follow-up ID when resumed). Optional mode, model, effort and timeoutMin apply only when resuming. Queued agents must start or stop first.',
+    `Steer a running agent and return immediately, or resume a stopped session as a new job like ${prefix}_agent_resume. Resumes return a task when supported; otherwise wait for the next event. Answer pending questions or approvals with ${prefix}_agent_answer. Optional mode, model, effort and timeoutMin apply only when resuming. Queued agents must start or stop first.`,
     z.object({
       jobId,
       message: z
         .string()
         .min(1)
         .refine(message => message.trim().length > 0, 'Message must not be blank')
-        .describe('Instructions or an answer for the agent; stopped sessions resume with this prompt.'),
+        .describe('Steering instructions or a follow-up prompt for a stopped session.'),
       mode: z.enum(['read', 'write', 'trusted', 'full']).optional(),
       model: z.string().optional(),
       effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional(),
       timeoutMin: z.number().positive().optional(),
     }),
-    ({ jobId, message, ...overrides }) => manager.message(jobId, message, overrides)
+    async ({ jobId, message, ...overrides }) => {
+      const job = manager.store.get(jobId);
+      if (job.awaitingInput || job.pendingApproval)
+        throw new Error(`Job needs input; use ${prefix}_agent_answer (qid ${job.awaitingInput?.qid ?? job.pendingApproval!.id})`);
+      if (job.state === 'queued') throw new Error('Queued agents must start or stop before they can be messaged');
+      if (job.state !== 'running') return { ...await manager.send(jobId, message, overrides), delivered: 'resumed' };
+      return { ...await manager.steer(jobId, message), jobId };
+    }
+  );
+  add(
+    'agent_resume',
+    'Resume a stopped agent session as a new follow-up job. Inherits the session and job settings unless overridden. Returns an MCP task when supported; otherwise waits until the new job stops, pauses, or needs input.',
+    z.object({
+      jobId,
+      message: z.string().min(1)
+        .refine(message => message.trim().length > 0, 'Message must not be blank')
+        .describe('Follow-up instructions for the stopped session.'),
+      mode: z.enum(['read', 'write', 'trusted', 'full']).optional(),
+      model: z.string().optional(),
+      effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional(),
+      timeoutMin: z.number().positive().optional(),
+    }),
+    ({ jobId, message, ...overrides }) => manager.send(jobId, message, overrides)
   );
   add(
     'agent_answer',
-    `Answer an agent question with answer and optional qid, or an app-server approval with decision. Inspect awaitingInput/pendingApproval in ${prefix}_agent_status first.`,
+    `Answer an agent question with answer and optional qid, or an app-server approval with decision. Returns a new task when supported; otherwise blocks until the next stop, pause, question or approval. Inspect awaitingInput/pendingApproval in ${prefix}_agent_status first.`,
     z.object({ jobId, decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']).optional(), answer: z.string().trim().min(1).max(20000).optional(), qid: z.string().optional() })
       .refine(args => (args.decision === undefined) !== (args.answer === undefined), { message: 'Provide exactly one of answer or decision' }),
     args => manager.respond(args.jobId, args.answer !== undefined ? { answer: args.answer, qid: args.qid } : args.decision)
@@ -224,7 +250,7 @@ export function registerJobTools(
   );
   add(
     'agent_retry',
-    'Create a new queued job from a paused, lost or failed job using its saved full prompt. Optionally choose a different model or hand off to the sibling server; it must be enabled to pick up the job.',
+    'Create a new queued job from a paused, lost or failed job using its saved full prompt. Returns an MCP task when supported; otherwise waits until the new job stops, pauses, or needs input. Optionally choose a different model or hand off to the sibling server; it must be enabled to pick up the job.',
     z.object({
       jobId,
       model: z.string().optional().describe('Explicit replacement model.'),

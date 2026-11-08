@@ -227,7 +227,13 @@ Before removal, collection walks ordinary directories and unlinks junctions and 
 
 ## Wake delivery
 
-Wakes use an MCP task when requested, else the external multi-agent hook-wait PostToolUse hook (`multi-agent/scripts/hook-wait.sh`). MCP-task jobs carry `mcp-task.json`, which lets the hook skip jobs whose task provides the wake. The hook observes stopped jobs and pending questions or approvals from the shared store.
+Wakes use Claude Code's native MCP tasks or pending tool calls. Every wait ends at the job's next event and returns `jobId`, `state`, and `event`: `stopped`, `paused`, `question`, or `approval`. Input events include `awaitingInput` or `pendingApproval`. Worker questions reach Claude as results; they never open user elicitation forms. No external `hook-wait.sh` PostToolUse hook is needed.
+
+With task support, `codex_agent`, `codex_agent_follow`, `codex_agent_retry`, `codex_agent_resume`, and `codex_agent_answer` return tasks. Each answer starts a new task for the same job and ignores the input ID just answered. A task completes even when the job remains running for a question, or paused for an automatic retry. Completed task results are immutable and persist across reconnects under `~/.agent-jobs/tasks/`. Task IDs and job IDs can differ; use the result's `jobId` for job tools. Questions and approvals are answered only through `codex_agent_answer`; `tasks/update`, `input_required`, and `inputRequests` are not used.
+
+Without task support, the same calls remain pending until the next event. Implicit waits have no deadline. Explicit blocking `codex_agent_follow` retains `maxWaitSec`; expiry returns `timedOut: true` without an event. Progress includes the job ID, every 20 seconds and on state/input changes. Cancelling a wait leaves the job running; `tasks/cancel` stops it.
+
+`codex_agent_message` steers a running job and returns immediately. On a stopped or failed job it resumes the session as a new job, with the same task or blocking wait as `codex_agent_resume { jobId, message, mode?, model?, effort?, timeoutMin? }`. Pending input makes message reject with an instruction naming `codex_agent_answer` and the input ID. Discovery connects before job recovery finishes; job tools wait for initialization before accessing the manager.
 
 ## Usage
 
