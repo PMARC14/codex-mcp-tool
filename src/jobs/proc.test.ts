@@ -15,6 +15,8 @@ import {
   snapshotDescendants,
   runCommandBuffer,
   killProcessGroup,
+  closeGrace,
+  liveIn,
   type GroupKillDeps,
 } from './proc.js';
 import type { Owner } from './connector.js';
@@ -320,7 +322,45 @@ test('snapshot follows a dead known parent but rejects a reused parent PID', () 
   const root = { pid: 10, startTime: '1000' };
   const known = [{ pid: 20, startTime: '1100' }];
   const rows = [{ ProcessId: 30, ParentProcessId: 20, Start: '1200' }];
-  assert.deepEqual(snapshotDescendants(rows, root, known).map(p => p.pid), [20, 30]);
-  assert.deepEqual(snapshotDescendants([...rows, { ProcessId: 20, ParentProcessId: 1, Start: '1300' }], root, known).map(p => p.pid), [20]);
-  assert.deepEqual(snapshotDescendants([{ ...rows[0], Start: '900' }], root, known).map(p => p.pid), [20]);
+  // Dead known entries still act as parents but are dropped from the result.
+  assert.deepEqual(snapshotDescendants(rows, root, known).map(p => p.pid), [30]);
+  assert.deepEqual(snapshotDescendants([...rows, { ProcessId: 20, ParentProcessId: 1, Start: '1300' }], root, known).map(p => p.pid), []);
+  assert.deepEqual(snapshotDescendants([{ ...rows[0], Start: '900' }], root, known).map(p => p.pid), []);
+  assert.deepEqual(snapshotDescendants([...rows, { ProcessId: 20, ParentProcessId: 10, Start: '1100' }], root, known).map(p => p.pid), [20, 30]);
+});
+
+test('liveIn matches PID and start time from one snapshot', () => {
+  const rows = [{ ProcessId: 1, ParentProcessId: 0, Start: '5' }, { ProcessId: 2, ParentProcessId: 1, Start: '6' }];
+  assert.deepEqual(liveIn(rows, [{ pid: 1, startTime: '5' }, { pid: 2, startTime: '7' }, { pid: 3, startTime: '8' }, { pid: 1, startTime: '' }]), [{ pid: 1, startTime: '5' }]);
+});
+
+for (const [name, script] of [
+  ['a child that keeps running after its stdin closes', 'process.stdin.resume(); process.stdin.on("data", d => { if (String(d).includes("done")) console.log("turn-completed"); }); setInterval(() => {}, 1000);'],
+  ['a child whose grandchild holds its pipes after it exits', 'process.stdin.resume(); process.stdin.on("data", d => { if (String(d).includes("done")) { require("child_process").spawn(process.execPath, ["-e", "setTimeout(()=>{},60000)"], { stdio: "inherit" }); console.log("turn-completed"); setTimeout(() => process.exit(0), 200); } });'],
+] as const) test(`close grace finishes ${name} as a clean exit`, async () => {
+  const f = fixture();
+  const saved = closeGrace.ms;
+  closeGrace.ms = 500;
+  try {
+    const started = Date.now();
+    const proc = startProcess({
+      exe: process.execPath,
+      args: ['-e', script],
+      stdin: 'done\n',
+      stdinPlan: () => (line: string) => (line === 'turn-completed' ? { close: true } : undefined),
+      cwd: f.home,
+      stdout: join(f.home, 'out'),
+      stderr: join(f.home, 'err'),
+      async onSpawn() {},
+      onSnapshot() {},
+      onLine() {},
+    });
+    const outcome = await proc.done;
+    assert.equal(outcome.kind, 'exit');
+    assert.equal(outcome.code, 0);
+    assert.ok(Date.now() - started < 20_000, 'finishes well before any job timeout');
+  } finally {
+    closeGrace.ms = saved;
+    f.cleanup();
+  }
 });

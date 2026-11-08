@@ -9,6 +9,9 @@ import { jobWrapper } from './jobobject.js';
 
 /** stdin write errors that only mean the child stopped reading (EOF is the Windows form of EPIPE). */
 const CLOSED_PIPE_CODES = new Set(['EPIPE', 'EOF', 'ECONNRESET']);
+// After stdin closes or the child exits, wait this long for the pipes to close. A worker's own
+// background processes can keep the child alive or hold its pipes open; then the tree is killed.
+export const closeGrace = { ms: 15_000 };
 
 export function resolveCommand(exe: string, args: string[]): { exe: string; args: string[] } {
   if (/\.(cmd|bat)$/i.test(exe)) {
@@ -241,13 +244,22 @@ async function cachedStartTime(pid: number): Promise<string | undefined> {
   return value;
 }
 
-export async function descendants(root: Owner, known: Owner[] = []): Promise<Owner[]> {
-  if (process.platform !== 'win32') return [];
+async function processRows(): Promise<ProcessRow[]> {
   const raw = await powershell(
     `@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='Start';e={[math]::Floor($_.CreationDate.ToUniversalTime().Ticks / 10000).ToString('0')}}) | ConvertTo-Json -Compress`
   );
-  const rows = JSON.parse(raw || '[]') as ProcessRow[];
-  return snapshotDescendants(rows, root, known);
+  return JSON.parse(raw || '[]') as ProcessRow[];
+}
+
+export async function descendants(root: Owner, known: Owner[] = []): Promise<Owner[]> {
+  if (process.platform !== 'win32') return [];
+  return snapshotDescendants(await processRows(), root, known);
+}
+
+/** Identities that are alive in one snapshot: same PID and same start time. */
+export function liveIn(rows: ProcessRow[], identities: Owner[]): Owner[] {
+  const byPid = new Map(rows.map(row => [row.ProcessId, row]));
+  return identities.filter(identity => !!identity.startTime && byPid.get(identity.pid)?.Start === identity.startTime);
 }
 
 export interface ProcessRow {
@@ -278,30 +290,33 @@ export function snapshotDescendants(rows: ProcessRow[], root: Owner, known: Owne
       changed = true;
     }
   }
-  return [...found.values()];
+  // Dead entries still serve as parents above (orphans keep their dead parent's PID), but are
+  // not kept: a long job spawns hundreds of short-lived test processes.
+  return [...found.values()].filter(p => !byPid.has(p.pid) ? false : byPid.get(p.pid)!.Start === p.startTime);
 }
 
 export async function killTree(root?: Owner, recorded: Owner[] = [], child?: ChildProcess): Promise<void> {
   if (process.platform === 'win32') {
-    let children = recorded;
-    if (root) children = await descendants(root, recorded).catch(() => recorded);
-    for (const identity of [...(root ? [root] : []), ...children]) {
-      // Only a still-live child handle authorizes PID-based termination without a start time.
-      // Persisted empty identities alone must never authorize killing a possibly reused PID.
-      const heldChild = identity === root && !identity.startTime && child?.pid === identity.pid && child.exitCode === null && child.signalCode === null;
-      if (heldChild || await isAlive(identity)) {
-        const killing = runCommand(systemBinary('taskkill.exe'), [
-          '/PID',
-          String(identity.pid),
-          '/T',
-          '/F',
-        ]).catch(() => {});
-        if (heldChild) child!.kill();
-        await killing;
-      }
+    // One snapshot, one batched taskkill, one re-check: per-PID probes cannot finish inside the
+    // 10 second cancel deadline once a job has recorded hundreds of descendants.
+    const rows = await processRows().catch(() => undefined);
+    const all = [...(root ? [root] : []), ...(rows && root ? snapshotDescendants(rows, root, recorded) : recorded)];
+    // Only a still-live child handle authorizes PID-based termination without a start time.
+    // Persisted empty identities alone must never authorize killing a possibly reused PID.
+    const heldChild = !!root && !root.startTime && child?.pid === root.pid && child.exitCode === null && child.signalCode === null;
+    const targets = rows ? liveIn(rows, all) : (await Promise.all(all.map(async identity => (await isAlive(identity)) ? identity : undefined))).filter((x): x is Owner => !!x);
+    const handleLive = !!child && child.pid === root?.pid && child.exitCode === null && child.signalCode === null;
+    // A snapshot can miss the root; a live handle plus a verified start time still authorizes it.
+    if (root && !targets.includes(root) && (heldChild || (handleLive && await isAlive(root)))) targets.unshift(root);
+    for (let i = 0; i < targets.length; i += 40) {
+      const batch = targets.slice(i, i + 40);
+      await runCommand(systemBinary('taskkill.exe'), [...batch.flatMap(t => ['/PID', String(t.pid)]), '/T', '/F']).catch(() => {});
     }
-    const survivors = await Promise.all([...(root ? [root] : []), ...children].map(ownerAlive));
-    if (survivors.some(Boolean))
+    if (heldChild) child!.kill();
+    if (!targets.length) return;
+    const after = await processRows().catch(() => undefined);
+    const survivors = after ? liveIn(after, targets.filter(t => t.startTime)) : (await Promise.all(targets.map(ownerAlive))).some(Boolean) ? targets : [];
+    if (survivors.length || (heldChild && child!.exitCode === null && child!.signalCode === null && after?.some(row => row.ProcessId === root!.pid)))
       throw new Error('kill-failed: processes in the tree are still alive');
     return;
   }
@@ -404,6 +419,8 @@ export function startProcess(options: {
   let spawnReady: Promise<void> = Promise.resolve();
   let setupError: string | undefined;
   let termination: Promise<void> | undefined;
+  let graceTimer: NodeJS.Timeout | undefined;
+  let completing = false;
   let spawned!: () => void;
   const spawnEvent = new Promise<void>(resolveSpawn => {
     spawned = resolveSpawn;
@@ -415,14 +432,29 @@ export function startProcess(options: {
   const fds: number[] = [];
   const buffers = { stdout: '', stderr: '' };
   const inputHandler = options.stdinPlan?.({
-    apply: action => updateStdin(child?.stdin, action),
+    apply: action => { updateStdin(child?.stdin, action); if (action.close) armGrace(); },
     emit: event => options.onEvent?.(event),
   });
   const onLine = (line: string, stream: 'stdout' | 'stderr') => {
     const action = inputHandler?.(line, stream);
-    if (action) updateStdin(child.stdin, action);
+    if (action) { updateStdin(child.stdin, action); if (action.close) armGrace(); }
     options.onLine(line, stream);
   };
+  function armGrace() {
+    if (graceTimer || closed) return;
+    graceTimer = setTimeout(() => {
+      if (closed) return;
+      // The work is done; only stragglers remain. Finish as a clean exit, then clean up the tree.
+      claim({ kind: 'exit', code: child?.exitCode ?? 0 });
+      beginTermination();
+      void termination?.finally(() => {
+        if (closed) return;
+        for (const stream of ['stdout', 'stderr'] as const) child?.[stream]?.destroy();
+        void complete();
+      });
+    }, closeGrace.ms);
+    graceTimer.unref?.();
+  }
   const claim = (value: ProcessOutcome) => {
     outcome ??= value;
   };
@@ -446,6 +478,9 @@ export function startProcess(options: {
       });
   };
   const complete = async () => {
+    if (completing) return;
+    completing = true;
+    clearTimeout(graceTimer);
     try { updateStdin(child?.stdin, { close: true }); } catch { /* Child has exited. */ }
     closed = true;
     inputHandler?.dispose?.();
@@ -554,6 +589,7 @@ export function startProcess(options: {
     }
     child.once('exit', (code, signal) => {
       claim({ kind: 'exit', code, signal: signal ?? undefined });
+      armGrace();
     });
     if (options.stdin !== undefined) {
       if (inputHandler) updateStdin(child.stdin, { write: options.stdin });
