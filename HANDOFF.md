@@ -20,10 +20,12 @@ The legacy tools load only with `CODEX_MCP_LEGACY_TOOLS=1`.
 
 **Docs:** `docs/agent-jobs.md` (full), `docs/job-surface-audit.md`, `README.md`.
 
-**State (2026-11-07):**
-- **Panel review round 1 is in** (`602b3d6`).
-- **Round 2 was in flight** (Flash job `9d21e890`): an OS-level named-pipe mutex in `lock.ts`, `safeSpawn` using the launcher by default, the orphan-answer fix, and real interleaving tests. Collect, test twice, commit, then run `scripts/sync-jobs.sh` into the agy fork.
-- **Not yet live-tested in the real client:** the `/mcp` reconnect, then start, steer, ask-back and finish in both launch modes. `codex_selftest` checks the protocol path.
+**State (2026-11-07, evening):**
+- Panel round 1 (`602b3d6`), round 2 (`69cdd0a`: named-pipe OS mutex in `lock.ts`, launcher by default in `safeSpawn`, orphan-answer supervision) and the channel removal (`0dbba35`: `claude-agents` / `CLAUDE_AGENTS` / `channel.ts` gone) are in. 221/221 tests from a clean `dist`.
+- **Live-tested in plain `claude`:** start, steer (`app-server`, delivered mid-turn), ask-back via `ask_orchestrator` (hook wake, answer, re-arm) and finish, one wake each.
+- **Mixed versions are unsafe:** round 2's `withLock` takes the pipe mutex and overwrites the `lock` file, so an older-build server (another open session) is not excluded. Reconnect or restart every session that loads this server after updating.
+- Claude Code occasionally falls back to the pre-task protocol for one server (`initialize` after `server/discover`; 24 of 433 codex sessions). Such a session gets plain jobs, which the hook covers.
+- Round 2 left dead helpers in `lock.ts` (`reclaimStale`, `releaseOwned`, `tryAcquire`, `staleContent`, now unused by `withLock`) and stripped some rationale comments. Remove or restore in the next pass.
 
 **Next project:** extract `src/jobs` + `src/tools/{mcp-tasks,traffic-log,debug-tools,client-schemas}` + `src/bridge` into one standalone `agent-jobs` package or server, with Codex and agy as connectors. That drops the fork history, the sync script and the legacy tools. Upstream PRs are no longer practical; the changes are too large.
 
