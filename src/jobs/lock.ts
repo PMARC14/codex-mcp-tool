@@ -1,5 +1,5 @@
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import net from 'node:net';
@@ -28,7 +28,23 @@ export const lockTestHooks: {
  * - macOS: socket file under the jobs home
  */
 export function mutexAddress(key: string, home?: string): string {
-  const sha8 = createHash('sha256').update(key).digest('hex').slice(0, 8);
+  let canonical = resolve(key);
+  // Resolve an existing ancestor too: lock files often do not exist until after the mutex is held.
+  let ancestor = canonical;
+  const missing: string[] = [];
+  while (true) {
+    try {
+      canonical = join(realpathSync.native(ancestor), ...missing.reverse());
+      break;
+    } catch {
+      const parent = dirname(ancestor);
+      if (parent === ancestor) break;
+      missing.push(basename(ancestor));
+      ancestor = parent;
+    }
+  }
+  if (process.platform === 'win32') canonical = canonical.replace(/\\/g, '/').toLowerCase();
+  const sha8 = createHash('sha256').update(canonical).digest('hex').slice(0, 8);
   if (process.platform === 'win32') {
     return `\\\\.\\pipe\\agent-jobs-${sha8}`;
   }
@@ -351,25 +367,26 @@ export async function withLock<T>(
 ): Promise<T> {
   const path = join(home, 'lock');
   sweepStaleTemps(home);
+  const deadline = Date.now() + timeoutMs;
   const mutex = await acquireMutex(path, { timeoutMs, home });
-  const token = randomUUID();
-  const content = JSON.stringify({ pid: process.pid, token, time: Date.now() });
+  let content: string | undefined;
+  let acquired = false;
   try {
-    writeFileSync(path, content);
-  } catch {}
-  try {
+    content = JSON.stringify({ ...await currentOwner(), token: randomUUID(), time: Date.now() });
+    // Keep the legacy protocol until no pre-69cdd0a server can run; those servers only take this file lock.
+    let delay = 5;
+    while (!(acquired = tryAcquire(path, content))) {
+      const stale = await staleContent(path);
+      if (stale !== undefined) reclaimStale(path, stale);
+      if (Date.now() >= deadline) throw new Error('Timed out waiting for the agent-jobs lock');
+      await sleep(delay);
+      delay = Math.min(delay * 2, 50);
+    }
     return await action();
   } finally {
     try {
-      if (existsSync(path)) {
-        try {
-          if (JSON.parse(readFileSync(path, 'utf8')).token === token) unlinkSync(path);
-        } catch {
-          unlinkSync(path);
-        }
-      }
-    } catch {}
-    finally {
+      if (acquired) releaseOwned(path, raw => raw === content);
+    } finally {
       await mutex.release();
     }
   }

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { type MutexHandle, tryAcquireMutexSync } from './lock.js';
 
@@ -6,32 +6,33 @@ interface Claim { owner: string; id: string; ts: number; timeoutMs: number }
 
 const activeClaims = new Map<string, { id: string; mutex: MutexHandle }>();
 
-/** Publish a complete claim atomically; an unexpired claim always wins over another asker. */
+/** Publish a complete claim while holding its mutex; a file without a mutex holder is stale. */
 export function claimQuestion(dir: string, claim: Claim): boolean {
   const path = join(dir, 'question.lock');
-  try {
-    if (existsSync(path)) {
+  const active = activeClaims.get(dir);
+  // A local timeout may release our own holder. Foreign holders must release their mutex themselves.
+  if (active) {
+    try {
       const raw = readFileSync(path, 'utf8');
       let expired: boolean;
       const old = (() => { try { return JSON.parse(raw) as Partial<Claim> | null; } catch { return null; } })();
       if (old && typeof old === 'object' && Number.isFinite(old.ts) && Number.isFinite(old.timeoutMs))
         expired = Date.now() >= old.ts! + old.timeoutMs!;
       else expired = Date.now() - statSync(path).mtimeMs >= 30 * 60 * 1000;
-      if (!expired) return false;
-      const active = activeClaims.get(dir);
-      if (active) {
+      if (expired) {
         void active.mutex.release();
         activeClaims.delete(dir);
       }
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+    } catch (error) {
       try {
-        if (Date.now() - statSync(path).mtimeMs < 30 * 60 * 1000) return false;
-      } catch {}
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT' && Date.now() - statSync(path).mtimeMs < 30 * 60 * 1000) return false;
+      } catch { return false; }
+      void active.mutex.release();
+      activeClaims.delete(dir);
     }
   }
 
+  // Try the OS mutex before trusting any file timestamp: a dead bridge can leave an unexpired claim.
   const mutex = tryAcquireMutexSync(path, dir);
   if (!mutex) return false;
 

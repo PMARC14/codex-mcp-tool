@@ -27,6 +27,13 @@ export class CodexConnector implements Connector {
   readonly reviewModel = 'gpt-6-astra';
   readonly defaultTransport = 'app-server' as const;
 
+  isNoise(line: string): boolean {
+    try {
+      const event = JSON.parse(line);
+      return event?.id === undefined && ['skills/changed', 'account/rateLimits/updated', 'mcpServer/startupStatus/updated'].includes(event?.method);
+    } catch { return false; }
+  }
+
   constructor(
     private run = runCommand,
     private resolve = () => resolveBinary('codex', CODEX_PATH_ENV),
@@ -56,7 +63,7 @@ export class CodexConnector implements Connector {
     return local.available ? local : snapshot?.parsed ?? local;
   }
 
-  async usagePercent(): Promise<number | undefined> {
+  async usagePercent(_model?: string): Promise<number | undefined> {
     const usage = await this.usage();
     const values = [usage.fiveHour?.usedPercent, usage.weekly?.usedPercent].filter((value): value is number => typeof value === 'number');
     return values.length ? Math.max(...values) : undefined;

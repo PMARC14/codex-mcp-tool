@@ -9,6 +9,7 @@ import { fixture, until } from '../jobs/test-helpers.js';
 import { createBridge } from './agent-bridge.js';
 import { buildAppServer } from '../connectors/codexAppServer.js';
 import type { JobSpec } from '../jobs/connector.js';
+import { claimQuestion, releaseQuestion } from '../jobs/question-claim.js';
 
 async function peer(home: string, id: string) {
   const server = createBridge(home, id);
@@ -44,12 +45,12 @@ test('native and bridge question claims exclude another asker before mailbox pub
   const job = { finalPath: join(dir, 'final.txt'), cwd: f.home, mode: 'write', prompt: 'fake' } as JobSpec;
   const handler = buildAppServer(job, 'fake', { config: {}, prompt: 'fake' } as any).stdinPlan({ apply(a) { if (a.write) writes.push(JSON.parse(a.write)); }, emit() {} });
   try {
-    writeFileSync(join(dir, 'question.lock'), JSON.stringify({ owner: 'native', id: 'first', ts: Date.now(), timeoutMs: 10000 }));
+    assert.equal(claimQuestion(dir, { owner: 'native', id: 'first', ts: Date.now(), timeoutMs: 10000 }), true);
     await assert.rejects(p.client.callTool({ name: 'ask_orchestrator', arguments: { question: 'bridge', timeoutSec: 0.1 } }), /already awaiting/i);
     handler(JSON.stringify({ id: 'native-second', method: 'item/tool/requestUserInput', params: { questions: [{ id: 'a', question: 'native' }] } }), 'stdout');
     assert.match(writes.find(m => m.id === 'native-second')?.error?.message ?? '', /already awaiting/i);
     assert.equal(existsSync(join(dir, 'question.json')), false);
-  } finally { handler.dispose?.(); await p.close(); f.cleanup(); }
+  } finally { handler.dispose?.(); releaseQuestion(dir, 'first'); await p.close(); f.cleanup(); }
 });
 
 

@@ -8,6 +8,41 @@ import { fixture, until } from './test-helpers.js';
 
 import { getUsage } from './usage-cache.js';
 
+test('concurrent usage calls keep the last good disk snapshot when the active probe fails', async () => {
+  const f = fixture();
+  const opts = { home: f.home, onBattery: false, now: () => 1_000_000 };
+  const cache = join(f.home, 'cache', 'fake-usage.json');
+  const good = { takenAt: 1, ok: true, raw: { available: true }, parsed: { percent: 42 } };
+  mkdirSync(join(f.home, 'cache'));
+  writeFileSync(cache, JSON.stringify(good));
+  let entered!: () => void;
+  const probing = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let duplicates = 0;
+  const first = getUsage('fake', async () => {
+    entered();
+    await gate;
+    return { ok: false, raw: null, parsed: null };
+  }, opts);
+  try {
+    await probing;
+    const second = await getUsage('fake', async () => {
+      duplicates++;
+      return { ok: true, raw: 'duplicate', parsed: { percent: 99 } };
+    }, opts);
+    assert.deepEqual(second, good, 'a contending reader receives the last good result');
+    release();
+    const failed = await first;
+    assert.equal(failed?.ok, false, 'the probing caller can still observe failure');
+    assert.deepEqual(failed?.parsed, good.parsed);
+    assert.deepEqual(JSON.parse(readFileSync(cache, 'utf8')), good, 'a failed overlapping probe never replaces the last good disk snapshot');
+    const cached = await getUsage('fake', async () => { duplicates++; throw new Error('must back off'); }, opts);
+    assert.equal(cached?.ok, false);
+    assert.equal(duplicates, 0);
+  } finally { release(); await first; f.cleanup(); }
+});
+
 test('usage cache shares five-minute results and backs off fifteen minutes on battery or failure', async () => {
   const f = fixture(); let time = 1000000, calls = 0, battery = false, fail = false;
   const opts = { home: f.home, now: () => time, onBattery: () => battery, ttlMs: 300000, batteryTtlMs: 900000 };
@@ -31,7 +66,15 @@ test('usage cache shares five-minute results and backs off fifteen minutes on ba
     time++; await getUsage('fake', probe, opts); assert.equal(calls, 5);
     const saved = JSON.parse(readFileSync(join(f.home, 'cache', 'fake-usage.json'), 'utf8'));
     assert.deepEqual(Object.keys(saved).sort(), ['ok', 'parsed', 'raw', 'takenAt']);
-    assert.equal(saved.takenAt, time);
+    assert.equal(saved.ok, true);
+    assert.equal(saved.raw, 'quota:42');
+    assert.equal(saved.takenAt, 2500000, 'failed probes preserve the successful snapshot timestamp');
+    const failurePath = join(f.home, 'cache', 'fake-usage.failure.json');
+    assert.equal(JSON.parse(readFileSync(failurePath, 'utf8')).takenAt, time);
+    fail = false;
+    time += 900000;
+    assert.equal((await getUsage('fake', probe, opts))?.ok, true);
+    assert.equal(existsSync(failurePath), false, 'successful probes clear the failure backoff');
   } finally { f.cleanup(); }
 });
 

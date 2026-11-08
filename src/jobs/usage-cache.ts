@@ -83,12 +83,20 @@ export async function getUsage<T>(
   const home = resolve(opts.home ?? process.env.AGENT_JOBS_HOME ?? join(homedir(), '.agent-jobs'));
   const dir = join(home, 'cache');
   const path = join(dir, `${connector}-usage.json`), lock = join(dir, `${connector}-usage.lock`);
+  const failurePath = join(dir, `${connector}-usage.failure.json`);
   const now = opts.now ?? Date.now;
   const configured = usageIntervals();
   const ttl = opts.ttlMs ?? configured.intervalMs, backoff = opts.backoffMs ?? USAGE_BACKOFF_MS;
   const batteryTtl = Math.max(opts.batteryTtlMs ?? configured.batteryIntervalMs, ttl);
   const fresh = (value: UsageSnapshot<unknown> | undefined, limit: number) => value && now() >= value.takenAt && now() - value.takenAt < limit;
-  let saved = readSnapshot<T>(path);
+  // Keep the last successful disk snapshot intact. Failure/backoff state is separate so a
+  // failed overlapping CLI probe cannot replace a usable snapshot with { ok: false, raw: null }.
+  const readCurrent = () => {
+    const value = readSnapshot<T>(path);
+    const failure = readSnapshot<T>(failurePath);
+    return failure?.ok === false && (!value || failure.takenAt >= value.takenAt) ? failure : value;
+  };
+  let saved = readCurrent();
   const cachedBattery = () => {
     if (typeof opts.onBattery === 'boolean') return opts.onBattery;
     const power = readSnapshot<boolean>(join(dir, 'machine-power-usage.json'));
@@ -110,14 +118,14 @@ export async function getUsage<T>(
       const raw = readFileSync(lock, 'utf8');
       let ts = statSync(lock).mtimeMs;
       try { const record = JSON.parse(raw); if (Number.isFinite(record.ts)) ts = record.ts; } catch { /* partial claim */ }
-      if (now() - ts < (opts.staleLockMs ?? 120000)) return readSnapshot<T>(path) ?? saved;
+      if (now() - ts < (opts.staleLockMs ?? 120000)) return readCurrent() ?? saved;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 
     mutex = await tryAcquireMutex(lock, home);
-    if (!mutex) return readSnapshot<T>(path) ?? saved;
+    if (!mutex) return readCurrent() ?? saved;
     try { writeFileSync(lock, JSON.stringify({ token, ts: now() })); } catch {}
 
-    saved = readSnapshot<T>(path) ?? saved;
+    saved = readCurrent() ?? saved;
     if (snapshotFresh(saved)) return saved;
     if (!opts.force && saved?.ok && fresh(saved, batteryTtl)) {
       try { if (await onBattery({ ...opts, home })) return saved; } catch { /* Power status unavailable: normal TTL. */ }
@@ -125,8 +133,14 @@ export async function getUsage<T>(
     let result: UsageProbe<T>;
     try { result = await probe(); }
     catch (error) { result = { ok: false, raw: String((error as Error)?.message ?? error), parsed: saved?.parsed ?? null }; }
-    const snapshot: UsageSnapshot<T> = { takenAt: now(), ok: result.ok, raw: result.raw ?? null, parsed: result.parsed ?? saved?.parsed ?? null };
-    atomicWrite(path, JSON.stringify(snapshot));
+    const latest = readSnapshot<T>(path);
+    // A newer successful writer (including an older server) wins over a failed in-flight probe.
+    if (!result.ok && latest?.ok && latest.takenAt > (saved?.takenAt ?? -Infinity)) return latest;
+    const snapshot: UsageSnapshot<T> = { takenAt: now(), ok: result.ok, raw: result.raw ?? null, parsed: result.parsed ?? latest?.parsed ?? saved?.parsed ?? null };
+    atomicWrite(!result.ok && latest?.ok ? failurePath : path, JSON.stringify(snapshot));
+    if (result.ok) {
+      try { unlinkSync(failurePath); } catch {}
+    }
     return snapshot;
   } catch { return saved; } // Cache/lock unavailable: fail open without an uncoordinated probe.
   finally {

@@ -1,6 +1,22 @@
 # Background agents and worktrees
 
-The existing synchronous tools remain available. The `codex_agent` and `codex_agent_*` tools provide a persistent background queue, process-tree cancellation, timeouts, and isolated Git worktrees. The agy server exposes corresponding `agy_agent` and `agy_agent_*` tools.
+The `codex_agent` and `codex_agent_*` tools provide a persistent background queue, process-tree cancellation, timeouts, and isolated Git worktrees. The agy server exposes corresponding `agy_agent` and `agy_agent_*` tools. Legacy synchronous tools require `CODEX_MCP_LEGACY_TOOLS=1`.
+
+## Contents
+
+- [Tools](#tools)
+- [Steering and app-server](#steering-and-the-opt-in-codex-app-server-transport)
+- [MCP tasks](#mcp-tasks-no-launch-flag)
+- [Worker bridge](#worker-to-orchestrator-bridge)
+- [Store and ownership](#shared-store-and-ownership)
+- [Worktrees and collection](#worktrees-and-collection)
+- [Wake delivery](#wake-delivery)
+- [Usage](#usage)
+- [Development](#development)
+- [Stability and cost rules](#stability-and-cost-rules-w1)
+- [Glossary](#glossary)
+
+## Tools
 
 | Tool | Title | Purpose |
 | --- | --- | --- |
@@ -59,7 +75,7 @@ While the job is running, call `codex_agent_message` with its `jobId` and a nonb
 
 For running delivery, the shared `<p>_agent_message` tool checks server ownership. Its connector capability is generic: each process gets a fresh `StdinHandler` from `StdinPlan(context)`, optionally exposing `onSteer(message)` which returns (or resolves to) a stdin action plus `delivered`. `context.apply` supports asynchronous writes/EOF and `context.emit` produces job events. Optional `onInterrupt`, `onRespond` and `dispose` hooks manage interactive lifetimes; existing callable line handlers remain compatible. Connectors without `onSteer`, including default Codex exec and the current agy connector, reject with: `this job can't take mid-turn messages; use <p>_agent_message after it stops, or start it with transport: app-server`. Agy can later supply its own queued stream-json user turn without depending on the Codex protocol.
 
-For app-server, modes map to sandbox `read-only`, `workspace-write`, and `danger-full-access` (`trusted` and `full`). The approval policy is `never` for every mode by default, matching headless `exec`, which never asks (with `on-request`, a read-only job blocked on an approval nobody saw and died with `approval_timeout`). Pass `approvals: "on-request"` to `codex_agent` to opt in for read/write jobs; approvals, `input_required` and elicitation then work as described below. `trusted` and `full` never ask either; `full` also bypasses the sandbox. The choice is saved in metadata and inherited by follow-ups. The existing exec mode mapping is unchanged. Model, reasoning effort, cwd and worktree Git writable directory are passed as thread settings. `resumeSession` uses `thread/resume` instead of `thread/start` before starting the prompt turn. Session IDs, final agent messages, reasoning and usage-limit/error events enter the same job event pipeline as exec.
+For app-server, modes map to sandbox `read-only`, `workspace-write`, and `danger-full-access` (`trusted` and `full`). The approval policy is `never` for every mode by default, matching headless `exec`, which never asks (with `on-request`, a read-only job blocked on an approval nobody saw and died with `approval_timeout`). Pass `approvals: "on-request"` to `codex_agent` to opt in for read, write, or trusted jobs; approvals, `input_required` and elicitation then work as described below. Only `full` forces `never` regardless of the requested approval policy; it also bypasses the sandbox. The choice is saved in metadata and inherited by follow-ups. The existing exec mode mapping is unchanged. Model, reasoning effort, cwd and worktree Git writable directory are passed as thread settings. `resumeSession` uses `thread/resume` instead of `thread/start` before starting the prompt turn. Session IDs, final agent messages, reasoning and usage-limit/error events enter the same job event pipeline as exec.
 
 App-server cancellation first sends `turn/interrupt`, waits up to three seconds for the process to exit, and then performs the normal process-tree cleanup within the existing cancel deadline. Wall-clock timeouts still use normal cleanup directly.
 
@@ -176,14 +192,14 @@ Hooks should watch `meta.json.awaitingInput` (`qid`, bounded `question`, `option
 
 ## Shared store and ownership
 
-Both forks use `~/.agent-jobs/`, containing `config.json`, a machine lock, and `jobs/<id>/`. Each job saves `meta.json`, `prompt.txt`, `stdout`, `stderr`, `final.txt`, and `patch.diff`. Metadata and completed artifacts use atomic replacement; stdout and stderr are streamed to separate files. Metadata includes the owning server PID and process start time. Other servers can read a job but cannot run, update, or cancel it. Requeue creates a new record, so another server can retry a lost job without rewriting its history.
+Both forks use `~/.agent-jobs/`, containing `config.json`, a machine lock, and `jobs/<id>/`. Each job saves `meta.json`, `prompt.txt`, `stdout`, `stderr`, `final.txt`, and `patch.diff`. Metadata and completed artifacts use atomic replacement; stdout and stderr are streamed to separate files. Metadata includes the owning server PID and process start time. Other servers can read jobs; execution and cancellation require ownership. Recovery and terminal worktree collection use the shared lock. Requeue creates a new record, so another server can retry a lost job without rewriting its history.
 
 The machine-wide limit defaults to eight running jobs and is enforced with an OS-managed cross-process mutex that automatically frees itself when its holder dies:
 - **Windows:** a named pipe (`\\.\pipe\agent-jobs-<sha8>`). `net.createServer().listen(...)` succeeds for exactly one process; contenders receive `EADDRINUSE`. The Windows kernel automatically releases the pipe when the holding process exits or crashes.
 - **Linux:** a Unix domain socket in the Linux abstract namespace (`\0agent-jobs-<sha8>`), also automatically freed by the kernel on process exit or crash.
 - **macOS:** a Unix domain socket file under the jobs home (`.agent-jobs-<sha8>.sock`). On `EADDRINUSE`, liveness is checked by attempting a connection: a connection refused indicates a stale holder, so the socket file is unlinked and acquisition retried.
 
-Diagnostic lock-file contents and paths are kept only for human-readable diagnostics. `question-claim` and `usage-cache` use this same OS-managed primitive keyed by their own names.
+While holding the machine mutex, `withLock` also acquires the legacy `lock` file with stale-owner reclamation and owner-checked release. The file lock remains required while any pre-69cdd0a server can run. Mutex keys use resolved real paths, with Windows case and separator normalization before hashing. `question-claim` and `usage-cache` use the same OS-managed primitive keyed by their own names.
 
 Jobs waiting for a slot stay queued. Running and queued jobs whose owner has died become `lost`; partial output remains available. When an orphan worker asks a question and an answer is published (via `publishAnswer`, through `tasks/update` or `codex_agent_answer`), recovery preserves and continues supervising that orphan until its process exits or its timeout passes, never terminating it merely because an answer exists. Recorded Windows descendants are checked against their saved start times before cleanup. Finished jobs older than seven days are pruned at startup. Usage-limit pauses are persisted in `pauses.json`; paused jobs retain reset times and retry after reset; without a reset they require explicit requeue. For a clock-only message such as "try again at 5:37 PM", a reset less than two hours in the past is treated as now plus 60 seconds, including messages received seconds after the named minute. If the retry still hits the limit, its fresh message pauses the job again. Older clock times (two hours or more in the past) resolve to tomorrow; future times remain today. A manual requeue supersedes the source job's automatic retry without clearing the connector/model pause.
 
@@ -207,7 +223,7 @@ Worktrees start from the recorded `HEAD` SHA, under `<root>.worktrees/<label>-<i
 
 After the job stops, collect with `remove: "none"`, `"worktree"`, or `"worktree+branch"`. Collection stages all files and diffs against the recorded base with `--binary`, capturing new files, binary files, and worker commits. It saves `patch.diff` before removal, returns a capped patch and full path, and reports removal failures. Applying the patch or merging the branch remains the caller's responsibility.
 
-Before removal, collection walks ordinary directories and unlinks junctions and symlinks, including nested and dangling links. It removes only each link, leaving its target untouched. A failed Git removal is retried with `core.longpaths=true`. Before the first removal attempt, `patch.diff.removal-attempted` saves the patch's stat summary. Later collections reuse the saved patch and summary, even after a restart, because a failed removal may have already deleted tracked files. Missing saved artifacts cause an error instead of collecting from a partially removed worktree.
+Before removal, collection walks ordinary directories and unlinks junctions and symlinks, including nested and dangling links. It removes only each link, leaving its target untouched. A failed Git removal is retried with `core.longpaths=true`. Before the first removal attempt, `patch.diff.removal-attempted` saves the patch's stat summary and hashes of tracked and untracked source files. Later collections reuse the saved patch and summary, even after a restart, because a failed removal may have already deleted tracked files. A removal retry refuses source changes, including partial deletion, so a reused worktree's newer edits cannot be deleted using an older patch. Inspect and preserve these edits before removing the worktree manually. Old markers without a snapshot also require manual removal if the worktree still exists. Missing saved artifacts cause an error instead of collecting from a partially removed worktree. After reconnect, any server for the same connector can collect a terminal job whose process cleanup is confirmed; queued, running, reserved, and other connectors' jobs remain protected.
 
 ## Wake delivery
 
@@ -217,7 +233,7 @@ Wakes use an MCP task when requested, else the external multi-agent hook-wait Po
 
 `codex_usage` reads the machine-wide usage cache, refreshing through a short-lived `codex app-server` without a model turn when due. If unavailable, it reads the newest `rate_limits` snapshot in `~/.codex/sessions` or uses the last cached parsed value. `source` is `live` or `session-log` (also present when unavailable), with `available` and optional `reason`. Successful reports include `snapshotAt` (ISO), `snapshotAgeSec`, `meter`, and `fiveHour` / `weekly` windows. Each window has `usedPercent`, `windowMinutes`, `resetsAt` (epoch seconds), `resetAtIso`, and `resetIn`. Reset credits are reported when supplied; they are never spent automatically.
 
-The vendor-neutral `getUsage(connector, probe, opts)` in `src/jobs/usage-cache.ts` stores `{ takenAt, ok, raw, parsed }` at `~/.agent-jobs/cache/<connector>-usage.json` (or under `AGENT_JOBS_HOME`). The default TTL is five minutes, extended to fifteen minutes on battery or after a failed probe. A failed probe retains the last parsed value, with `ok: false`. An OS-managed mutex keyed by the connector lock path allows one probe per connector across processes; other readers immediately return the last snapshot, even stale, or `undefined` when none exists. Probe timeouts must be shorter than lock acquisition deadlines. Windows power status is queried through `GetSystemPowerStatus`. The shared `cache/machine-power-usage.json` records power state with its own five-minute timestamp. A fresh battery state lets successful quota snapshots remain fresh for fifteen minutes and return before acquiring the usage lock; repeated readers neither re-query power nor move the quota snapshot timestamp. `opts` can supply `home`, `now`, `onBattery`, `ttlMs`, `backoffMs`, and `staleLockMs` for adapters and fake-only tests.
+The vendor-neutral `getUsage(connector, probe, opts)` in `src/jobs/usage-cache.ts` stores `{ takenAt, ok, raw, parsed }` at `~/.agent-jobs/cache/<connector>-usage.json` (or under `AGENT_JOBS_HOME`). The default TTL is fifteen minutes on AC and thirty minutes on battery. A failed probe retains the last successful disk snapshot and writes failure/backoff state to `<connector>-usage.failure.json`; callers still receive `ok: false` with the last parsed value. A successful probe replaces the snapshot and clears the failure record. With no successful snapshot, the first failure is stored in the main cache file. Failed probes back off for at least fifteen minutes. An OS-managed mutex keyed by the connector lock path allows one probe per connector across processes; other readers immediately return the cached result, even stale, or `undefined` when none exists. Probe timeouts must be shorter than lock acquisition deadlines. Windows power status is queried through `GetSystemPowerStatus`. The shared `cache/machine-power-usage.json` records power state with its own ten-minute timestamp. A fresh battery state lets successful quota snapshots remain fresh for the battery interval and return before acquiring the usage lock; repeated readers neither re-query power nor move the quota snapshot timestamp. `opts` can supply `home`, `now`, `onBattery`, `ttlMs`, `backoffMs`, and `staleLockMs` for adapters and fake-only tests.
 
 Codex `detect()`, `usagePercent()` and `codex_usage` share this cache. Detection derives authentication from the cached usage response and never runs `codex login status` independently. Explicit signed-out responses report unavailable; an unknown or failed usage response fails open and observes the fifteen-minute backoff. The existing live-usage reader does not distinguish every auth failure from other unavailable responses. Agy and external quota-meter readers must adopt `getUsage` in their own port to share this coordination; this patch changes the Codex consumers only.
 
@@ -247,7 +263,7 @@ Cooperative cancellation gets a three-second interrupt grace followed by a separ
 
 Codex reasoning is saved in the `reasoning` job file, retaining the most recent 256 KiB. It is omitted from results by default: set `includeReasoning` on `agent_result` for its last 4,000 characters, or `showReasoning` on `agent_follow` to use the latest sentence for progress. `agent_read` can page through the file.
 
-`agent` accepts `stallTimeoutMin` (default 10, zero disables detection) and `onStall` (`report`, the default, or `kill`). A stall means neither output file grew within the interval. Status and results expose `stalled` and `stalledSince`; output clears the flag. The kill option stops the worker with reason `stalled`, allowing requeue. Follow-ups and requeues inherit these settings.
+`agent` accepts `stallTimeoutMin` (default 10, zero disables detection) and `onStall` (`report`, the default, or `kill`). A stall means no meaningful output arrived within the interval. Connectors can classify notification lines with `isNoise`; Codex excludes `skills/changed`, `account/rateLimits/updated`, and `mcpServer/startupStatus/updated`. These notifications neither reset the timer nor clear a reported stall. Connectors without this classifier also count output file growth. Status and results expose `stalled` and `stalledSince`; meaningful output clears the flag. The kill option stops the worker with reason `stalled`, allowing requeue. Follow-ups and requeues inherit these settings and the original job label.
 
 Waiting for approval resets the stall clock on every sample, and an approval response starts a fresh interval. MCP task status notifications track the derived status, including `working` to `input_required` and back. Modern (`2026-07-28`) cancellation returns a task projection with `ttlMs` and `pollIntervalMs`; a terminal `tasks/get` returns the completed result payload. Explicit failure reasons and `lost` take precedence over authentication text, whose fallback matching uses whole words.
 
@@ -256,13 +272,13 @@ The external multi-agent hook-wait PostToolUse hook owns `jobs/<id>/woken` and p
 
 Jobs started or adopted as MCP tasks carry `mcp-task.json`: the task provides their wake and the hook skips them. Returning to queued or running clears the per-attempt `woken` and `collected` markers.
 
-`agent` accepts an optional `idempotencyKey`; a matching connector and key created within 24 hours returns the existing job. `priority` defaults to `normal`; `optional` starts are rejected when either the five-hour or weekly usage window reaches `usageCeiling` (default 90 percent). The optional-start guard reads the shared usage cache; unknown usage permits the start. Codex uses the same live snapshot as detection and `codex_usage`, with a session-log fallback when live usage is unavailable.
+`agent` accepts an optional `idempotencyKey`; a matching connector and key created within 24 hours returns the existing job. `priority` defaults to `normal`; `optional` starts are rejected when either the five-hour or weekly usage window reaches `usageCeiling` (default 90 percent). The optional-start guard passes the resolved model, including configured defaults and inherited follow-up models, to `Connector.usagePercent(model)` and caches each model independently for five minutes. Unknown usage permits the start. Codex uses the same live snapshot as detection and `codex_usage`, with a session-log fallback when live usage is unavailable.
 
 Stopped jobs expose `failureReason` for quota exhaustion, timeout, cancellation, stalls, authentication, CLI errors, failed cleanup, lost ownership, superseding, and failed verification. `partial: true` indicates output without a final answer or an interrupted run. A completed job with failed verification can be requeued. Verification uses Git Bash on Windows, selected by `AGENT_JOBS_BASH`, then `CLAUDE_CODE_GIT_BASH_PATH`, Git's installation, or Program Files; POSIX uses bash. Git worktree operations allow ten minutes per command and failed creation cleans up its partial worktree and branch.
 
 For `codex_agent_answer`, pass the `qid` shown in `awaitingInput` or the watch status to reject answers intended for an older question. Omitting it answers the current question; the response includes the `qid` answered, even if the question arrived after the last status read. Bridge questions can be answered by another server; app-server approvals require the owning server.
 
-Native and bridge questions share a per-job claim. A second question receives an "already awaiting an answer" error; it can be retried after the first clears. Claims expire at the question timeout; malformed claims expire after 30 minutes. If a server disappears while a matching file-based question remains unanswered, orphan recovery waits until an answer is written or the question expires, then resumes its usual cleanup; answering does not transfer ownership of the worker.
+Native and bridge questions share a per-job claim and OS mutex. A second question receives an "already awaiting an answer" error while the first bridge holds that mutex; it can be retried after the first clears. A claim left by a dead bridge is immediately reclaimable once its mutex is free, even before the file's timeout. Local claims expire at the question timeout; malformed local claims expire after 30 minutes. If a server disappears while a matching file-based question remains unanswered, orphan recovery preserves its worker through the answer until the worker exits or its wall-clock timeout passes; answering does not transfer ownership of the worker. Once that worker is confirmed gone and cleanup succeeds, a nonempty `final.txt` recovers it as completed. Its exit code is unavailable after reconnect; without final output it remains lost.
 
 
 ## Stability and cost rules (W1)
@@ -304,3 +320,14 @@ Windows Terminal is the default terminal, and a console program started with a n
 ### Legacy tools
 
 `ask-codex`, `batch-codex`, `review-changes`, `do-act`, `brainstorm`, `fetch-chunk`, `timeout-test`, `image-gen`, `list-skills`, `list-sessions`, `help`, `ping` and `version` are registered only when `CODEX_MCP_LEGACY_TOOLS=1`. `health`, `codex_usage`, `codex_selftest`, `codex_debug_log` and all `codex_agent*` tools always register.
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| Connector | Adapter that launches and parses one CLI, such as Codex or agy. |
+| Job | Durable queue record for one worker run. |
+| Mutex | OS resource that permits one holder for a shared lock key. |
+| Owner | Server process identity, recorded as PID and process start time. |
+| Reserved | A job that still holds a machine slot pending process cleanup. |
+| Worktree | Isolated Git checkout associated with a job and its saved patch. |

@@ -6,9 +6,56 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fixture, until } from './test-helpers.js';
 import { currentOwner } from './proc.js';
-import { lockTestHooks, reclaimStale, withLock } from './lock.js';
+import { lockTestHooks, mutexAddress, reclaimStale, tryAcquire, withLock } from './lock.js';
 
 const deadLock = JSON.stringify({ pid: 999999, startTime: 'gone', token: 'dead' });
+
+test('withLock excludes a live legacy file-lock holder without overwriting it', async () => {
+  const f = fixture();
+  const path = join(f.home, 'lock');
+  const legacy = JSON.stringify({ ...await currentOwner(), token: 'legacy' });
+  try {
+    assert.equal(tryAcquire(path, legacy), true);
+    await assert.rejects(withLock(f.home, () => assert.fail('overlapped legacy holder'), 100), /Timed out/);
+    assert.equal(readFileSync(path, 'utf8'), legacy);
+  } finally { f.cleanup(); }
+});
+
+test('withLock publishes a legacy-compatible owner and releases both locks after errors', async () => {
+  const f = fixture();
+  try {
+    const owner = await currentOwner();
+    await assert.rejects(withLock(f.home, () => {
+      const held = JSON.parse(readFileSync(join(f.home, 'lock'), 'utf8'));
+      assert.equal(held.pid, owner.pid);
+      assert.equal(held.startTime, owner.startTime);
+      assert.equal(tryAcquire(join(f.home, 'lock'), 'old server'), false);
+      throw new Error('action failed');
+    }), /action failed/);
+    assert.equal(existsSync(join(f.home, 'lock')), false);
+    assert.equal(await withLock(f.home, () => 'released', 100), 'released');
+  } finally { f.cleanup(); }
+});
+
+test('withLock release preserves a replacement file owned by another holder', async () => {
+  const f = fixture();
+  try {
+    await withLock(f.home, () => writeFileSync(join(f.home, 'lock'), '{replacement'));
+    assert.equal(readFileSync(join(f.home, 'lock'), 'utf8'), '{replacement');
+  } finally { f.cleanup(); }
+});
+
+test('mutex address resolves relative keys before hashing', () => {
+  assert.equal(mutexAddress('relative-lock'), mutexAddress(join(process.cwd(), 'relative-lock')));
+});
+
+test('mutex address canonicalizes Windows case and separator variants', { skip: process.platform !== 'win32' }, () => {
+  const f = fixture();
+  try {
+    for (const key of [f.home, join(f.home, 'not-created-yet')])
+      assert.equal(mutexAddress(key), mutexAddress(key.toUpperCase().replace(/\\/g, '/')));
+  } finally { f.cleanup(); }
+});
 
 test(
   'a live legacy .reap sentinel neither blocks nor is touched when reclaiming a stale lock',
@@ -150,6 +197,8 @@ test('when a lock holder is killed mid-critical-section, the next waiter gets th
   const lockModule = new URL('./lock.js', import.meta.url).href;
   const holderEntered = join(f.home, 'holder.entered');
   const waiterAcquired = join(f.home, 'waiter.acquired');
+  const waiterReady = join(f.home, 'waiter.ready');
+  const procModule = new URL('./proc.js', import.meta.url).href;
 
   const holderCode = `
     import { withLock } from ${JSON.stringify(lockModule)};
@@ -163,8 +212,12 @@ test('when a lock holder is killed mid-critical-section, the next waiter gets th
 
   const waiterCode = `
     import { withLock } from ${JSON.stringify(lockModule)};
+    import { currentOwner } from ${JSON.stringify(procModule)};
     import { writeFileSync } from 'node:fs';
-    const [home, signal] = process.argv.slice(1);
+    const [home, signal, ready] = process.argv.slice(1);
+    // Windows process identity initialization launches PowerShell; exclude startup from lock handoff timing.
+    await currentOwner();
+    writeFileSync(ready, 'ready');
     await withLock(home, async () => {
       writeFileSync(signal, String(Date.now()));
     });
@@ -177,7 +230,7 @@ test('when a lock holder is killed mid-critical-section, the next waiter gets th
     });
     await until(() => existsSync(holderEntered), 'holder entered critical section', 5000);
 
-    const waiter = spawn(process.execPath, ['--input-type=module', '-e', waiterCode, f.home, waiterAcquired], {
+    const waiter = spawn(process.execPath, ['--input-type=module', '-e', waiterCode, f.home, waiterAcquired, waiterReady], {
       stdio: 'inherit',
       windowsHide: true,
     });
@@ -185,7 +238,7 @@ test('when a lock holder is killed mid-critical-section, the next waiter gets th
       waiter.on('close', code => (code === 0 ? resolve() : reject(new Error(`Waiter exited ${code}`))));
     });
 
-    await new Promise(r => setTimeout(r, 50));
+    await until(() => existsSync(waiterReady), 'waiter initialized', 5000);
     const killTime = Date.now();
     holder.kill();
 
@@ -193,7 +246,9 @@ test('when a lock holder is killed mid-critical-section, the next waiter gets th
     const acquiredTime = Number(readFileSync(waiterAcquired, 'utf8'));
     const waitDuration = acquiredTime - killTime;
 
-    assert.ok(waitDuration < 100, `Waiter took too long to acquire: ${waitDuration}ms`);
+    // Full Windows runs contend for disk and process scheduling; still reject any stale-lock grace period.
+    const maxHandoffMs = process.platform === 'win32' ? 1000 : 100;
+    assert.ok(waitDuration < maxHandoffMs, `Waiter took too long to acquire: ${waitDuration}ms`);
 
     await waiterDone;
   } finally {

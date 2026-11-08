@@ -88,6 +88,60 @@ test('failed removal retries preserve the original patch after partial deletion'
   } finally { f.cleanup(); }
 });
 
+test('collection retry refuses removal when a reused worktree contains newer edits', async t => {
+  let failRemoval = true;
+  let removes = 0;
+  const f = setup(t, args => {
+    if (args.includes('remove')) { removes++; return failRemoval ? { error: 'locked file' } : {}; }
+    if (args.includes('ls-files')) return { out: 'tracked.txt\0' };
+    return { out: args.includes('diff') ? 'original patch\n' : '' };
+  });
+  try {
+    writeFileSync(join(f.worktree.path, 'tracked.txt'), 'original edit');
+    const first = await collectWorktree(f.worktree, f.patch, 'worktree', f.home);
+    assert.match(first.removalError!, /locked file/);
+    const attempts = removes;
+    writeFileSync(join(f.worktree.path, 'tracked.txt'), 'newer edit from replacement');
+    failRemoval = false;
+    const second = await collectWorktree(JSON.parse(JSON.stringify(f.worktree)), f.patch, 'worktree', f.home);
+    assert.equal(second.removed, false);
+    assert.match(second.removalError!, /changed|newer/i);
+    assert.equal(removes, attempts, 'never call destructive Git removal with a stale saved patch');
+    assert.equal(readFileSync(join(f.worktree.path, 'tracked.txt'), 'utf8'), 'newer edit from replacement');
+    assert.equal(readFileSync(f.patch, 'utf8'), 'original patch\n');
+  } finally { f.cleanup(); }
+});
+
+test('collection retry removes an unchanged worktree using the saved patch', async t => {
+  let failRemoval = true;
+  const f = setup(t, args => {
+    if (args.includes('remove') && failRemoval) return { error: 'locked file' };
+    if (args.includes('ls-files')) return { out: 'tracked.txt\0' };
+    return { out: args.includes('diff') ? 'saved changes\n' : '' };
+  });
+  try {
+    writeFileSync(join(f.worktree.path, 'tracked.txt'), 'same edit');
+    assert.ok((await collectWorktree(f.worktree, f.patch, 'worktree', f.home)).removalError);
+    failRemoval = false;
+    const retry = await collectWorktree(f.worktree, f.patch, 'worktree', f.home);
+    assert.equal(retry.removed, true);
+    assert.equal(retry.removalError, undefined);
+    assert.equal(readFileSync(f.patch, 'utf8'), 'saved changes\n');
+  } finally { f.cleanup(); }
+});
+
+test('legacy removal markers without a snapshot cannot delete a remaining worktree', async t => {
+  const f = setup(t, () => ({}));
+  try {
+    writeFileSync(f.patch, 'old patch');
+    writeFileSync(`${f.patch}.removal-attempted`, JSON.stringify({ stat: 'old stat' }));
+    const result = await collectWorktree(f.worktree, f.patch, 'worktree', f.home);
+    assert.equal(result.removed, false);
+    assert.match(result.removalError!, /without a snapshot/);
+    assert.equal(f.calls.some(args => args.includes('remove')), false);
+  } finally { f.cleanup(); }
+});
+
 test('removal unlinks junctions without touching outside targets and retries with longpaths', async t => {
   let attempts = 0;
   let linksPresent = false;

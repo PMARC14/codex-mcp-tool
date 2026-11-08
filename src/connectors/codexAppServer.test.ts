@@ -106,6 +106,30 @@ function setup() {
   return { ...f, manager, messages, ready, cleanup: async () => { await manager.dispose(); f.cleanup(); } };
 }
 
+test('trusted app-server honors requested approvals while full always bypasses them', async () => {
+  for (const mode of ['trusted', 'full'] as const) {
+    for (const approvals of [undefined, 'never', 'on-request'] as const) {
+      const writes: any[] = [];
+      const job = { id: 'fake', connector: 'codex', prompt: 'hi', cwd: '/fake', mode, approvals, timeoutMin: 1, finalPath: '/fake/final' };
+      const handler = buildAppServer(job, '/fake').stdinPlan({ apply(action) { if (action.write) writes.push(JSON.parse(action.write)); }, emit() {} });
+      try {
+        handler(JSON.stringify({ id: 1, result: {} }), 'stdout');
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const thread = writes.find(m => m.method === 'thread/start');
+        assert.equal(thread.params.approvalPolicy, mode === 'full' ? 'never' : (approvals ?? 'never'));
+      } finally { handler.dispose!(); }
+    }
+  }
+});
+
+test('Codex connector classifies only background app-server notifications as noise', () => {
+  const connector = new CodexConnector();
+  for (const method of ['skills/changed', 'account/rateLimits/updated', 'mcpServer/startupStatus/updated'])
+    assert.equal(connector.isNoise(JSON.stringify({ method, params: {} })), true);
+  for (const line of ['plain stderr', '{bad', JSON.stringify({ method: 'item/agentMessage/delta' }), JSON.stringify({ id: 9, method: 'skills/changed' })])
+    assert.equal(connector.isNoise(line), false);
+});
+
 test('app-server start, final, reasoning, resume and inherited transport on send/requeue', async () => {
   const f = setup();
   try {
@@ -271,7 +295,7 @@ test('approval session, decline and cancel decisions follow command and permissi
   }
 });
 
-test('app-server settings match sandbox modes and trusted/full never approve', () => {
+test('app-server settings match sandbox modes and default to never approving', () => {
   for (const mode of ['read', 'write', 'trusted', 'full'] as const) {
     const job: JobSpec = { id: 'test', connector: 'codex', prompt: 'hello', cwd: '/repo', mode, timeoutMin: 1, finalPath: '/final' };
     const command = buildAppServer(job, '/fake');

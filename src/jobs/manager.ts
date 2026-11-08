@@ -109,7 +109,7 @@ export class JobManager {
   private readonly kill: typeof killTree;
   private readonly resolveVerifyShell: typeof verifyShell;
   private cleanupTried = new Map<string, number>();
-  private usageCache?: { at: number; value: number | undefined };
+  private usageCache = new Map<string | undefined, { at: number; value: number | undefined }>();
   private readonly watchShutdown = new AbortController();
 
   constructor(
@@ -158,6 +158,7 @@ export class JobManager {
   // Must run under the shared lock. The slot and the identities needed to retry the cleanup are
   // only dropped once the tree is confirmed dead; a later recovery pass retries the same record.
   private async recoverOrphan(job: JobMeta, now: number): Promise<void> {
+    let recoveredFinal = false;
     // A worker that was waiting on a file-based question survives its server and can still be
     // answered by a replacement. It is preserved (and flagged, so an answer does not end the
     // preservation) until its process exits or its wall-clock timeout passes.
@@ -182,7 +183,8 @@ export class JobManager {
         }
       }
       const timedOut = now > (job.startedAt ?? job.createdAt) + job.timeoutMin * 60000;
-      if (preserve && !timedOut && (!job.process || (await ownerAlive(job.process)))) {
+      const workerAlive = !job.process || await ownerAlive(job.process);
+      if (preserve && !timedOut && workerAlive) {
         let changed = !job.orphanPreserved;
         job.orphanPreserved = true;
         if (job.awaitingInput && existsSync(join(dir, `answer-${job.awaitingInput.qid}.json`))) {
@@ -192,6 +194,10 @@ export class JobManager {
         if (changed) this.store.write(job);
         return;
       }
+      // A preserved worker can finish after being answered without a server to settle its record.
+      // Its exit code is unavailable after reconnect; a published final answer is the completion evidence.
+      if (preserve && !timedOut && !workerAlive)
+        recoveredFinal = !!readFileSync(job.finalPath, 'utf8').trim();
     }
     if (job.state === 'lost' && now - (this.cleanupTried.get(job.id) ?? 0) < 2000) return;
     this.cleanupTried.set(job.id, now);
@@ -203,9 +209,10 @@ export class JobManager {
     this.store.write({
       ...job,
       ...(job.connector === this.connector.id ? { owner: this.owner, managerId: this.id } : {}),
-      state: 'lost',
+      state: recoveredFinal && confirmed ? 'completed' : 'lost',
       reserved: !confirmed,
-      reason: 'owner_gone',
+      reason: recoveredFinal && confirmed ? undefined : 'owner_gone',
+      ...(recoveredFinal && confirmed ? { awaitingInput: undefined, orphanPreserved: undefined } : {}),
       finishedAt: job.finishedAt ?? now,
     });
     if (confirmed) this.cleanupTried.delete(job.id);
@@ -296,17 +303,20 @@ export class JobManager {
         const existing = this.store.list().find(job => job.connector === connector && job.idempotencyKey === options.idempotencyKey && Date.now() - job.createdAt < 86400000);
         if (existing) return { jobId: existing.id, state: existing.state, warning: undefined };
       }
+      const original = followUpOf ? this.store.get(followUpOf) : undefined;
+      const model = this.selectModel(options.model ?? original?.model, connector);
       if (options.priority === 'optional' && connector === this.connector.id) {
-        if (!this.usageCache || Date.now() - this.usageCache.at >= 300000) {
+        let usage = this.usageCache.get(model);
+        if (!usage || Date.now() - usage.at >= 300000) {
           let value: number | undefined;
-          try { value = await this.connector.usagePercent?.(); } catch { /* fail open */ }
-          this.usageCache = { at: Date.now(), value };
+          try { value = await this.connector.usagePercent?.(model); } catch { /* fail open */ }
+          usage = { at: Date.now(), value };
+          this.usageCache.set(model, usage);
         }
-        if (this.usageCache.value !== undefined && this.usageCache.value >= (this.config.usageCeiling ?? 90))
-          throw new Error(`Optional job refused: 5-hour or weekly usage window is at ${this.usageCache.value}% (ceiling ${this.config.usageCeiling ?? 90}%)`);
+        if (usage.value !== undefined && usage.value >= (this.config.usageCeiling ?? 90))
+          throw new Error(`Optional job refused: 5-hour or weekly usage window is at ${usage.value}% (ceiling ${this.config.usageCeiling ?? 90}%)`);
       }
       const id = randomUUID();
-      const model = followUpOf ? undefined : this.selectModel(options.model);
       const worktree = options.worktree
         ? await createWorktree(options.cwd, options.label, id, this.connector.id, this.config.home)
         : undefined;
@@ -365,6 +375,7 @@ export class JobManager {
             mode: options.mode ?? original.mode,
             model: this.selectModel(options.model ?? original.model, original.connector),
             effort: options.effort ?? original.effort,
+            label: options.label ?? original.label,
             timeoutMin: options.timeoutMin ?? original.timeoutMin,
             stallTimeoutMin: options.stallTimeoutMin ?? original.stallTimeoutMin ?? 10,
             onStall: options.onStall ?? original.onStall ?? 'report',
@@ -747,7 +758,13 @@ export class JobManager {
         },
         onClosed,
         onEvent: receive,
-        onLine: (line, stream) => receive(this.connector.parse(line, stream)),
+        onLine: (line, stream) => {
+          if (!this.connector.isNoise?.(line)) {
+            lastGrowth = Date.now();
+            if (job.stalled) { job.stalled = false; job.stalledSince = undefined; this.store.save(job, this.owner); }
+          }
+          receive(this.connector.parse(line, stream));
+        },
       });
       const finished = process.done
         .then(async outcome => {
@@ -821,7 +838,8 @@ export class JobManager {
         if (workerDone || job.state !== 'running' || !(job.stallTimeoutMin ?? 10) || stalledKill) return;
         const current = [statSync(this.store.path(job.id, 'stdout')).size, statSync(this.store.path(job.id, 'stderr')).size];
         const now = Date.now();
-        if (current[0] > sizes[0] || current[1] > sizes[1]) {
+        // Connectors that classify notifications track progress on complete, non-noise lines.
+        if (!this.connector.isNoise && (current[0] > sizes[0] || current[1] > sizes[1])) {
           lastGrowth = now;
           if (job.stalled) { job.stalled = false; job.stalledSince = undefined; this.store.save(job, this.owner); }
         }
@@ -1130,8 +1148,8 @@ export class JobManager {
       if (!job.worktree) throw new Error('This job has no worktree');
       if (job.state === 'running' || job.reserved || job.state === 'queued')
         throw new Error('Wait for the job to stop before collecting its worktree');
-      if (!this.owns(job))
-        throw new Error('Only the owning server can collect this job; requeue a lost job first');
+      if (job.connector !== this.connector.id || (!this.owns(job) && !terminal(job)))
+        throw new Error('Only the same connector can collect a terminal job; non-terminal jobs require the owning server');
       // Requeue copies the worktree reference, so every job that points at it must be idle.
       // A paused job that was requeued will never resume and does not count.
       const sharing = this.store
@@ -1145,7 +1163,7 @@ export class JobManager {
         throw new Error(`Job ${busy.id} still uses this worktree; wait for it to stop first`);
       const result = await collectWorktree(job.worktree, this.store.path(jobId, 'patch'), remove, this.config.home);
       if (job.worktree.removed && job.state === 'paused') job.pauseCleared = true;
-      this.store.save(job, this.owner);
+      this.store.write(job);
       if (job.worktree.removed)
         for (const other of sharing) {
           if (!other.worktree) continue;

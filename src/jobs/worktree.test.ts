@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fixture } from './test-helpers.js';
+import { fixture, fakeConnector, meta } from './test-helpers.js';
+import { JobManager } from './manager.js';
 import { runCommand, runCommandBuffer } from './proc.js';
 import { createWorktree, collectWorktree, sanitizeLabel } from './worktree.js';
 
@@ -28,6 +29,30 @@ async function repo(home: string) {
   await git('commit', '-m', 'base');
   return { root, git };
 }
+
+test('reconnected same-connector server collects terminal jobs but refuses foreign or active jobs', async () => {
+  const f = fixture();
+  const manager = new JobManager(fakeConnector(f.script), f.config);
+  try {
+    await manager.initialize();
+    const { root } = await repo(f.home);
+    const worktree = await createWorktree(root, 'reconnect', 'reconnect', 'codex', f.home);
+    const job = meta(f.home, { id: 'old-server', state: 'completed', worktree,
+      owner: { pid: 2147483647, startTime: 'old' }, managerId: 'previous-server' });
+    manager.store.create(job, 'first');
+    writeFileSync(join(worktree.path, 'tracked.txt'), 'collected after reconnect\n');
+    const result = await manager.collect(job.id);
+    assert.match(result.patch, /collected after reconnect/);
+    manager.store.write({ ...manager.store.get(job.id), connector: 'agy' });
+    await assert.rejects(manager.collect(job.id), /connector|owning server/);
+    manager.store.write({ ...manager.store.get(job.id), connector: 'codex', state: 'running' });
+    await assert.rejects(manager.collect(job.id), /stop before collecting/);
+    manager.store.write({ ...manager.store.get(job.id), state: 'completed', reserved: true });
+    await assert.rejects(manager.collect(job.id), /stop before collecting/);
+    manager.store.write({ ...manager.store.get(job.id), reserved: false });
+    await manager.collect(job.id, 'worktree+branch');
+  } finally { await manager.dispose(); f.cleanup(); }
+});
 
 test('create and collect preserve new files, binary files and worker commits before removal', async () => {
   const f = fixture();

@@ -308,10 +308,11 @@ test('a cross-connector retry starts a fresh native session', async () => {
 test('a structurally invalid claim expires by file age instead of never', () => {
   const dir = scratch();
   try {
+    assert.equal(claimQuestion(dir, { owner: 'bridge', id: 'first', ts: Date.now(), timeoutMs: 60000 }), true);
     writeFileSync(join(dir, 'question.lock'), '{}');
-    assert.equal(claimQuestion(dir, { owner: 'bridge', id: 'a', ts: Date.now(), timeoutMs: 1000 }), false); // fresh garbage still holds
+    assert.equal(claimQuestion(dir, { owner: 'bridge', id: 'a', ts: Date.now(), timeoutMs: 1000 }), false); // a live mutex still holds
     const old = new Date(Date.now() - 31 * 60 * 1000);
     utimesSync(join(dir, 'question.lock'), old, old);
     assert.equal(claimQuestion(dir, { owner: 'bridge', id: 'a', ts: Date.now(), timeoutMs: 1000 }), true);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { releaseQuestion(dir, 'a'); rmSync(dir, { recursive: true, force: true }); }
 });

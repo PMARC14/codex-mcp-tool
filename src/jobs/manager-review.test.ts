@@ -86,6 +86,28 @@ test('approval waiting and response restart the stall clock', { skip: process.pl
   } finally { await f.cleanup(); }
 });
 
+test('noise-only worker output flags a stall and only meaningful output clears it', { skip: process.platform !== 'win32' }, async t => {
+  const f = await setup(t);
+  Object.assign(f.manager.connector, { isNoise: (line: string) => JSON.parse(line).method === 'skills/changed' });
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  f.job.onStall = 'report';
+  try {
+    for (let i = 0; i < 4; i++) {
+      now += 20000;
+      f.children[0].stdout.emit('data', '{"method":"skills/changed"}\n');
+      f.active.sample();
+    }
+    assert.equal(f.job.stalled, true);
+    f.children[0].stdout.emit('data', '{"method":"skills/changed"}\n');
+    f.active.sample();
+    assert.equal(f.job.stalled, true, 'noise must not clear a reported stall');
+    f.children[0].stdout.emit('data', '{"method":"item/agentMessage/delta"}\n');
+    f.active.sample();
+    assert.equal(f.job.stalled, false);
+  } finally { await f.cleanup(); }
+});
+
 test('orphan recorder owns lost jobs and can retry cleanup', async () => {
   const f = fixture();
   let fail = true;

@@ -109,7 +109,10 @@ export interface Connector {
   refreshUsage?(): Promise<void>;
   detect(): Promise<{ available: boolean; reason?: string; version?: string; exe?: string }>;
   models(): Promise<string[]>;
-  usagePercent?(): Promise<number | undefined>;
+  /** Usage for the resolved model's quota pool; omitted model means the connector default. */
+  usagePercent?(model?: string): Promise<number | undefined>;
+  /** Background notifications that do not count as worker progress for stall detection. */
+  isNoise?(line: string): boolean;
   build(job: JobSpec): { exe: string; args: string[]; stdin: string; stdinPlan?: StdinPlan };
   parse(line: string, stream: 'stdout' | 'stderr'): JobEvent | null;
   sandboxDirs(job: JobSpec): string[];

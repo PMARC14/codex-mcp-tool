@@ -152,7 +152,7 @@ export function buildAppServer(job: JobSpec, exe: string, bridge = codexBridge(j
     const settings = {
       cwd: job.cwd, model: job.model,
       sandbox: { read: 'read-only', write: 'workspace-write', trusted: 'danger-full-access', full: 'danger-full-access' }[job.mode],
-      approvalPolicy: job.mode === 'trusted' || job.mode === 'full' ? 'never' : (job.approvals ?? 'never'),
+      approvalPolicy: job.mode === 'full' ? 'never' : (job.approvals ?? 'never'),
       config: {
         ...bridge.config,
         ...(job.effort ? { model_reasoning_effort: job.effort } : {}),

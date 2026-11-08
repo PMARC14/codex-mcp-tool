@@ -1,4 +1,5 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { safeSpawn } from './proc.js';
 import { readConfig } from './config.js';
@@ -149,6 +150,7 @@ export async function collectWorktree(
   if (worktree.removed) throw new Error(`Worktree already removed; saved patch: ${patchPath}`);
   const removalMarker = `${patchPath}.removal-attempted`;
   const previousRemoval = existsSync(removalMarker);
+  let snapshot: Record<string, string> | undefined;
   let group: Awaited<ReturnType<typeof gitGroup>> | undefined;
   let raw: Buffer;
   let stat: string;
@@ -156,7 +158,9 @@ export async function collectWorktree(
     // A failed Git removal may already have deleted tracked files, or even .git.
     // The durable marker also protects retries after a server restart.
     raw = readFileSync(patchPath);
-    stat = JSON.parse(readFileSync(removalMarker, 'utf8')).stat;
+    const marker = JSON.parse(readFileSync(removalMarker, 'utf8'));
+    stat = marker.stat;
+    snapshot = marker.snapshot;
   } else {
     group = await gitGroup(worktree.path, home);
     await group.text(worktree.path, 'add', '-A');
@@ -168,7 +172,19 @@ export async function collectWorktree(
   let removalError: string | undefined;
   if (remove !== 'none') {
     try {
-      if (!previousRemoval) atomicWrite(removalMarker, JSON.stringify({ stat }));
+      if (previousRemoval && existsSync(worktree.path)) {
+        if (!snapshot) throw new Error('Cannot safely retry removal without a snapshot; preserve newer edits and remove the worktree manually');
+        group = await gitGroup(worktree.path, home);
+        const current = await collectionSnapshot(group, worktree.path);
+        // Partial deletion and later worker edits are indistinguishable; either needs manual inspection.
+        if (Object.keys(current).length !== Object.keys(snapshot).length ||
+          Object.entries(current).some(([path, hash]) => snapshot![path] !== hash))
+          throw new Error('Worktree changed after the saved patch; preserve newer edits before removing it manually');
+      }
+      if (!previousRemoval) {
+        snapshot = await collectionSnapshot(group!, worktree.path);
+        atomicWrite(removalMarker, JSON.stringify({ stat, snapshot }));
+      }
       group ??= await gitGroup(worktree.root, home);
       await removeWorktree(group, worktree.root, worktree.path);
       worktree.removed = true;
@@ -186,4 +202,21 @@ export async function collectWorktree(
     removed: worktree.removed ?? false,
     removalError,
   };
+}
+
+/** Snapshot tracked and untracked source files without traversing ignored dependency trees or links. */
+async function collectionSnapshot(group: Awaited<ReturnType<typeof gitGroup>>, path: string): Promise<Record<string, string>> {
+  const files = await group.buffer(path, 'ls-files', '-z', '--cached', '--others', '--exclude-standard');
+  const snapshot: Record<string, string> = Object.create(null);
+  for (const name of files.toString('utf8').split('\0').filter(Boolean)) {
+    const file = join(path, name);
+    try {
+      const entry = lstatSync(file);
+      const content = entry.isSymbolicLink() ? `link:${readlinkSync(file)}` : entry.isFile() ? readFileSync(file) : 'directory';
+      snapshot[name] = createHash('sha256').update(content).digest('hex');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  return snapshot;
 }

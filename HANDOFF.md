@@ -1,6 +1,6 @@
 # Handoff: codex-mcp-tool (fork, branch `agent-standard`)
 
-**What it is.** An MCP server that lets Claude Code run Codex CLI as background agents. Forked from trishchuk/codex-mcp-tool (base `ab1238f5`, 2026-09-30); about 60–70% of the source is now ours. `src/jobs/` is the **canonical shared jobs module**. Sync it to the agy fork with `bash scripts/sync-jobs.sh`; `src/jobs/sync.test.ts` fails until the copies match.
+An MCP server that lets Claude Code run Codex CLI as background agents. `src/jobs/` is the canonical shared jobs module. Sync it to the agy fork with `bash scripts/sync-jobs.sh`; the sibling-sync check fails until the copies match.
 
 **Tools:**
 - `codex_agent` (launch; an MCP task that shows in `/tasks` and wakes Claude);
@@ -20,13 +20,42 @@ The legacy tools load only with `CODEX_MCP_LEGACY_TOOLS=1`.
 
 **Docs:** `docs/agent-jobs.md` (full), `docs/job-surface-audit.md`, `README.md`.
 
-**State (2026-11-07, evening):**
-- Panel round 1 (`602b3d6`), round 2 (`69cdd0a`: named-pipe OS mutex in `lock.ts`, launcher by default in `safeSpawn`, orphan-answer supervision) and the channel removal (`0dbba35`: `claude-agents` / `CLAUDE_AGENTS` / `channel.ts` gone) are in. 221/221 tests from a clean `dist`.
-- **Live-tested in plain `claude`:** start, steer (`app-server`, delivered mid-turn), ask-back via `ask_orchestrator` (hook wake, answer, re-arm) and finish, one wake each.
-- **Mixed versions are unsafe:** round 2's `withLock` takes the pipe mutex and overwrites the `lock` file, so an older-build server (another open session) is not excluded. Reconnect or restart every session that loads this server after updating.
-- Claude Code occasionally falls back to the pre-task protocol for one server (`initialize` after `server/discover`; 24 of 433 codex sessions). Such a session gets plain jobs, which the hook covers.
-- Round 2 left dead helpers in `lock.ts` (`reclaimStale`, `releaseOwned`, `tryAcquire`, `staleContent`, now unused by `withLock`) and stripped some rationale comments. Remove or restore in the next pass.
+**Core fixes and regression tests:**
 
-**Next project:** extract `src/jobs` + `src/tools/{mcp-tasks,traffic-log,debug-tools,client-schemas}` + `src/bridge` into one standalone `agent-jobs` package or server, with Codex and agy as connectors. That drops the fork history, the sync script and the legacy tools. Upstream PRs are no longer practical; the changes are too large.
+| Fix | Implementation | Regression test |
+| --- | --- | --- |
+| 1. Mixed-version exclusion | `lock.ts:363`: pipe mutex plus legacy file protocol; owner-checked release of both. | `withLock excludes a live legacy file-lock holder without overwriting it` |
+| 2. Canonical mutex keys | `lock.ts:30`: resolve real paths and existing ancestors; normalize Windows case/separators. | `mutex address canonicalizes Windows case and separator variants` |
+| 3. Collection after reconnect | `manager.ts:1144`: same-connector terminal collection under the shared lock. | `reconnected same-connector server collects terminal jobs but refuses foreign or active jobs` |
+| 4. Trusted approvals | `codexAppServer.ts:155`: only full forces never. | `trusted app-server honors requested approvals while full always bypasses them` |
+| 5. Meaningful stall progress | `manager.ts:761`, `codex.ts:30`: background notifications do not reset or clear stalls. | `noise-only worker output flags a stall and only meaningful output clears it` |
+| 6. Model quota pools | `connector.ts`, `manager.ts:306`: pass resolved models; cache per model. | `optional quota guard resolves models and caches each model independently` |
+| 7. Resume labels | `manager.ts:378`: resumed jobs inherit the label; requeue preserves it. | `resume and requeue inherit the original job label` |
+| 8a. Safe removal retry | `worktree.ts:178`: refuse changed files or legacy markers without snapshots. | `collection retry refuses removal when a reused worktree contains newer edits` |
+| 8b. Orphan final recovery | `manager.ts:200`: recover final output once the preserved worker exits and cleanup succeeds. | `an answered orphan exiting zero recovers its final answer instead of becoming lost` |
+| 8c. Dead question claims | `question-claim.ts:10`: a free mutex makes an old claim reclaimable immediately. | `an unexpired question claim left by a dead bridge is immediately reclaimable` |
+| Additional cache fix | `usage-cache.ts:86`: preserve successful snapshots; keep failure/backoff state in a separate file. | `concurrent usage calls keep the last good disk snapshot when the active probe fails` |
+
+All three suspected bugs, 8a–c, are confirmed. Each fix has a regression observed failing before implementation. The additional cache test confirms snapshot replacement on failure; its concurrent caller is excluded by the mutex, so duplicate live probes were not reproduced.
+
+**Operational rules:**
+
+- Keep the legacy lock helpers and file lock until no pre-69cdd0a server can run.
+- Inspect and save newer edits before manually removing a changed worktree after a failed removal attempt. The original saved patch remains available.
+- Recovered orphan completion uses nonempty `final.txt` as evidence. The exited worker's code is unavailable; verification is not rerun during recovery.
+- Usage failures retain the successful `<connector>-usage.json`; `<connector>-usage.failure.json` stores failure reporting and backoff. Success clears the failure record.
+
+**Validation:** both final `npm test` runs built successfully and reported 239 tests: 238 passed, 1 failed, 0 skipped. The only failure in each was `sibling jobs module is byte-identical when installed`; `AGENT_JOBS_MIRROR` points to the untouched main checkout. `git diff --check` passes. The Windows lock-handoff fixture waits for identity initialization and allows one second for scheduling and disk contention.
+
+**Files changed:**
+
+- Jobs: `connector.ts`, `core-bugs.test.ts` (new), `lock.ts`, `lock.test.ts`, `manager.ts`, `manager-review.test.ts`, `question-claim.ts`, `question-claim.test.ts`, `stability-a.test.ts`, `usage-cache.ts`, `usage-cache.test.ts`, `worktree.ts`, `worktree.test.ts`, `worktree-review.test.ts`.
+- Connectors: `codex.ts`, `codexAppServer.ts`, `codexAppServer.test.ts`.
+- Bridge fixture: `src/bridge/agent-bridge.test.ts`.
+- Documentation: `docs/agent-jobs.md`, `HANDOFF.md`.
+
+**Scope:** source changes are confined to the allowed jobs/connectors files. The orchestrator explicitly authorized the additional `src/bridge/agent-bridge.test.ts` fixture edit to hold a real question mutex. No commits or pushes. Main checkout unchanged; this worktree uses the authorized `node_modules` junction.
+
+**Next project:** extract the shared jobs, task adapters, diagnostics and bridge into one `agent-jobs` server with Codex and agy connectors.
 
 **Reviews and research:** `Documents\Research\mcp-agent-servers\` (panel reviews in `panel-2026-11-07\`, wake-hold research in `wakehold-2026-11-07\`, job reports in `job-reports\`).
