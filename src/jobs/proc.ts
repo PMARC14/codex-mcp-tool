@@ -309,7 +309,14 @@ export async function killTree(root?: Owner, recorded: Owner[] = [], child?: Chi
     // A snapshot can miss the root; a live handle plus a verified start time still authorizes it.
     if (root && !targets.includes(root) && (heldChild || (handleLive && await isAlive(root)))) targets.unshift(root);
     for (let i = 0; i < targets.length; i += 40) {
-      const batch = targets.slice(i, i + 40);
+      let batch = targets.slice(i, i + 40);
+      // Earlier batches kill whole trees (/T), freeing PIDs that may be reused: re-check later ones.
+      if (i > 0) {
+        const now = await processRows().catch(() => undefined);
+        if (!now) break;
+        batch = liveIn(now, batch);
+        if (!batch.length) continue;
+      }
       await runCommand(systemBinary('taskkill.exe'), [...batch.flatMap(t => ['/PID', String(t.pid)]), '/T', '/F']).catch(() => {});
     }
     if (heldChild) child!.kill();
