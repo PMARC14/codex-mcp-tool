@@ -29,4 +29,4 @@ The legacy tools load only with `CODEX_MCP_LEGACY_TOOLS=1`.
 
 **Next project:** extract `src/jobs` + `src/tools/{mcp-tasks,traffic-log,debug-tools,client-schemas}` + `src/bridge` into one standalone `agent-jobs` package or server, with Codex and agy as connectors. That drops the fork history, the sync script and the legacy tools. Upstream PRs are no longer practical; the changes are too large.
 
-**Reviews and research:** `~/.agent-jobs/research/panel-2026-11-07/`, and `Documents\Research\mcp-agent-servers\`.
+**Reviews and research:** `Documents\Research\mcp-agent-servers\` (panel reviews in `panel-2026-11-07\`, wake-hold research in `wakehold-2026-11-07\`, job reports in `job-reports\`).
