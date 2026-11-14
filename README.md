@@ -1,3 +1,5 @@
+> **Retired fork.** The `agent-standard` work from this fork moved to [agents-jobs](https://github.com/PMARC14/agents-jobs) (private) on 2026-11-08. This repository is archived and no longer maintained.
+
 # Codex MCP Server
 
 <div align="center">
